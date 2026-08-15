@@ -938,6 +938,64 @@ mod tests {
     }
 
     #[test]
+    fn a_max_size_replay_stays_within_the_frame_budget() {
+        let mut a = app_with_data();
+        a.page = Page::Replay;
+        a.replay.request = Some(ReplayRequest {
+            source: Source::Codex,
+            session: "dense-session".into(),
+            project: "dense-project".into(),
+            model: "dense-model".into(),
+        });
+        a.replay.data = Some(SessionReplay {
+            events: (0..20_000)
+                .map(|index| ReplayEvent {
+                    ts_ms: 1_787_000_000_000 + index as i64,
+                    offset_ms: index as u64,
+                    kind: match index % 4 {
+                        0 => ReplayKind::Assistant,
+                        1 => ReplayKind::ToolCall,
+                        2 => ReplayKind::ToolResult,
+                        _ => ReplayKind::User,
+                    },
+                    title: "event".into(),
+                    detail: "compact detail".into(),
+                })
+                .collect(),
+            first_ts_ms: 1_787_000_000_000,
+            last_ts_ms: 1_787_000_019_999,
+            truncated: false,
+        });
+        a.selected = 10_000;
+        a.scroll = 10_000;
+        a.grow.snap_to(1.0);
+
+        let area = ratatui::layout::Rect { x: 0, y: 0, width: 160, height: 48 };
+        let mut warm = ratatui::buffer::Buffer::empty(area);
+        pages::draw(&mut a, &mut warm, area);
+        assert!(
+            a.hits.len() <= usize::from(area.width) + 64,
+            "时间线的点击区域必须受屏幕宽度限制，实际为 {}",
+            a.hits.len()
+        );
+
+        let started = std::time::Instant::now();
+        const FRAMES: u32 = 50;
+        for _ in 0..FRAMES {
+            let mut buf = ratatui::buffer::Buffer::empty(area);
+            pages::draw(&mut a, &mut buf, area);
+        }
+        let per_frame = started.elapsed() / FRAMES;
+        if !cfg!(debug_assertions) {
+            assert!(
+                per_frame < Duration::from_millis(5),
+                "20,000-event Replay takes {per_frame:?} to draw, against a {:?} frame",
+                anim::TICK
+            );
+        }
+    }
+
+    #[test]
     fn every_page_the_arrows_work_on_shows_where_the_selection_is() {
         // The bug this pins: Overview drew its model list inert while still
         // owning the arrow keys, so ↑↓ moved a selection with nothing on

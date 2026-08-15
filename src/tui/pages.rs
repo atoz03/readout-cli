@@ -1184,15 +1184,30 @@ fn replay_timeline(
         w::text(buf, x, line_y, 1, "─", Style::default().fg(theme::RULE));
     }
     let track = inner.width.saturating_sub(1).max(1);
-    for (index, event) in events.iter().enumerate() {
-        let fraction = if duration == 0 { 0.0 } else { event.offset_ms as f64 / duration as f64 };
-        let x =
-            inner.x + ((fraction * f64::from(track) * app.grow.value()).round() as u16).min(track);
+    let visible_track =
+        (f64::from(track) * app.grow.value()).round().clamp(0.0, f64::from(track)) as u16;
+    let mut start = 0;
+    for column in 0..=visible_track {
+        // 同一终端列里的事件只画一个代表点。通过有序时间戳二分列边界，
+        // 单帧成本只随屏幕宽度增长，不再随最多 20,000 条事件增长。
+        let end = events.partition_point(|event| {
+            replay_timeline_column(event.offset_ms, duration, visible_track) <= column
+        });
+        if start == end {
+            continue;
+        }
+
+        // 选中事件必须保持可见；否则用该列最新的事件，点击后落到这段轨迹的末端。
+        let index =
+            if (start..end).contains(&app.selected) { app.selected } else { end.saturating_sub(1) };
+        let event = &events[index];
         let selected = index == app.selected;
         let mark = if selected { "◆" } else { "│" };
         let color = if selected { theme::TEXT_PRIMARY } else { replay_color(event.kind) };
+        let x = inner.x + column;
         w::text(buf, x, line_y, 1, mark, Style::default().fg(color));
         hits.add(Rect { x, y: line_y, width: 1, height: 1 }, Action::ReplaySeek(index));
+        start = end;
     }
 
     if inner.height < 2 {
@@ -1244,6 +1259,16 @@ fn replay_timeline(
         &status,
         Style::default().fg(theme::TEXT_MUTED),
     );
+}
+
+/// 把事件映射到已经展开的时间线列；使用整数运算避免长 session 的浮点边界漂移。
+fn replay_timeline_column(offset_ms: u64, duration_ms: u64, track: u16) -> u16 {
+    if duration_ms == 0 || track == 0 {
+        return 0;
+    }
+    let duration = u128::from(duration_ms);
+    let column = (u128::from(offset_ms) * u128::from(track) + duration / 2) / duration;
+    column.min(u128::from(track)) as u16
 }
 
 fn replay_events(
