@@ -11,7 +11,7 @@ keywords = ["cli", "tui", "claude", "codex", "usage"]
 categories = ["command-line-utilities", "visualization"]
 # Only what a build needs. The screenshots and the packaged binaries are not
 # part of the crate.
-exclude = [".github/", ".netcatty-paste-images/", "install.sh"]
+exclude = [".github/", ".netcatty-paste-images/", "install.sh", "CLAUDE.md"]
 
 [[bin]]
 name = "readout"
