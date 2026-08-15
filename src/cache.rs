@@ -103,8 +103,13 @@ impl Cache {
 
     /// Write atomically: a partial cache file left by a kill would otherwise
     /// be indistinguishable from a valid one on the next run.
+    ///
+    /// The scratch name carries the pid because two readouts can now be
+    /// running at once — a watching dashboard and a `readout summary` in
+    /// another terminal. Sharing one scratch path would let each truncate the
+    /// other's half-written file and rename the result into place.
     pub fn save(&self, path: &Path) -> Result<()> {
-        let tmp = path.with_extension("json.tmp");
+        let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
         let text = serde_json::to_string(self).context("serializing cache")?;
         std::fs::write(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
         std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
@@ -112,9 +117,13 @@ impl Cache {
     }
 
     /// Forget files that no longer exist, so a long-lived cache does not grow
-    /// without bound as sessions are archived or deleted.
-    pub fn retain_existing(&mut self, seen: &std::collections::HashSet<String>) {
+    /// without bound as sessions are archived or deleted. Returns how many
+    /// entries were dropped, which is one of the ways the cache becomes worth
+    /// rewriting.
+    pub fn retain_existing(&mut self, seen: &std::collections::HashSet<String>) -> usize {
+        let before = self.files.len();
         self.files.retain(|k, _| seen.contains(k));
+        before - self.files.len()
     }
 }
 

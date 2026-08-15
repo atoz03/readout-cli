@@ -39,6 +39,8 @@ pub struct ScanStats {
     pub events: usize,
     pub duplicates_dropped: usize,
     pub skipped_synthetic: u32,
+    /// Cache entries dropped because their file is gone.
+    pub files_forgotten: usize,
     pub discover_ms: u128,
     pub parse_ms: u128,
     pub total_ms: u128,
@@ -205,7 +207,7 @@ pub fn scan(
         seen.insert(key.clone());
         cache.files.insert(key, entry);
     }
-    cache.retain_existing(&seen);
+    stats.files_forgotten = cache.retain_existing(&seen);
 
     let before = all.len();
     let events = dedup(all);
@@ -329,11 +331,24 @@ pub fn scan_with_cache(
     let mut result = scan(&targets, &mut cache, on_progress)?;
     result.stats.discover_ms = discover_ms;
     result.stats.total_ms = t0.elapsed().as_millis();
-    if let (Some(p), true) = (&cache_path, use_cache) {
+    if let (Some(p), true) = (&cache_path, use_cache)
+        && cache_changed(&result.stats)
+    {
         // A cache we cannot persist costs speed, never correctness.
         let _ = cache.save(p);
     }
     Ok(result)
+}
+
+/// Whether this scan learned anything the cache does not already hold.
+///
+/// The cache carries the parsed events for every file, so writing it is
+/// proportional to the whole corpus rather than to what changed. That was
+/// fine when a scan happened once per launch; the watching dashboard scans
+/// every few seconds, and rewriting megabytes to record that nothing moved is
+/// the one way this tool could become a nuisance on someone's disk.
+fn cache_changed(stats: &ScanStats) -> bool {
+    stats.files_appended > 0 || stats.files_full > 0 || stats.files_forgotten > 0
 }
 
 #[cfg(test)]
@@ -373,6 +388,19 @@ mod tests {
         assert_eq!(out[0].tokens.output, 50);
         let out = dedup(vec![ev(Some("m1"), 1, 50), ev(Some("m1"), 1, 5)]);
         assert_eq!(out[0].tokens.output, 50);
+    }
+
+    #[test]
+    fn a_scan_that_learned_nothing_leaves_the_cache_alone() {
+        // The cache holds every parsed event, so writing it costs the whole
+        // corpus. Watch mode scans every few seconds; rewriting megabytes to
+        // record that nothing changed is the one way this becomes a nuisance.
+        let reused = ScanStats { files_total: 400, files_reused: 400, ..Default::default() };
+        assert!(!cache_changed(&reused));
+
+        assert!(cache_changed(&ScanStats { files_appended: 1, ..reused.clone() }));
+        assert!(cache_changed(&ScanStats { files_full: 1, ..reused.clone() }));
+        assert!(cache_changed(&ScanStats { files_forgotten: 1, ..reused }));
     }
 
     #[test]

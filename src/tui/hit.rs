@@ -26,6 +26,8 @@ pub enum Action {
     ClearFilter,
     /// Re-run the scan.
     Refresh,
+    /// Start or stop rescanning on a timer.
+    ToggleWatch,
     /// Leave the dashboard.
     Quit,
 }

@@ -34,6 +34,10 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
+    /// Keep the dashboard's numbers live, rescanning every few seconds
+    #[arg(long, short = 'w')]
+    watch: bool,
+
     #[command(flatten)]
     common: Common,
 }
@@ -64,7 +68,11 @@ struct Common {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Open the interactive dashboard (default)
-    Tui,
+    Tui {
+        /// Keep the numbers live, rescanning every few seconds
+        #[arg(long, short = 'w')]
+        watch: bool,
+    },
     /// Print a summary
     Summary {
         /// Emit JSON instead of text
@@ -123,9 +131,12 @@ fn main() -> Result<()> {
     let sources = resolve_sources(&cli.common)?;
 
     match cli.command {
-        None | Some(Command::Tui) => {
+        // `readout -w` and `readout tui -w` are the same request; accepting it
+        // only before the subcommand would make the explicit form an error.
+        None | Some(Command::Tui { .. }) => {
+            let watch = cli.watch || matches!(cli.command, Some(Command::Tui { watch: true }));
             let filter = build_filter(&cli.common, &sources);
-            tui::run(sources, filter, !cli.common.no_cache)
+            tui::run(sources, filter, !cli.common.no_cache, watch)
         }
         Some(Command::Summary { json, csv, timing }) => {
             let (s, stats, _) = load(&cli.common, &sources)?;

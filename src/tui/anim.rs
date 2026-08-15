@@ -61,6 +61,16 @@ impl Eased {
         self.target = target;
     }
 
+    /// Resume from a value already on screen, keeping the current target.
+    ///
+    /// Used when a live rescan lands a new number: replaying the count-up
+    /// from zero would say "here is a fresh dashboard" when what happened is
+    /// "that figure went up by three cents".
+    pub fn ease_from(&mut self, current: f64) {
+        self.current = current;
+        self.rate = RATE;
+    }
+
     pub fn value(&self) -> f64 {
         self.current
     }

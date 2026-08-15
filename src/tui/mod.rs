@@ -18,7 +18,7 @@ use crate::model::Source;
 use crate::pricing::Pricing;
 use crate::scan::{self, Progress};
 use anyhow::Result;
-use app::{App, Drill, Loading, Page, Range};
+use app::{App, Drill, Loading, Page, Range, Rescan};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -41,7 +41,7 @@ enum ScanMsg {
     Failed(String),
 }
 
-pub fn run(sources: Vec<Source>, base: Filter, use_cache: bool) -> Result<()> {
+pub fn run(sources: Vec<Source>, base: Filter, use_cache: bool, watch: bool) -> Result<()> {
     // Without a terminal there is nothing to put in raw mode, and crossterm
     // reports that as a bare "No such device or address (os error 6)". Say
     // what happened and name the two subcommands that work in a pipe.
@@ -53,6 +53,7 @@ pub fn run(sources: Vec<Source>, base: Filter, use_cache: bool) -> Result<()> {
     }
     let pricing = Pricing::load(crate::paths::pricing_override_file().ok().as_deref())?;
     let mut app = App::new(sources.clone(), base, pricing);
+    app.watch = watch;
 
     let mut terminal = setup()?;
     // Whatever happens below, the terminal must come back. Restoring before
@@ -168,6 +169,8 @@ fn event_loop(
     use_cache: bool,
 ) -> Result<()> {
     let mut rx = spawn_scan(sources.clone(), use_cache);
+    app.scan_pending = true;
+    let mut kind = Rescan::Manual;
 
     loop {
         if app.needs_redraw {
@@ -178,14 +181,23 @@ fn event_loop(
             app.needs_redraw = false;
         }
 
-        drain_scan(app, &rx);
+        drain_scan(app, &rx, kind);
 
-        if app.rescan_requested {
-            app.rescan_requested = false;
-            app.loading = Loading::Scanning(None);
-            app.status = Some("rescanning…".into());
+        if app.watch_due(std::time::Instant::now()) {
+            app.request_rescan(Rescan::Watch);
+        }
+
+        if let Some(next) = app.rescan_requested.take() {
+            kind = next;
+            // A watch scan leaves the dashboard exactly as it is until it has
+            // something to say. Only the manual one announces itself.
+            if kind == Rescan::Manual {
+                app.loading = Loading::Scanning(None);
+                app.status = Some("rescanning…".into());
+                app.needs_redraw = true;
+            }
+            app.scan_pending = true;
             rx = spawn_scan(sources.clone(), use_cache);
-            app.needs_redraw = true;
         }
 
         if event::poll(anim::TICK)? {
@@ -214,25 +226,37 @@ fn event_loop(
     }
 }
 
-fn drain_scan(app: &mut App, rx: &Receiver<ScanMsg>) {
+fn drain_scan(app: &mut App, rx: &Receiver<ScanMsg>, kind: Rescan) {
     loop {
         match rx.try_recv() {
+            // Progress from a watch scan is deliberately dropped: reporting it
+            // would put the dashboard back into a loading state every few
+            // seconds to say something the user did not ask about.
             Ok(ScanMsg::Progress(p)) => {
-                app.loading = Loading::Scanning(Some(p));
-                app.needs_redraw = true;
+                if kind == Rescan::Manual {
+                    app.loading = Loading::Scanning(Some(p));
+                    app.needs_redraw = true;
+                }
             }
             Ok(ScanMsg::Done(result)) => {
-                app.events = result.events;
-                app.stats = result.stats;
-                app.loading = Loading::Done;
-                app.status = None;
-                app.recompute(true);
+                app.scan_pending = false;
+                app.apply_scan(result.events, result.stats, kind);
             }
             Ok(ScanMsg::Failed(e)) => {
-                app.loading = Loading::Failed(e);
-                app.needs_redraw = true;
+                app.scan_pending = false;
+                app.scan_failed(e);
             }
-            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => return,
+            Err(TryRecvError::Empty) => return,
+            // The thread ended without a verdict, which means it died. Say so
+            // rather than leaving watch mode waiting forever on a scan that
+            // will never report.
+            Err(TryRecvError::Disconnected) => {
+                if app.scan_pending {
+                    app.scan_pending = false;
+                    app.scan_failed("the scan stopped without reporting".into());
+                }
+                return;
+            }
         }
     }
 }
@@ -261,7 +285,9 @@ fn on_key(app: &mut App, k: KeyEvent) {
         }
         KeyCode::Esc => app.set_drill(Drill::None),
         KeyCode::Char('q') => app.should_quit = true,
-        KeyCode::Char('r') => app.rescan_requested = true,
+        KeyCode::Char('r') => app.request_rescan(Rescan::Manual),
+        KeyCode::Char('w') => app.toggle_watch(),
+        KeyCode::Char('t') => app.set_range(Range::Today),
         KeyCode::Tab | KeyCode::Right => app.next_page(1),
         KeyCode::BackTab | KeyCode::Left => app.next_page(-1),
         KeyCode::Down | KeyCode::Char('j') => move_and_follow(app, 1),
@@ -278,8 +304,11 @@ fn on_key(app: &mut App, k: KeyEvent) {
         KeyCode::Char('c') => app.toggle_source(Source::Claude),
         KeyCode::Char('x') => app.toggle_source(Source::Codex),
         KeyCode::Char('?') => {
-            app.status =
-                Some("click the sidebar, chips, and rows · wheel scrolls · enter drills in".into())
+            app.status = Some(
+                "click the sidebar, chips, and rows · wheel scrolls · enter drills in · \
+                 w keeps the numbers live"
+                    .into(),
+            )
         }
         _ => {
             app.needs_redraw = false;
@@ -338,7 +367,8 @@ fn apply(app: &mut App, action: Action) {
             }
         }
         Action::ClearFilter => app.set_drill(Drill::None),
-        Action::Refresh => app.rescan_requested = true,
+        Action::Refresh => app.request_rescan(Rescan::Manual),
+        Action::ToggleWatch => app.toggle_watch(),
         Action::Quit => app.should_quit = true,
     }
 }
@@ -454,7 +484,86 @@ mod tests {
     fn a_refresh_click_requests_a_rescan() {
         let mut a = app_with_data();
         apply(&mut a, Action::Refresh);
-        assert!(a.rescan_requested);
+        assert_eq!(a.rescan_requested, Some(Rescan::Manual));
+    }
+
+    #[test]
+    fn a_second_refresh_does_not_stack_a_second_scan() {
+        // Every request spawns a thread. Clicking the scan summary twice, or
+        // holding `r`, must not start a scan per click.
+        let mut a = app_with_data();
+        apply(&mut a, Action::Refresh);
+        a.scan_pending = true;
+        a.rescan_requested = None;
+        apply(&mut a, Action::Refresh);
+        assert_eq!(a.rescan_requested, None, "a scan is already running");
+    }
+
+    /// Run the event loop's scan-scheduling step for a stretch of frames.
+    ///
+    /// This is the loop body with the terminal, the input and the scan thread
+    /// removed — what is left is the decision the loop makes ~60 times a
+    /// second, which is the part that can go wrong at that rate.
+    fn drive(app: &mut App, frames: u32, finish_scans: bool) -> usize {
+        let t0 = std::time::Instant::now();
+        app.last_scan = Some(t0);
+        let mut spawned = 0;
+        for f in 0..frames {
+            let now = t0 + anim::TICK * f;
+            if app.watch_due(now) {
+                app.request_rescan(Rescan::Watch);
+            }
+            if app.rescan_requested.take().is_some() {
+                app.scan_pending = true;
+                spawned += 1;
+            }
+            if finish_scans && app.scan_pending {
+                app.scan_pending = false;
+                app.last_scan = Some(now);
+            }
+        }
+        spawned
+    }
+
+    #[test]
+    fn watching_starts_one_scan_per_interval_not_one_per_frame() {
+        let mut a = app_with_data();
+        a.watch = true;
+        let per_interval = (app::WATCH_INTERVAL.as_millis() / anim::TICK.as_millis()) as u32;
+        // Three and a half intervals. The interval is measured from when the
+        // last scan *finished*, so each one lands a little after the tick
+        // that was due — the half gives that drift somewhere to go without
+        // admitting a fourth scan.
+        let spawned = drive(&mut a, per_interval * 7 / 2, true);
+        assert_eq!(spawned, 3, "one per interval, no more");
+    }
+
+    #[test]
+    fn a_scan_that_never_finishes_is_never_joined_by_a_second() {
+        // Watch scans leave `loading` on Done by design, so the elapsed time
+        // keeps growing while one is in flight. Without the in-flight guard
+        // the loop would spawn a thread on every frame from then on.
+        let mut a = app_with_data();
+        a.watch = true;
+        let per_interval = (app::WATCH_INTERVAL.as_millis() / anim::TICK.as_millis()) as u32;
+        assert_eq!(drive(&mut a, per_interval * 5, false), 1, "one scan, still running");
+    }
+
+    #[test]
+    fn nothing_is_scanned_on_a_timer_unless_watching() {
+        let mut a = app_with_data();
+        let per_interval = (app::WATCH_INTERVAL.as_millis() / anim::TICK.as_millis()) as u32;
+        assert_eq!(drive(&mut a, per_interval * 3, true), 0);
+    }
+
+    #[test]
+    fn the_watch_chip_toggles_watching() {
+        let mut a = app_with_data();
+        assert!(!a.watch);
+        apply(&mut a, Action::ToggleWatch);
+        assert!(a.watch);
+        apply(&mut a, Action::ToggleWatch);
+        assert!(!a.watch);
     }
 
     #[test]

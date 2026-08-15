@@ -43,6 +43,25 @@ pub fn text(s: &Summary, stats: &ScanStats, days: Option<i64>) -> String {
         );
     }
 
+    // Today, always — the window totals answer "what have I spent", and the
+    // question people actually ask next is "what have I spent *today*". A
+    // one-day window already is today, so repeating it there says nothing.
+    if days != Some(1) {
+        let t = s.today();
+        let _ = writeln!(o);
+        let _ = writeln!(
+            o,
+            "  {:>15}  {:>10}  {:>9}  {:>8}   today",
+            fmt::count(t.map_or(0, |b| b.tokens.total())),
+            fmt::money_partial(
+                t.map_or(0.0, |b| b.priced.cost),
+                t.map_or(1.0, |b| b.priced.coverage())
+            ),
+            fmt::count(t.map_or(0, |b| b.events)),
+            fmt::count(t.map_or(0, |b| b.session_count() as u64)),
+        );
+    }
+
     let _ = writeln!(o);
     let _ = writeln!(
         o,
@@ -169,6 +188,10 @@ pub fn json(s: &Summary, stats: &ScanStats, days: Option<i64>) -> String {
         "window_days": days,
         "generated_ts": chrono::Local::now().timestamp(),
         "total": bucket(&s.total),
+        // Null rather than a zeroed bucket: "nothing billed today" and "today
+        // is not in this window" are both real answers, and a row of zeros
+        // would be indistinguishable from either.
+        "today": s.today().map(bucket),
         "by_source": s.by_source.iter().map(|(src, b)| {
             let mut o = bucket(b);
             o["source"] = json!(src.short());
@@ -324,5 +347,46 @@ mod tests {
         let out = text(&s, &ScanStats::default(), Some(30));
         assert!(out.contains("codex-auto-review"));
         assert!(out.contains("no price on file"));
+    }
+
+    #[test]
+    fn text_output_reports_today_beside_the_window() {
+        let p = Pricing::builtin();
+        let s = summarize(&sample(), &Filter::default(), &p);
+        let out = text(&s, &ScanStats::default(), Some(30));
+        let today =
+            out.lines().find(|l| l.ends_with("   today")).expect("a today row under the totals");
+        assert!(today.contains("400"), "the sample was all billed today: {today}");
+    }
+
+    #[test]
+    fn a_one_day_window_does_not_repeat_itself_as_today() {
+        let p = Pricing::builtin();
+        let s = summarize(&sample(), &Filter::default(), &p);
+        let out = text(&s, &ScanStats::default(), Some(1));
+        assert!(!out.lines().any(|l| l.ends_with("   today")), "TOTAL already is today");
+    }
+
+    #[test]
+    fn json_carries_today_and_null_when_there_is_none() {
+        let p = Pricing::builtin();
+
+        let s = summarize(&sample(), &Filter::default(), &p);
+        let v: serde_json::Value =
+            serde_json::from_str(&json(&s, &ScanStats::default(), None)).unwrap();
+        assert_eq!(v["today"]["tokens"]["total"], 400);
+
+        // Nothing billed today: the key stays, the value says so.
+        let old: Vec<UsageEvent> = sample()
+            .into_iter()
+            .map(|mut e| {
+                e.ts -= 3 * 86_400;
+                e
+            })
+            .collect();
+        let s = summarize(&old, &Filter::default(), &p);
+        let v: serde_json::Value =
+            serde_json::from_str(&json(&s, &ScanStats::default(), None)).unwrap();
+        assert!(v["today"].is_null());
     }
 }

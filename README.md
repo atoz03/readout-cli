@@ -73,18 +73,25 @@ PATH. Building from source needs a recent stable Rust — the crate is on the
 readout            # opens on Overview
 readout -d 30      # start with the window limited to 30 days
 readout -s claude  # one tool only
+readout -w         # keep the numbers live while you work
 ```
+
+`-d` opens on the chip that matches, rounding up to the next one when the
+number falls between two — the chips are the only thing naming the active
+window, so the dashboard never shows a window its header disagrees with. The
+text subcommands take `-d` exactly.
 
 Everything on screen that means something is clickable.
 
 | Mouse | |
 |---|---|
 | Sidebar entry | switch page |
-| `7d` `30d` `90d` `All` | change the time window |
+| `Today` `7d` `30d` `90d` `All` | change the time window |
 | `● Claude Code` / `● Codex` | include or exclude that tool |
 | A row in any list | select it; click again to filter the whole dashboard by it |
 | A KPI tile | jump to the page that breaks it down |
 | A card header (`›`) | open the full page for that card |
+| `● live`, bottom right | start or stop watching |
 | The scan summary, bottom right | re-scan |
 | `✕`, top right | quit |
 | Wheel | scroll the focused list |
@@ -96,14 +103,52 @@ Everything on screen that means something is clickable.
 | `Enter` | filter everything by the selected row |
 | `Esc` | clear that filter |
 | `Tab` / `Shift-Tab`, `←` `→` | change page |
-| `1` `2` `3` `4` | 7d / 30d / 90d / all time |
+| `t` / `1` `2` `3` `4` | today / 7d / 30d / 90d / all time |
 | `c` / `x` | toggle Claude Code / Codex |
 | `r` | re-scan |
+| `w` | watch: keep the numbers live |
 | `?` | what's clickable |
 | `q`, `Ctrl-C` | quit |
 
 At least one tool always stays on: switching the last one off would leave a
 dashboard of zeroes rather than an answer.
+
+## Today, and keeping it live
+
+The window totals answer "what have I spent". The question after that is
+usually "what have I spent *today*", so today is always on screen — in the
+line under the header, in `readout summary`, and under `"today"` in the JSON:
+
+```
+           tokens        cost   requests  sessions
+      613,900,468     $449.37      3,652        18   TOTAL
+      569,241,294     $417.09      3,251        11   Claude Code
+       44,659,174      $32.28        401         7   Codex
+
+      245,542,893     $189.95      1,706         6   today
+```
+
+`Today` is also a window of its own — the chip, `t`, or `readout -d 1`. Under
+it the trend chart gives way to that day's hours, because a one-day trend is
+one bar next to its own axis.
+
+Watch mode keeps all of it current:
+
+```sh
+readout --watch     # or press w in the dashboard
+```
+
+Every five seconds it re-runs the same incremental scan, which reads only what
+the transcripts appended. A figure that moved eases from the number you were
+looking at to the new one, rather than counting up from zero as if the
+dashboard had just opened.
+
+A scan that finds nothing new draws no frame and writes no cache. So watching
+costs a warm scan's worth of CPU every five seconds and *nothing at all down
+the wire* — the terminal sees not one byte until a number actually changes,
+which is what makes it reasonable over ssh. It repaints when the numbers move,
+when a failed scan recovers, and at midnight, when every window shifts a day
+without a single token moving.
 
 ## The CLI
 
@@ -186,6 +231,11 @@ stopped. On a 1.4 GB corpus of 455 transcripts:
 cold   455 files, 1.4 GB   →  ~390 ms  (360 ms of it parsing, in parallel)
 warm   454 reused, 1 grown →  ~140 ms, 3.3 kB read
 ```
+
+The cache is rewritten only when a scan actually learned something. It holds
+the parsed events for every file, so saving it costs the whole corpus rather
+than the part that changed — fine once per launch, wrong every five seconds
+under `--watch`.
 
 `readout refresh` rebuilds the cache; `readout refresh --clear` deletes it.
 Set `READOUT_STATE_DIR` to move the cache and the price overrides elsewhere.

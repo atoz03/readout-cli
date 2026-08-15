@@ -199,6 +199,19 @@ pub fn summarize(events: &[UsageEvent], filter: &Filter, pricing: &Pricing) -> S
     s
 }
 
+impl Summary {
+    /// Today's totals, under whatever filter produced this summary.
+    ///
+    /// Derived from `daily` rather than accumulated separately, so it can
+    /// never disagree with the day it is a row of. `None` means no billed
+    /// request has landed today — which is not the same as zero, and the
+    /// callers that care render it differently.
+    pub fn today(&self) -> Option<&Bucket> {
+        let today = Local::now().date_naive();
+        self.daily.iter().find(|d| d.date == today).map(|d| &d.bucket)
+    }
+}
+
 /// Highest-valued key, with the name as a tiebreak so the answer is stable
 /// across runs rather than dependent on hash order.
 fn top_key(map: &HashMap<String, u64>) -> Option<&str> {
@@ -310,6 +323,49 @@ mod tests {
         assert_eq!(s.by_source.iter().map(|(_, b)| b.tokens.output).sum::<u64>(), 600);
         assert_eq!(s.daily.iter().map(|d| d.bucket.tokens.output).sum::<u64>(), 600);
         assert_eq!(s.by_hour.iter().map(|b| b.tokens.output).sum::<u64>(), 600);
+    }
+
+    #[test]
+    fn today_is_the_same_number_however_wide_the_window() {
+        // The figure the dashboard shows for today has to be the figure a
+        // one-day window totals, or one of the two is lying.
+        let p = Pricing::builtin();
+        let events = vec![
+            ev(Source::Claude, "claude-opus-5", "alpha", "s1", at(0, 9), 100),
+            ev(Source::Claude, "claude-opus-5", "alpha", "s2", at(0, 21), 200),
+            ev(Source::Codex, "gpt-5.2", "beta", "s3", at(1, 14), 300),
+            ev(Source::Codex, "gpt-5.2", "beta", "s4", at(20, 14), 400),
+        ];
+        let wide = summarize(&events, &Filter::default(), &p);
+        let narrow = summarize(&events, &Filter::last_days(1), &p);
+
+        let today = wide.today().expect("two events landed today");
+        assert_eq!(today.tokens.total(), narrow.total.tokens.total());
+        assert_eq!(today.events, 2);
+        assert_eq!(today.session_count(), 2);
+        assert_eq!(today.priced.cost, narrow.total.priced.cost);
+    }
+
+    #[test]
+    fn today_is_absent_rather_than_zero_when_nothing_was_billed() {
+        // `None` and a zeroed bucket are different claims: one says no request
+        // has landed today, the other says one landed and cost nothing.
+        let p = Pricing::builtin();
+        let events = vec![ev(Source::Claude, "claude-opus-5", "alpha", "s1", at(3, 9), 100)];
+        let s = summarize(&events, &Filter::default(), &p);
+        assert!(s.today().is_none());
+    }
+
+    #[test]
+    fn today_respects_the_filter_it_was_summarized_under() {
+        let p = Pricing::builtin();
+        let events = vec![
+            ev(Source::Claude, "claude-opus-5", "alpha", "s1", at(0, 9), 100),
+            ev(Source::Codex, "gpt-5.2", "beta", "s2", at(0, 9), 300),
+        ];
+        let claude_only = Filter { sources: vec![Source::Claude], ..Default::default() };
+        let s = summarize(&events, &claude_only, &p);
+        assert_eq!(s.today().unwrap().events, 1, "the excluded tool must not count");
     }
 
     #[test]

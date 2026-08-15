@@ -18,6 +18,11 @@ use ratatui::style::{Modifier, Style};
 
 pub const SIDEBAR_W: u16 = 18;
 
+/// Titles for the hour histogram. Across a long window the bars are a working
+/// habit; across one day they are that day as far as it has got.
+const HOURS_HABIT: &str = "When You Work";
+const HOURS_TODAY: &str = "Today, by Hour";
+
 /// A list that can own the keyboard selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NavList {
@@ -207,8 +212,13 @@ fn draw_header(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
         );
     }
 
-    // Range chips, right-aligned.
-    let chips: Vec<String> = Range::ORDER.iter().map(|r| format!(" {} ", r.label())).collect();
+    // Range chips, right-aligned. "Today" says what it is; "1d" is what fits
+    // once the tool toggles have taken the left half of a narrow header.
+    let long = area.width >= 76;
+    let chips: Vec<String> = Range::ORDER
+        .iter()
+        .map(|r| format!(" {} ", if long { r.label() } else { r.label_short() }))
+        .collect();
     let total: u16 = chips.iter().map(|c| c.chars().count() as u16).sum();
     let mut cx = area.right().saturating_sub(total + quit_w + 1);
     for (r, label) in Range::ORDER.iter().zip(&chips) {
@@ -228,18 +238,12 @@ fn draw_header(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
     }
 
     // Sub-line: the sentence that tells you what you are looking at.
-    let sub = headline(app);
-    w::text(
-        buf,
-        area.x + 1,
-        y + 1,
-        area.width.saturating_sub(2),
-        &sub,
-        Style::default().fg(theme::TEXT_MUTED),
-    );
+    let width = area.width.saturating_sub(2);
+    let sub = headline(app, width);
+    w::text(buf, area.x + 1, y + 1, width, &sub, Style::default().fg(theme::TEXT_MUTED));
 }
 
-fn headline(app: &App) -> String {
+fn headline(app: &App, width: u16) -> String {
     let s = &app.summary;
     if let Some(drill) = app.drill.label() {
         return format!("Filtered to {drill} — press Esc to clear");
@@ -247,18 +251,41 @@ fn headline(app: &App) -> String {
     if s.total.events == 0 {
         return "No usage in this window.".into();
     }
-    let streak = current_streak(&s.daily);
-    let streak_txt = match streak {
-        0 => "Quiet today.".to_string(),
-        1 => "Active today.".to_string(),
-        n => format!("{n}-day streak."),
+    let streak = match current_streak(&s.daily) {
+        0 | 1 => String::new(),
+        n => format!(" · {n}-day streak"),
     };
-    format!(
-        "{} across {} projects and {} models. {streak_txt}",
-        fmt::count(s.total.session_count() as u64) + " sessions",
+    let shape = format!(
+        "{} sessions across {} projects and {} models",
+        fmt::count(s.total.session_count() as u64),
         s.by_project.len(),
         s.by_model.len(),
-    )
+    );
+
+    // Under a one-day window the tiles above are already today's, so leading
+    // with today would be the same number twice.
+    if app.range == Range::Today {
+        return format!("{shape}{streak}");
+    }
+
+    // Everywhere else the tiles show the window and this shows the day, which
+    // is the figure people actually keep an eye on. It comes first, and it is
+    // the last thing dropped as the terminal narrows.
+    let today = match s.today() {
+        Some(b) => format!(
+            "Today {} · {}",
+            fmt::money_partial(b.priced.cost, b.priced.coverage()),
+            fmt::tokens(b.tokens.total()),
+        ),
+        None => "Nothing today yet".to_string(),
+    };
+    if width >= 92 {
+        format!("{today}{streak} — {shape}")
+    } else if width >= 40 {
+        format!("{today}{streak}")
+    } else {
+        today
+    }
 }
 
 fn draw_sidebar(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
@@ -323,17 +350,40 @@ fn draw_footer(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
     w::text(buf, rx, area.y, rw, &right, right_style);
     hits.add(Rect { x: rx, y: area.y, width: rw, height: 1 }, Action::Refresh);
 
+    // Watch chip, left of the scan summary. Dot plus word, like the tool
+    // toggles, so whether it is on never rests on colour alone. Dropped on a
+    // footer too narrow to hold it and a hint both; `w` still works there.
+    let mut edge = rx;
+    if area.width >= 44 {
+        let watch = if app.watch { "● live" } else { "○ live" };
+        let ww = watch.chars().count() as u16;
+        let wx = rx.saturating_sub(ww + 2);
+        let style = if app.watch {
+            Style::default().fg(theme::SERIES[2])
+        } else {
+            Style::default().fg(theme::TEXT_MUTED)
+        };
+        w::text(buf, wx, area.y, ww, watch, style);
+        hits.add(Rect { x: wx, y: area.y, width: ww, height: 1 }, Action::ToggleWatch);
+        edge = wx;
+    }
+
     // The hint is chosen against the room the scan summary leaves, not the
     // terminal width: sized against the latter it gets clipped mid-word, and
     // "q qui" is not an instruction.
-    let room = rx.saturating_sub(area.x + 2);
+    let room = edge.saturating_sub(area.x + 2);
+    // Each threshold is the exact width of the string it admits, so a hint is
+    // either whole or replaced by a shorter whole one — never trimmed.
     let left = match &app.status {
         Some(msg) => msg.clone(),
-        None if room >= 72 => {
-            "↑↓ move · ⏎ drill · esc clear · tab page · 1-4 range · r rescan · q quit".into()
+        None if room >= 83 => {
+            "↑↓ move · ⏎ drill · esc clear · tab page · t/1-4 range · r rescan · w live · q quit"
+                .into()
         }
-        None if room >= 42 => "↑↓ ⏎ esc tab · 1-4 range · r rescan · q quit".into(),
-        None if room >= 16 => "? help · q quit".into(),
+        None if room >= 55 => "↑↓ ⏎ esc tab · t/1-4 range · r rescan · w live · q quit".into(),
+        None if room >= 38 => "↑↓ ⏎ esc · t/1-4 · r · w live · q quit".into(),
+        None if room >= 24 => "? help · w live · q quit".into(),
+        None if room >= 15 => "? help · q quit".into(),
         None => "q quit".into(),
     };
     w::text(buf, area.x + 1, area.y, room, &left, Style::default().fg(theme::TEXT_MUTED));
@@ -370,15 +420,20 @@ fn overview(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
     kpi_row(app, buf, hits, tiles);
 
     if charts_h > 0 {
-        // Below ~64 columns the two charts would each be too narrow to read;
-        // give the width to the trend, which is the one that answers "how
-        // much, lately".
-        if activity.width >= 64 {
+        // A one-day window has nothing to trend: the chart would be a single
+        // bar next to its own axis. The hours of that day are the shape there
+        // is, so they take the whole row.
+        if app.range == Range::Today {
+            hour_card(app, buf, hits, activity, HOURS_TODAY);
+        } else if activity.width >= 64 {
+            // Below ~64 columns the two charts would each be too narrow to
+            // read; give the width to the trend, which is the one that
+            // answers "how much, lately".
             let [trend, clock] =
                 Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
                     .areas(activity);
             trend_card(app, buf, hits, trend);
-            hour_card(app, buf, hits, clock);
+            hour_card(app, buf, hits, clock, HOURS_HABIT);
         } else {
             trend_card(app, buf, hits, activity);
         }
@@ -529,18 +584,17 @@ fn trend_card(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
     }
 }
 
-fn hour_card(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
+/// A 24-hour histogram of the window.
+///
+/// The title is the caller's because the same bars mean two different things:
+/// across a long window they are a habit, and across one day they are that
+/// day's shape so far.
+fn hour_card(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect, title: &'static str) {
     let inner = w::card(
         buf,
         hits,
         area,
-        Card {
-            title: "When You Work",
-            glyph: "◷",
-            glyph_color: theme::SERIES[5],
-            meta: None,
-            action: None,
-        },
+        Card { title, glyph: "◷", glyph_color: theme::SERIES[5], meta: None, action: None },
     );
     if inner.height < 3 {
         return;
@@ -658,6 +712,16 @@ fn recent_card(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
 fn daily(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
     let [chart_area, table_area] =
         Layout::vertical([Constraint::Length(14), Constraint::Min(4)]).areas(area);
+
+    // A one-day window plots one bar, which is a number wearing a chart's
+    // clothes. Show that day's hours instead; the table below still lists the
+    // day, so nothing is lost.
+    if app.range == Range::Today {
+        hour_card(app, buf, hits, chart_area, HOURS_TODAY);
+        day_table(app, buf, hits, table_area);
+        return;
+    }
+
     // One column per day: the window is what fits, and the label says so.
     let days = app
         .range
@@ -698,6 +762,10 @@ fn daily(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
         Some(&action),
     );
 
+    day_table(app, buf, hits, table_area);
+}
+
+fn day_table(app: &App, buf: &mut Buffer, hits: &mut Registry, table_area: Rect) {
     let inner = w::card(
         buf,
         hits,
@@ -1160,6 +1228,40 @@ mod tests {
             assert!(values.len() <= width.max(1) as usize, "width {width} overflowed its plot");
             assert_eq!(labels.len(), values.len());
         }
+    }
+
+    #[test]
+    fn the_headline_leads_with_today_at_every_width() {
+        use crate::agg::Filter;
+        use crate::model::{Source, Tokens, UsageEvent};
+        use crate::pricing::Pricing;
+
+        let mut a = App::new(Source::ALL.to_vec(), Filter::default(), Pricing::builtin());
+        a.events = vec![UsageEvent {
+            source: Source::Claude,
+            ts: chrono::Local::now().timestamp(),
+            model: "claude-opus-5".into(),
+            session: "s1".into(),
+            project: "alpha".into(),
+            tokens: Tokens { input: 1_000, output: 1_000, ..Default::default() },
+            dedup_key: None,
+            dedup_rank: 0,
+        }];
+        a.recompute(false);
+
+        for width in 20..=200u16 {
+            let line = headline(&a, width);
+            assert!(line.starts_with("Today "), "width {width} dropped today: {line}");
+            assert!(
+                line.chars().count() <= width as usize,
+                "width {width} would be clipped: {line}"
+            );
+        }
+
+        // Under a one-day window the tiles above already are today, so saying
+        // it again in the sub-line is just the same number twice.
+        a.set_range(Range::Today);
+        assert!(!headline(&a, 200).starts_with("Today "));
     }
 
     #[test]
