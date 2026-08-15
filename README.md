@@ -32,6 +32,9 @@ place only, its own cache under `~/.cache/readout/`. Neither tool's
 configuration is modified, so there is no way for this to break a working
 setup.
 
+Session Replay 只在用户打开具体 session 时按需读取消息和工具调用。正文不会写入
+`~/.cache/readout/`；增量缓存仍然只保存 usage 元数据。
+
 Switching providers, editing configs, and proxying requests are deliberately
 out of scope. This tool answers "what did I spend", and nothing else.
 
@@ -101,7 +104,10 @@ Everything on screen that means something is clickable.
 | Sidebar entry | switch page |
 | `Today` `7d` `30d` `90d` `All` | change the time window |
 | `● Claude Code` / `● Codex` | include or exclude that tool |
-| A model, project, or session row | select it; click again to filter the dashboard by it |
+| A model row | select it; click again to filter the dashboard by it |
+| A project row | open that project's sessions |
+| A session row | open Session Replay |
+| Replay controls and timeline events | play/pause, change speed, or seek to an event |
 | A day or rate row | select it |
 | A KPI tile | jump to the page that breaks it down |
 | A card header (`›`) | open the full page for that card |
@@ -114,7 +120,7 @@ Everything on screen that means something is clickable.
 |---|---|
 | `↑` `↓` / `j` `k` | move the selection (the window scrolls to follow) |
 | `PgUp` `PgDn` `Home` `End` | move it faster |
-| `Enter` | filter by the selected model, project, or session |
+| `Enter` | filter the selected model, open a project's sessions, or replay a session |
 | `Esc` | clear that filter |
 | `Tab` / `Shift-Tab`, `←` `→` | change page |
 | `t` / `1` `2` `3` `4` | today / 7d / 30d / 90d / all time |
@@ -123,6 +129,16 @@ Everything on screen that means something is clickable.
 | `w` | watch: keep the numbers live |
 | `?` | what's clickable |
 | `q`, `Ctrl-C` | quit |
+
+### Session Replay
+
+项目和 session 现在是明确的两级导航：点击项目进入该项目过滤后的 Sessions，点击
+session 进入独立的 Replay 页面。Replay 会按时间排列用户消息、助手消息、工具调用、
+工具结果和失败结果，并显示可点击的时间轴。
+
+Replay 默认暂停在首个事件。`Space` 播放或暂停，`1`/`2`/`4` 切换倍速，`[`/`]`
+逐事件移动，`Esc` 返回当前项目的 Sessions。播放位置、列表选中项和时间轴指示器会
+同步更新；进入页面时沿用 dashboard 的缓入动画。
 
 At least one tool always stays on: switching the last one off would leave a
 dashboard of zeroes rather than an answer.

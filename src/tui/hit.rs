@@ -22,9 +22,18 @@ pub enum Action {
     ToggleSource(crate::model::Source),
     /// Select row `usize` of the focused list.
     Row(usize),
-    /// A session row shown on Overview; open the Sessions page without
-    /// accidentally interpreting its index as a model row.
+    /// 打开项目并显示它的 sessions。
+    ProjectRow(usize),
+    /// 打开 session replay。
     SessionRow(usize),
+    /// 返回当前项目的 Sessions 页。
+    BackToSessions,
+    /// 播放或暂停 replay。
+    ReplayToggle,
+    /// 设置 replay 倍速。
+    ReplaySpeed(u8),
+    /// 跳到 replay 中的具体事件。
+    ReplaySeek(usize),
     /// Clear any drill-down filter.
     ClearFilter,
     /// Re-run the scan.

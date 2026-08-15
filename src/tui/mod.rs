@@ -16,6 +16,7 @@ pub mod widgets;
 use crate::agg::Filter;
 use crate::model::Source;
 use crate::pricing::Pricing;
+use crate::replay::{self, ReplayRequest, SessionReplay};
 use crate::scan::{self, Progress};
 use anyhow::Result;
 use app::{App, Drill, Loading, Page, Range, Rescan};
@@ -39,6 +40,11 @@ use std::time::Duration;
 enum ScanMsg {
     Progress(Progress),
     Done(Box<scan::ScanResult>),
+    Failed(String),
+}
+
+enum ReplayMsg {
+    Done(SessionReplay),
     Failed(String),
 }
 
@@ -181,6 +187,18 @@ fn spawn_scan(sources: Vec<Source>, use_cache: bool) -> Receiver<ScanMsg> {
     rx
 }
 
+fn spawn_replay(request: ReplayRequest) -> Receiver<ReplayMsg> {
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        let message = match replay::load(request) {
+            Ok(replay) => ReplayMsg::Done(replay),
+            Err(error) => ReplayMsg::Failed(error.to_string()),
+        };
+        let _ = tx.send(message);
+    });
+    rx
+}
+
 fn event_loop(
     terminal: &mut Term,
     app: &mut App,
@@ -188,10 +206,22 @@ fn event_loop(
     use_cache: bool,
 ) -> Result<()> {
     let mut rx = spawn_scan(sources.clone(), use_cache);
+    let mut replay_rx: Option<Receiver<ReplayMsg>> = None;
     app.scan_pending = true;
     let mut kind = Rescan::Manual;
 
     loop {
+        if let Some(request) = app.replay_requested.take()
+            && app.page == Page::Replay
+        {
+            replay_rx = Some(spawn_replay(request));
+        }
+        if let Some(receiver) = replay_rx.as_ref()
+            && drain_replay(app, receiver)
+        {
+            replay_rx = None;
+        }
+
         if app.needs_redraw {
             terminal.draw(|f| {
                 let area = f.area();
@@ -245,6 +275,27 @@ fn event_loop(
     }
 }
 
+/// 返回 true 表示后台 replay 已经结束，可以丢弃 receiver。
+fn drain_replay(app: &mut App, rx: &Receiver<ReplayMsg>) -> bool {
+    match rx.try_recv() {
+        Ok(ReplayMsg::Done(replay)) => {
+            app.apply_replay(replay);
+            true
+        }
+        Ok(ReplayMsg::Failed(error)) => {
+            app.fail_replay(error);
+            true
+        }
+        Err(TryRecvError::Empty) => false,
+        Err(TryRecvError::Disconnected) => {
+            if app.replay.loading {
+                app.fail_replay("the replay loader stopped without reporting".into());
+            }
+            true
+        }
+    }
+}
+
 fn drain_scan(app: &mut App, rx: &Receiver<ScanMsg>, kind: Rescan) {
     loop {
         match rx.try_recv() {
@@ -294,6 +345,22 @@ fn on_key(app: &mut App, k: KeyEvent) {
             _ => {}
         }
         return;
+    }
+
+    if app.page == Page::Replay {
+        match k.code {
+            KeyCode::Esc => app.back_to_sessions(),
+            KeyCode::Char(' ') => app.toggle_replay(),
+            KeyCode::Char('1') => app.set_replay_speed(1),
+            KeyCode::Char('2') => app.set_replay_speed(2),
+            KeyCode::Char('4') => app.set_replay_speed(4),
+            KeyCode::Char('[') => move_and_follow(app, -1),
+            KeyCode::Char(']') => move_and_follow(app, 1),
+            _ => {}
+        }
+        if matches!(k.code, KeyCode::Esc | KeyCode::Char(' ' | '1' | '2' | '4' | '[' | ']')) {
+            return;
+        }
     }
 
     match k.code {
@@ -385,11 +452,12 @@ fn apply(app: &mut App, action: Action) {
                 app.selected = i;
             }
         }
-        Action::SessionRow(i) => {
-            app.set_page(Page::Sessions);
-            app.selected = i;
-            app.scroll = i;
-        }
+        Action::ProjectRow(i) => app.open_project(i),
+        Action::SessionRow(i) => app.open_session(i),
+        Action::BackToSessions => app.back_to_sessions(),
+        Action::ReplayToggle => app.toggle_replay(),
+        Action::ReplaySpeed(speed) => app.set_replay_speed(speed),
+        Action::ReplaySeek(i) => app.seek_replay(i),
         Action::ClearFilter => app.set_drill(Drill::None),
         Action::Refresh => app.request_rescan(Rescan::Manual),
         Action::ToggleWatch => app.toggle_watch(),
@@ -402,6 +470,7 @@ mod tests {
     use super::*;
     use crate::model::Tokens;
     use crate::model::UsageEvent;
+    use crate::replay::{ReplayEvent, ReplayKind, ReplayRequest, SessionReplay};
 
     fn app_with_data() -> App {
         let mut a = App::new(Source::ALL.to_vec(), Filter::default(), Pricing::builtin());
@@ -609,19 +678,19 @@ mod tests {
     }
 
     #[test]
-    fn an_overview_session_row_opens_and_filters_the_session_not_a_model() {
+    fn a_session_row_opens_its_replay_not_a_model_filter() {
         let mut a = app_with_data();
         let target = 1;
         let session = a.summary.by_session[target].label.clone();
 
         apply(&mut a, Action::SessionRow(target));
-        assert_eq!(a.page, Page::Sessions);
-        assert_eq!(a.selected, target);
+        assert_eq!(a.page, Page::Replay);
+        assert!(a.replay.loading);
         assert_eq!(a.drill, Drill::None);
-
-        apply(&mut a, Action::Row(target));
-        assert_eq!(a.drill, Drill::Session(session));
-        assert_eq!(a.summary.total.session_count(), 1);
+        assert_eq!(
+            a.replay_requested.as_ref().map(|request| request.session.as_str()),
+            Some(session.as_str())
+        );
     }
 
     #[test]
@@ -675,6 +744,55 @@ mod tests {
                 let area = ratatui::layout::Rect { x: 0, y: 0, width: w, height: h };
                 let mut buf = ratatui::buffer::Buffer::empty(area);
                 pages::draw(&mut a, &mut buf, area);
+            }
+        }
+    }
+
+    #[test]
+    fn session_replay_renders_trace_timeline_and_compact_sizes() {
+        let mut a = app_with_data();
+        a.page = Page::Replay;
+        a.replay.request = Some(ReplayRequest {
+            source: Source::Codex,
+            session: "s0".into(),
+            project: "p0".into(),
+            model: "model-0".into(),
+        });
+        a.replay.data = Some(SessionReplay {
+            events: vec![
+                ReplayEvent {
+                    ts_ms: 1_787_000_000_000,
+                    offset_ms: 0,
+                    kind: ReplayKind::User,
+                    title: "user".into(),
+                    detail: "please inspect the repository".into(),
+                },
+                ReplayEvent {
+                    ts_ms: 1_787_000_002_000,
+                    offset_ms: 2_000,
+                    kind: ReplayKind::ToolCall,
+                    title: "shell".into(),
+                    detail: "rg --files".into(),
+                },
+                ReplayEvent {
+                    ts_ms: 1_787_000_003_000,
+                    offset_ms: 3_000,
+                    kind: ReplayKind::ToolResult,
+                    title: "shell".into(),
+                    detail: "Cargo.toml src/main.rs".into(),
+                },
+            ],
+            first_ts_ms: 1_787_000_000_000,
+            last_ts_ms: 1_787_000_003_000,
+            truncated: false,
+        });
+        for (width, height) in [(160, 48), (100, 30), (60, 18), (20, 8), (1, 1)] {
+            let buffer = render(&mut a, width, height);
+            if width >= 100 && height >= 30 {
+                let text = buffer_text(&buffer);
+                assert!(text.contains("Event Trace"));
+                assert!(text.contains("shell"));
+                assert!(text.contains("1x"));
             }
         }
     }

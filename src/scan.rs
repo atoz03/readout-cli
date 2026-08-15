@@ -16,8 +16,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 /// 单个 transcript 和单行都必须有硬边界；流式读取只保留当前行。
-const MAX_TRANSCRIPT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
-const MAX_JSONL_LINE_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_TRANSCRIPT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+pub(crate) const MAX_JSONL_LINE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_SCAN_THREADS: usize = 4;
 
 /// A transcript file to consider.

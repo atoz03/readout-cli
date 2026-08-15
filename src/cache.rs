@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
@@ -110,7 +110,9 @@ impl Cache {
         if !meta.is_file() || meta.len() > MAX_CACHE_BYTES {
             return Cache::default();
         }
-        match serde_json::from_reader::<_, Cache>(file) {
+        // `serde_json::from_reader(File)` 可能退化为大量很小的 `read(2)` 调用。
+        // 缓存会随历史增长到几十 MB，显式加缓冲能显著缩短 warm start。
+        match serde_json::from_reader::<_, Cache>(BufReader::new(file)) {
             Ok(c) if c.version == SCHEMA_VERSION && c.has_safe_shape() => c,
             _ => Cache::default(),
         }

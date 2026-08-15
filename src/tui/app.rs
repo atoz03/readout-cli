@@ -8,6 +8,7 @@
 use crate::agg::{Filter, Summary, summarize};
 use crate::model::{Source, UsageEvent};
 use crate::pricing::Pricing;
+use crate::replay::{ReplayRequest, SessionReplay};
 use crate::scan::{Progress, ScanStats};
 use crate::tui::anim::{Eased, Pulse};
 use crate::tui::hit::Registry;
@@ -19,6 +20,7 @@ pub enum Page {
     Models,
     Projects,
     Sessions,
+    Replay,
     Pricing,
 }
 
@@ -40,6 +42,7 @@ impl Page {
             Page::Models => "Models",
             Page::Projects => "Projects",
             Page::Sessions => "Sessions",
+            Page::Replay => "Session Replay",
             Page::Pricing => "Pricing",
         }
     }
@@ -51,12 +54,15 @@ impl Page {
             Page::Models => "◱",
             Page::Projects => "▣",
             Page::Sessions => "◷",
+            Page::Replay => "▷",
             Page::Pricing => "$",
         }
     }
 
     pub fn index(self) -> usize {
-        Page::ORDER.iter().position(|p| *p == self).unwrap_or(0)
+        // Replay 是 Sessions 的上下文子页，不单独占侧栏位置。
+        let page = if self == Page::Replay { Page::Sessions } else { self };
+        Page::ORDER.iter().position(|p| *p == page).unwrap_or(0)
     }
 }
 
@@ -143,7 +149,6 @@ pub enum Drill {
     None,
     Model(String),
     Project(String),
-    Session(String),
 }
 
 impl Drill {
@@ -152,7 +157,6 @@ impl Drill {
             Drill::None => None,
             Drill::Model(m) => Some(format!("model: {m}")),
             Drill::Project(p) => Some(format!("project: {p}")),
-            Drill::Session(s) => Some(format!("session: {s}")),
         }
     }
 }
@@ -175,6 +179,35 @@ pub enum Loading {
 pub enum Rescan {
     Manual,
     Watch,
+}
+
+/// Replay 页面自己的短生命周期状态；正文不会进入 usage cache。
+pub struct ReplayUi {
+    pub request: Option<ReplayRequest>,
+    pub data: Option<SessionReplay>,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub playing: bool,
+    pub speed: u8,
+    pub position_ms: f64,
+    pub last_tick: std::time::Instant,
+    pub return_session_index: usize,
+}
+
+impl Default for ReplayUi {
+    fn default() -> Self {
+        ReplayUi {
+            request: None,
+            data: None,
+            loading: false,
+            error: None,
+            playing: false,
+            speed: 1,
+            position_ms: 0.0,
+            last_tick: std::time::Instant::now(),
+            return_session_index: 0,
+        }
+    }
 }
 
 /// How often watch mode looks for new transcripts.
@@ -234,6 +267,10 @@ pub struct App {
     /// showing yesterday's answer until it repaints.
     pub summary_date: chrono::NaiveDate,
     pub status: Option<String>,
+
+    pub replay: ReplayUi,
+    /// event loop 取走请求后在后台读取 transcript。
+    pub replay_requested: Option<ReplayRequest>,
 }
 
 impl App {
@@ -273,6 +310,8 @@ impl App {
             watch: false,
             summary_date: today,
             status: None,
+            replay: ReplayUi::default(),
+            replay_requested: None,
         }
     }
 
@@ -295,7 +334,6 @@ impl App {
             Drill::None => {}
             Drill::Model(m) => f.model = Some(m.clone()),
             Drill::Project(p) => f.project = Some(p.clone()),
-            Drill::Session(s) => f.session = Some(s.clone()),
         }
         f
     }
@@ -423,6 +461,7 @@ impl App {
             Page::Models => self.summary.by_model.len(),
             Page::Projects => self.summary.by_project.len(),
             Page::Sessions => self.summary.by_session.len(),
+            Page::Replay => self.replay.data.as_ref().map_or(0, |replay| replay.events.len()),
             Page::Pricing => self.pricing.known_models().len(),
         }
     }
@@ -491,6 +530,13 @@ impl App {
         let i = (self.selected as isize + delta).clamp(0, n as isize - 1) as usize;
         if i != self.selected {
             self.selected = i;
+            if self.page == Page::Replay
+                && let Some(event) =
+                    self.replay.data.as_ref().and_then(|replay| replay.events.get(i))
+            {
+                self.replay.position_ms = event.offset_ms as f64;
+                self.replay.playing = false;
+            }
             self.needs_redraw = true;
         }
     }
@@ -517,25 +563,151 @@ impl App {
         }
     }
 
-    /// Open whatever the selected row points at, or release it if it is
-    /// already the filter — so the same gesture that applied a drill takes it
-    /// back, and Esc is a shortcut rather than the only way out.
+    /// 激活当前行：模型切换筛选，项目进入 Sessions，session 进入 Replay。
     pub fn activate_selected(&mut self) {
-        let next = match self.page {
+        match self.page {
             Page::Models | Page::Overview => {
-                self.summary.by_model.get(self.selected).map(|b| Drill::Model(b.label.clone()))
+                let next = self
+                    .summary
+                    .by_model
+                    .get(self.selected)
+                    .map(|bucket| Drill::Model(bucket.label.clone()));
+                if let Some(next) = next {
+                    self.set_drill(if self.drill == next { Drill::None } else { next });
+                }
             }
-            Page::Projects => {
-                self.summary.by_project.get(self.selected).map(|b| Drill::Project(b.label.clone()))
-            }
-            Page::Sessions => {
-                self.summary.by_session.get(self.selected).map(|b| Drill::Session(b.label.clone()))
-            }
-            _ => None,
-        };
-        if let Some(next) = next {
-            self.set_drill(if self.drill == next { Drill::None } else { next });
+            Page::Projects => self.open_project(self.selected),
+            Page::Sessions => self.open_session(self.selected),
+            Page::Replay => self.seek_replay(self.selected),
+            _ => {}
         }
+    }
+
+    /// 项目是 session 的父级：打开项目后直接落到过滤后的 Sessions 页。
+    pub fn open_project(&mut self, index: usize) {
+        let Some(project) = self.summary.by_project.get(index).map(|b| b.label.clone()) else {
+            return;
+        };
+        self.set_drill(Drill::Project(project));
+        self.set_page(Page::Sessions);
+    }
+
+    /// 选中 session 后切到上下文 replay 页，并把读取交给后台线程。
+    pub fn open_session(&mut self, index: usize) {
+        let Some(bucket) = self.summary.by_session.get(index) else { return };
+        let session = bucket.label.clone();
+        let project = bucket.top_project().unwrap_or("unknown").to_string();
+        let model = bucket.top_model().unwrap_or("unknown").to_string();
+        let filter = self.filter();
+        let source = self
+            .events
+            .iter()
+            .filter(|event| event.session == session && filter.admits(event))
+            .max_by_key(|event| event.ts)
+            .map(|event| event.source);
+        let Some(source) = source else {
+            self.status = Some("could not locate the session source".into());
+            return;
+        };
+        let request = ReplayRequest { source, session, project, model };
+        self.replay = ReplayUi {
+            request: Some(request.clone()),
+            loading: true,
+            return_session_index: index,
+            ..ReplayUi::default()
+        };
+        self.replay_requested = Some(request);
+        self.page = Page::Replay;
+        self.selected = 0;
+        self.scroll = 0;
+        self.grow = Eased::from_zero(1.0).with_rate(crate::tui::anim::RATE_FAST);
+        self.needs_redraw = true;
+    }
+
+    pub fn apply_replay(&mut self, replay: SessionReplay) {
+        self.replay.loading = false;
+        self.replay.error = None;
+        self.replay.data = Some(replay);
+        self.replay.position_ms = 0.0;
+        self.replay.playing = false;
+        self.selected = 0;
+        self.scroll = 0;
+        self.needs_redraw = true;
+    }
+
+    pub fn fail_replay(&mut self, error: String) {
+        self.replay.loading = false;
+        self.replay.error = Some(error);
+        self.needs_redraw = true;
+    }
+
+    pub fn back_to_sessions(&mut self) {
+        let index = self.replay.return_session_index;
+        self.page = Page::Sessions;
+        self.selected = index.min(self.summary.by_session.len().saturating_sub(1));
+        self.scroll = self.selected;
+        self.replay.playing = false;
+        self.replay_requested = None;
+        self.needs_redraw = true;
+    }
+
+    pub fn toggle_replay(&mut self) {
+        let Some(replay) = self.replay.data.as_ref() else { return };
+        if replay.events.is_empty() {
+            return;
+        }
+        if self.replay.position_ms >= replay.duration_ms() as f64 {
+            self.replay.position_ms = 0.0;
+            self.selected = 0;
+            self.scroll = 0;
+        }
+        self.replay.playing = !self.replay.playing;
+        self.replay.last_tick = std::time::Instant::now();
+        self.needs_redraw = true;
+    }
+
+    pub fn set_replay_speed(&mut self, speed: u8) {
+        if matches!(speed, 1 | 2 | 4) {
+            self.replay.speed = speed;
+            self.replay.last_tick = std::time::Instant::now();
+            self.needs_redraw = true;
+        }
+    }
+
+    pub fn seek_replay(&mut self, index: usize) {
+        let Some(replay) = self.replay.data.as_ref() else { return };
+        let Some(event) = replay.events.get(index) else { return };
+        self.selected = index;
+        self.replay.position_ms = event.offset_ms as f64;
+        self.replay.playing = false;
+        self.ensure_visible(self.list_rows.get());
+        self.needs_redraw = true;
+    }
+
+    fn tick_replay(&mut self) -> bool {
+        if self.page != Page::Replay || !self.replay.playing {
+            return false;
+        }
+        let Some(replay) = self.replay.data.as_ref() else { return false };
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.replay.last_tick).as_secs_f64() * 1_000.0;
+        self.replay.last_tick = now;
+        let duration = replay.duration_ms() as f64;
+        self.replay.position_ms =
+            (self.replay.position_ms + elapsed * f64::from(self.replay.speed)).min(duration);
+        let index = replay
+            .events
+            .partition_point(|event| event.offset_ms as f64 <= self.replay.position_ms)
+            .saturating_sub(1);
+        self.selected = index;
+        let rows = self.list_rows.get();
+        if rows > 0 && self.selected >= self.scroll + rows {
+            self.scroll = self.selected + 1 - rows;
+        }
+        if self.replay.position_ms >= duration {
+            self.replay.playing = false;
+        }
+        true
     }
 
     /// Advance animations; returns true if a redraw is warranted.
@@ -545,8 +717,9 @@ impl App {
             moving |= k.tick();
         }
         moving |= self.grow.tick();
+        moving |= self.tick_replay();
         // A running scan animates its spinner regardless of eased values.
-        if matches!(self.loading, Loading::Scanning(_)) {
+        if matches!(self.loading, Loading::Scanning(_)) || self.replay.loading {
             moving = true;
         }
         moving
@@ -557,6 +730,7 @@ impl App {
 mod tests {
     use super::*;
     use crate::model::Tokens;
+    use crate::replay::{ReplayEvent, ReplayKind};
 
     fn app() -> App {
         let mut a = App::new(Source::ALL.to_vec(), Filter::default(), Pricing::builtin());
@@ -634,6 +808,51 @@ mod tests {
         a.selected = 0;
         a.ensure_visible(1);
         assert_eq!(a.scroll, 0);
+    }
+
+    #[test]
+    fn opening_a_project_shows_only_that_projects_sessions() {
+        let mut a = app();
+        a.set_page(Page::Projects);
+        let project = a.summary.by_project[0].label.clone();
+        a.open_project(0);
+        assert_eq!(a.page, Page::Sessions);
+        assert_eq!(a.drill, Drill::Project(project.clone()));
+        assert!(a.summary.by_session.iter().all(|bucket| bucket.top_project() == Some(&project)));
+    }
+
+    #[test]
+    fn replay_playback_advances_the_selected_event_and_stops_at_the_end() {
+        let mut a = app();
+        a.page = Page::Replay;
+        a.replay.data = Some(SessionReplay {
+            events: vec![
+                ReplayEvent {
+                    ts_ms: 1,
+                    offset_ms: 0,
+                    kind: ReplayKind::User,
+                    title: "user".into(),
+                    detail: "start".into(),
+                },
+                ReplayEvent {
+                    ts_ms: 1_001,
+                    offset_ms: 1_000,
+                    kind: ReplayKind::ToolCall,
+                    title: "shell".into(),
+                    detail: "pwd".into(),
+                },
+            ],
+            first_ts_ms: 1,
+            last_ts_ms: 1_001,
+            truncated: false,
+        });
+        a.replay.playing = true;
+        a.replay.speed = 2;
+        a.replay.last_tick = std::time::Instant::now() - std::time::Duration::from_millis(600);
+        assert!(a.tick());
+        assert_eq!(a.selected, 1);
+        assert!(!a.replay.playing);
+        assert_eq!(a.replay.position_ms, 1_000.0);
     }
 
     #[test]

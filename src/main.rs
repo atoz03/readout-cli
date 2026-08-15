@@ -11,6 +11,7 @@ mod model;
 mod parse;
 mod paths;
 mod pricing;
+mod replay;
 mod report;
 mod scan;
 mod tui;

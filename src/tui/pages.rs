@@ -8,6 +8,7 @@
 use crate::agg::{Summary, current_streak, dense_daily, month_to_date};
 use crate::fmt;
 use crate::model::Source;
+use crate::replay::{ReplayEvent, ReplayKind};
 use crate::tui::app::{App, Drill, Loading, Page, Range};
 use crate::tui::hit::{Action, Registry};
 use crate::tui::theme;
@@ -30,6 +31,7 @@ enum NavList {
     Projects,
     Days,
     Sessions,
+    ReplayEvents,
     Rates,
 }
 
@@ -46,6 +48,7 @@ fn owns_selection(page: Page, list: NavList) -> bool {
         Page::Projects => list == NavList::Projects,
         Page::Daily => list == NavList::Days,
         Page::Sessions => list == NavList::Sessions,
+        Page::Replay => list == NavList::ReplayEvents,
         Page::Pricing => list == NavList::Rates,
     }
 }
@@ -83,6 +86,7 @@ pub fn draw(app: &mut App, buf: &mut Buffer, area: Rect) {
             Page::Models => ranked(app, buf, &mut hits, content, RankKind::Model),
             Page::Projects => ranked(app, buf, &mut hits, content, RankKind::Project),
             Page::Sessions => sessions(app, buf, &mut hits, content),
+            Page::Replay => replay(app, buf, &mut hits, content),
             Page::Pricing => pricing(app, buf, &mut hits, content),
         }
     }
@@ -244,6 +248,18 @@ fn draw_header(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
 }
 
 fn headline(app: &App, width: u16) -> String {
+    if app.page == Page::Replay
+        && let Some(request) = app.replay.request.as_ref()
+    {
+        let text = format!(
+            "{} › {} · {} · {}",
+            request.project,
+            request.session,
+            request.source.label(),
+            request.model
+        );
+        return fmt::ellipsize(&text, width as usize);
+    }
     let s = &app.summary;
     if let Some(drill) = app.drill.label() {
         return format!("Filtered to {drill} — press Esc to clear");
@@ -308,7 +324,7 @@ fn draw_sidebar(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
             if y >= area.bottom() {
                 break;
             }
-            let active = app.page == *page;
+            let active = app.page == *page || (app.page == Page::Replay && *page == Page::Sessions);
             let row = Rect { x: area.x + 1, y, width: area.width.saturating_sub(2), height: 1 };
             if active {
                 // The active pill is a filled surface plus a bold label — the
@@ -376,6 +392,13 @@ fn draw_footer(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
     // either whole or replaced by a shorter whole one — never trimmed.
     let left = match &app.status {
         Some(msg) => msg.clone(),
+        None if app.page == Page::Replay && room >= 67 => {
+            "space play/pause · [ ] step · 1/2/4 speed · esc sessions · q quit".into()
+        }
+        None if app.page == Page::Replay && room >= 35 => {
+            "space play · [ ] step · esc sessions · q quit".into()
+        }
+        None if app.page == Page::Replay => "space play · esc back · q quit".into(),
         None if room >= 83 => {
             "↑↓ move · ⏎ drill · esc clear · tab page · t/1-4 range · r rescan · w live · q quit"
                 .into()
@@ -931,7 +954,11 @@ fn bar_list(
             // Row, not a drill action: one click selects and a second opens,
             // the same contract every other list here honours. Drilling on the
             // first click made a passing click rewrite the whole dashboard.
-            hits.add_hoverable(row, Action::Row(i), i as u64);
+            let action = match kind {
+                RankKind::Model => Action::Row(i),
+                RankKind::Project => Action::ProjectRow(i),
+            };
+            hits.add_hoverable(row, action, i as u64);
         }
     }
 }
@@ -1020,9 +1047,368 @@ fn session_list(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect, sc
             &fmt::relative(b.last_ts),
             Style::default().fg(theme::TEXT_MUTED),
         );
-        let action =
-            if app.page == Page::Overview { Action::SessionRow(i) } else { Action::Row(i) };
-        hits.add_hoverable(row, action, hover_id);
+        hits.add_hoverable(row, Action::SessionRow(i), hover_id);
+    }
+}
+
+// ── Session replay ─────────────────────────────────────────────────────────
+
+fn replay(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
+    let detail_h = if area.height >= 20 { 6 } else { 0 };
+    let [meta, timeline, events, detail] = Layout::vertical([
+        Constraint::Length(4),
+        Constraint::Length(5),
+        Constraint::Min(5),
+        Constraint::Length(detail_h),
+    ])
+    .areas(area);
+
+    replay_meta(app, buf, hits, meta);
+    if app.replay.loading {
+        let frame = crate::tui::anim::SPINNER[app
+            .pulse
+            .frame(crate::tui::anim::SPINNER.len(), std::time::Duration::from_millis(800))];
+        w::callout(
+            buf,
+            hits,
+            events,
+            frame,
+            theme::TEXT_MUTED,
+            "reading this session's active transcripts…",
+            Some(Action::BackToSessions),
+        );
+        return;
+    }
+    if let Some(error) = app.replay.error.as_ref() {
+        w::callout(
+            buf,
+            hits,
+            events,
+            theme::ICON_WARNING,
+            theme::CRITICAL,
+            &format!("replay unavailable: {error}"),
+            Some(Action::BackToSessions),
+        );
+        return;
+    }
+    let Some(replay) = app.replay.data.as_ref() else { return };
+    replay_timeline(app, replay.events.as_slice(), buf, hits, timeline);
+    replay_events(app, replay.events.as_slice(), replay.truncated, buf, hits, events);
+    if detail_h > 0 {
+        replay_detail(app, replay.events.as_slice(), buf, hits, detail);
+    }
+}
+
+fn replay_meta(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
+    let request = app.replay.request.as_ref();
+    let inner = w::card(
+        buf,
+        hits,
+        area,
+        Card {
+            title: "Session Replay",
+            glyph: "◀",
+            glyph_color: theme::SERIES[0],
+            meta: request.map(|request| format!("{} · {}", request.source.label(), request.model)),
+            action: Some(Action::BackToSessions),
+        },
+    );
+    let Some(request) = request else { return };
+    if inner.height > 0 {
+        let project = format!("project  {}", request.project);
+        w::text(
+            buf,
+            inner.x,
+            inner.y,
+            inner.width,
+            &fmt::ellipsize(&project, inner.width as usize),
+            Style::default().fg(theme::TEXT_SECONDARY),
+        );
+    }
+    if inner.height > 1 {
+        let time = app
+            .replay
+            .data
+            .as_ref()
+            .map(|replay| replay_wall_range(replay.first_ts_ms, replay.last_ts_ms))
+            .filter(|time| !time.is_empty());
+        let session = match time {
+            Some(time) => format!("session  {} · {time}", request.session),
+            None => format!("session  {}", request.session),
+        };
+        w::text(
+            buf,
+            inner.x,
+            inner.y + 1,
+            inner.width,
+            &fmt::ellipsize(&session, inner.width as usize),
+            Style::default().fg(theme::TEXT_MUTED),
+        );
+    }
+}
+
+fn replay_timeline(
+    app: &App,
+    events: &[ReplayEvent],
+    buf: &mut Buffer,
+    hits: &mut Registry,
+    area: Rect,
+) {
+    let duration = events.last().map_or(0, |event| event.offset_ms);
+    let inner = w::card(
+        buf,
+        hits,
+        area,
+        Card {
+            title: "Timeline",
+            glyph: "▷",
+            glyph_color: theme::SERIES[2],
+            meta: Some(format!("{} events · {}", events.len(), replay_time(duration))),
+            action: None,
+        },
+    );
+    if events.is_empty() || inner.height == 0 || inner.width == 0 {
+        w::text(
+            buf,
+            inner.x,
+            inner.y,
+            inner.width,
+            "no replayable messages or tool calls",
+            Style::default().fg(theme::TEXT_MUTED),
+        );
+        return;
+    }
+
+    let line_y = inner.y;
+    for x in inner.x..inner.right() {
+        w::text(buf, x, line_y, 1, "─", Style::default().fg(theme::RULE));
+    }
+    let track = inner.width.saturating_sub(1).max(1);
+    for (index, event) in events.iter().enumerate() {
+        let fraction = if duration == 0 { 0.0 } else { event.offset_ms as f64 / duration as f64 };
+        let x =
+            inner.x + ((fraction * f64::from(track) * app.grow.value()).round() as u16).min(track);
+        let selected = index == app.selected;
+        let mark = if selected { "◆" } else { "│" };
+        let color = if selected { theme::TEXT_PRIMARY } else { replay_color(event.kind) };
+        w::text(buf, x, line_y, 1, mark, Style::default().fg(color));
+        hits.add(Rect { x, y: line_y, width: 1, height: 1 }, Action::ReplaySeek(index));
+    }
+
+    if inner.height < 2 {
+        return;
+    }
+    let y = inner.bottom() - 1;
+    let play = if app.replay.playing { " ❚❚ " } else { " ▶ " };
+    let play_w = play.chars().count() as u16;
+    w::text(
+        buf,
+        inner.x,
+        y,
+        play_w,
+        play,
+        Style::default().fg(theme::TEXT_PRIMARY).bg(theme::SURFACE_ACTIVE),
+    );
+    hits.add(Rect { x: inner.x, y, width: play_w, height: 1 }, Action::ReplayToggle);
+    let mut x = inner.x + play_w + 1;
+    for speed in [1u8, 2, 4] {
+        let label = format!(" {speed}x ");
+        let width = label.chars().count() as u16;
+        let active = app.replay.speed == speed;
+        w::text(
+            buf,
+            x,
+            y,
+            width,
+            &label,
+            if active {
+                Style::default().fg(theme::TEXT_PRIMARY).bg(theme::SURFACE_ACTIVE)
+            } else {
+                Style::default().fg(theme::TEXT_MUTED)
+            },
+        );
+        hits.add(Rect { x, y, width, height: 1 }, Action::ReplaySpeed(speed));
+        x += width;
+    }
+    let status = format!(
+        "Event {}/{} · {}",
+        app.selected.saturating_add(1).min(events.len()),
+        events.len(),
+        replay_time(events.get(app.selected).map_or(0, |event| event.offset_ms))
+    );
+    w::text_right(
+        buf,
+        x,
+        y,
+        inner.right().saturating_sub(x),
+        &status,
+        Style::default().fg(theme::TEXT_MUTED),
+    );
+}
+
+fn replay_events(
+    app: &App,
+    events: &[ReplayEvent],
+    truncated: bool,
+    buf: &mut Buffer,
+    hits: &mut Registry,
+    area: Rect,
+) {
+    let meta =
+        if truncated { format!("{} · truncated", events.len()) } else { events.len().to_string() };
+    let inner = w::card(
+        buf,
+        hits,
+        area,
+        Card {
+            title: "Event Trace",
+            glyph: "⑂",
+            glyph_color: theme::SERIES[3],
+            meta: Some(meta),
+            action: None,
+        },
+    );
+    let rows = inner.height as usize;
+    app.list_rows.set(rows);
+    for (index, event) in events.iter().enumerate().skip(app.scroll).take(rows) {
+        let y = inner.y + (index - app.scroll) as u16;
+        let row = Rect { x: inner.x, y, width: inner.width, height: 1 };
+        let selected = index == app.selected;
+        let hover = app.hover == Some(w::hover_id(&format!("replay:{index}")));
+        if selected || hover {
+            w::fill(
+                buf,
+                row,
+                if selected { theme::SURFACE_SELECTED } else { theme::SURFACE_RAISED },
+            );
+        }
+        let color = replay_color(event.kind);
+        let mark = if selected { theme::SELECT_MARK } else { replay_glyph(event.kind) };
+        w::text(buf, row.x, y, 1, mark, Style::default().fg(color));
+        let time_w = 10u16.min(row.width);
+        w::text(
+            buf,
+            row.x + 2,
+            y,
+            time_w.saturating_sub(2),
+            &replay_time(event.offset_ms),
+            Style::default().fg(theme::TEXT_MUTED),
+        );
+        let title_x = row.x + time_w;
+        let title_w = 22u16.min(row.right().saturating_sub(title_x));
+        w::text(
+            buf,
+            title_x,
+            y,
+            title_w,
+            &fmt::ellipsize(&event.title, title_w as usize),
+            Style::default()
+                .fg(if selected { theme::TEXT_PRIMARY } else { color })
+                .add_modifier(if selected { Modifier::BOLD } else { Modifier::empty() }),
+        );
+        let detail_x = title_x + title_w + 1;
+        let detail_w = row.right().saturating_sub(detail_x);
+        let detail_style = if index > app.selected {
+            Style::default().fg(theme::TEXT_MUTED)
+        } else {
+            Style::default().fg(theme::TEXT_SECONDARY)
+        };
+        w::text(
+            buf,
+            detail_x,
+            y,
+            detail_w,
+            &fmt::ellipsize(&event.detail, detail_w as usize),
+            detail_style,
+        );
+        hits.add_hoverable(row, Action::ReplaySeek(index), w::hover_id(&format!("replay:{index}")));
+    }
+}
+
+fn replay_detail(
+    app: &App,
+    events: &[ReplayEvent],
+    buf: &mut Buffer,
+    hits: &mut Registry,
+    area: Rect,
+) {
+    let Some(event) = events.get(app.selected) else { return };
+    let inner = w::card(
+        buf,
+        hits,
+        area,
+        Card {
+            title: &event.title,
+            glyph: replay_glyph(event.kind),
+            glyph_color: replay_color(event.kind),
+            meta: Some(replay_time(event.offset_ms)),
+            action: None,
+        },
+    );
+    draw_wrapped(buf, inner, &event.detail, Style::default().fg(theme::TEXT_SECONDARY));
+}
+
+fn replay_time(ms: u64) -> String {
+    let seconds = ms / 1_000;
+    let minutes = seconds / 60;
+    if minutes >= 60 {
+        format!("+{}:{:02}:{:02}", minutes / 60, minutes % 60, seconds % 60)
+    } else {
+        format!("+{}:{:02}", minutes, seconds % 60)
+    }
+}
+
+fn replay_wall_range(first_ms: i64, last_ms: i64) -> String {
+    if first_ms <= 0 || last_ms <= 0 {
+        return String::new();
+    }
+    let Some(first) = chrono::DateTime::from_timestamp_millis(first_ms) else {
+        return String::new();
+    };
+    let Some(last) = chrono::DateTime::from_timestamp_millis(last_ms) else {
+        return String::new();
+    };
+    let first = first.with_timezone(&chrono::Local);
+    let last = last.with_timezone(&chrono::Local);
+    if first.date_naive() == last.date_naive() {
+        format!("{}–{}", first.format("%b %-d %H:%M"), last.format("%H:%M"))
+    } else {
+        format!("{}–{}", first.format("%b %-d %H:%M"), last.format("%b %-d %H:%M"))
+    }
+}
+
+fn replay_glyph(kind: ReplayKind) -> &'static str {
+    match kind {
+        ReplayKind::User => "●",
+        ReplayKind::Assistant => "◆",
+        ReplayKind::ToolCall => "⚒",
+        ReplayKind::ToolResult => "↳",
+        ReplayKind::ToolError => "×",
+        ReplayKind::System => "ⓘ",
+    }
+}
+
+fn replay_color(kind: ReplayKind) -> ratatui::style::Color {
+    match kind {
+        ReplayKind::User => theme::SERIES[2],
+        ReplayKind::Assistant => theme::SERIES[0],
+        ReplayKind::ToolCall => theme::WARNING,
+        ReplayKind::ToolResult => theme::GOOD,
+        ReplayKind::ToolError => theme::CRITICAL,
+        ReplayKind::System => theme::SERIES[6],
+    }
+}
+
+fn draw_wrapped(buf: &mut Buffer, area: Rect, raw: &str, style: Style) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let safe = fmt::terminal_text(raw);
+    let chars: Vec<char> = safe.chars().collect();
+    let width = area.width as usize;
+    for (line, chunk) in chars.chunks(width).take(area.height as usize).enumerate() {
+        let text: String = chunk.iter().collect();
+        w::text(buf, area.x, area.y + line as u16, area.width, &text, style);
     }
 }
 

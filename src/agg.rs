@@ -123,7 +123,7 @@ impl Filter {
         }
     }
 
-    fn admits(&self, e: &UsageEvent) -> bool {
+    pub(crate) fn admits(&self, e: &UsageEvent) -> bool {
         if !self.sources.contains(&e.source) {
             return false;
         }
