@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 /// Bumped whenever the parsers or the on-disk shape change meaning. A stale
 /// cache is discarded silently and rebuilt rather than migrated.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Identity of a file, used to detect replacement under a stable path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

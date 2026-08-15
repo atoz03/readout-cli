@@ -19,6 +19,7 @@ use crate::pricing::Pricing;
 use crate::scan::{self, Progress};
 use anyhow::Result;
 use app::{App, Drill, Loading, Page, Range, Rescan};
+use crossterm::cursor;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -55,12 +56,11 @@ pub fn run(sources: Vec<Source>, base: Filter, use_cache: bool, watch: bool) -> 
     let mut app = App::new(sources.clone(), base, pricing);
     app.watch = watch;
 
-    let mut terminal = setup()?;
-    // Whatever happens below, the terminal must come back. Restoring before
-    // propagating means a panic or error never leaves the user in raw mode
-    // with a hidden cursor.
+    let (mut terminal, mut guard) = setup()?;
+    // Whatever happens below, the guard restores the terminal before an error
+    // propagates, and during unwinding as well.
     let result = event_loop(&mut terminal, &mut app, sources, use_cache);
-    restore(&mut terminal)?;
+    guard.restore(&mut terminal)?;
     result
 }
 
@@ -124,21 +124,40 @@ fn render_ansi(buf: &ratatui::buffer::Buffer) -> String {
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
-fn setup() -> Result<Term> {
+struct TerminalGuard {
+    active: bool,
+}
+
+impl TerminalGuard {
+    fn restore(&mut self, terminal: &mut Term) -> Result<()> {
+        disable_raw_mode()?;
+        execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
+        terminal.show_cursor()?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let _ = disable_raw_mode();
+        let mut out = io::stdout();
+        let _ = execute!(out, DisableMouseCapture, LeaveAlternateScreen, cursor::Show);
+    }
+}
+
+fn setup() -> Result<(Term, TerminalGuard)> {
     enable_raw_mode()?;
+    let guard = TerminalGuard { active: true };
     let mut out = io::stdout();
     execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
     terminal.hide_cursor()?;
     terminal.clear()?;
-    Ok(terminal)
-}
-
-fn restore(terminal: &mut Term) -> Result<()> {
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    Ok(())
+    Ok((terminal, guard))
 }
 
 fn spawn_scan(sources: Vec<Source>, use_cache: bool) -> Receiver<ScanMsg> {
@@ -366,6 +385,11 @@ fn apply(app: &mut App, action: Action) {
                 app.selected = i;
             }
         }
+        Action::SessionRow(i) => {
+            app.set_page(Page::Sessions);
+            app.selected = i;
+            app.scroll = i;
+        }
         Action::ClearFilter => app.set_drill(Drill::None),
         Action::Refresh => app.request_rescan(Rescan::Manual),
         Action::ToggleWatch => app.toggle_watch(),
@@ -582,6 +606,22 @@ mod tests {
         let label = a.summary.by_model[target].label.clone();
         apply(&mut a, Action::Row(target));
         assert_eq!(a.drill, Drill::Model(label), "the second click opens the row");
+    }
+
+    #[test]
+    fn an_overview_session_row_opens_and_filters_the_session_not_a_model() {
+        let mut a = app_with_data();
+        let target = 1;
+        let session = a.summary.by_session[target].label.clone();
+
+        apply(&mut a, Action::SessionRow(target));
+        assert_eq!(a.page, Page::Sessions);
+        assert_eq!(a.selected, target);
+        assert_eq!(a.drill, Drill::None);
+
+        apply(&mut a, Action::Row(target));
+        assert_eq!(a.drill, Drill::Session(session));
+        assert_eq!(a.summary.total.session_count(), 1);
     }
 
     #[test]

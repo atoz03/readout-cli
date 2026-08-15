@@ -118,8 +118,9 @@ display values only — the underlying numbers are always real.
 
 ## Invariants
 
-**Read-only, by construction.** Only `~/.claude/projects/**` and
-`~/.codex/sessions/**` (+ `archived_sessions/`) are opened;
+**Read-only, by construction.** Only `~/.claude/projects/**` and active
+`~/.codex/sessions/**` are opened; `archived_sessions/` is intentionally out of
+scope;
 `~/.claude/settings.json`, `~/.codex/config.toml` and `~/.codex/auth.json` hold
 live credentials and are never touched. The only write target is the state dir.
 Widening read scope breaks the product's central promise — `paths.rs` is the

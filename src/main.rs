@@ -45,14 +45,14 @@ struct Cli {
 #[derive(Args, Debug, Clone)]
 struct Common {
     /// Limit to the last N days (default: all time)
-    #[arg(long, short = 'd', global = true)]
+    #[arg(long, short = 'd', global = true, value_parser = parse_days)]
     days: Option<i64>,
 
     /// Only this tool: claude or codex
     #[arg(long, short = 's', global = true)]
     source: Option<String>,
 
-    /// Only this project
+    /// Only this project (full working directory)
     #[arg(long, short = 'p', global = true)]
     project: Option<String>,
 
@@ -63,6 +63,19 @@ struct Common {
     /// Ignore the incremental cache and reparse everything
     #[arg(long, global = true)]
     no_cache: bool,
+}
+
+/// A bounded calendar window. Larger histories should use the all-time view;
+/// accepting arbitrary `i64` values here would let CSV attempt an effectively
+/// unbounded allocation after converting the value to `usize`.
+fn parse_days(raw: &str) -> std::result::Result<i64, String> {
+    const MAX_DAYS: i64 = 36_500;
+    let days = raw.parse::<i64>().map_err(|_| "days must be a whole number".to_string())?;
+    if (1..=MAX_DAYS).contains(&days) {
+        Ok(days)
+    } else {
+        Err(format!("days must be between 1 and {MAX_DAYS}"))
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -143,7 +156,7 @@ fn main() -> Result<()> {
             if json {
                 println!("{}", report::json(&s, &stats, cli.common.days));
             } else if csv {
-                print!("{}", report::csv(&s, cli.common.days.unwrap_or(30)));
+                print!("{}", report::csv(&s, cli.common.days.unwrap_or(30) as usize));
             } else {
                 print!("{}", report::text(&s, &stats, cli.common.days));
                 for m in report::missing_sources(&sources) {
@@ -178,7 +191,7 @@ fn main() -> Result<()> {
             if json {
                 println!("{}", report::json(&s, &stats, cli.common.days));
             } else if csv {
-                print!("{}", report::csv(&s, cli.common.days.unwrap_or(30)));
+                print!("{}", report::csv(&s, cli.common.days.unwrap_or(30) as usize));
             } else {
                 println!("{:<12} {:>12} {:>10} {:>9}", "date", "tokens", "cost", "requests");
                 for d in &s.daily {
@@ -202,7 +215,7 @@ fn main() -> Result<()> {
                 if path.exists() {
                     eprintln!("{} already exists; not overwriting.", path.display());
                 } else {
-                    std::fs::write(&path, pricing.starter_override(&observed))?;
+                    std::fs::write(&path, pricing.starter_override(&observed)?)?;
                     println!("Wrote {}", path.display());
                     println!("Edit the zeroed rows to price the models readout has no rate for.");
                 }
@@ -262,13 +275,14 @@ fn load(common: &Common, sources: &[Source]) -> Result<Loaded> {
 }
 
 fn build_filter(common: &Common, sources: &[Source]) -> Filter {
+    let today = chrono::Local::now().date_naive();
     Filter {
         sources: sources.to_vec(),
-        since: common
-            .days
-            .map(|d| chrono::Local::now().date_naive() - chrono::Duration::days(d.max(1) - 1)),
+        since: common.days.map(|d| today - chrono::Duration::days(d - 1)),
+        until: Some(today),
         project: common.project.clone(),
         model: common.model.clone(),
+        session: None,
     }
 }
 
@@ -299,5 +313,20 @@ fn print_buckets(buckets: &[agg::Bucket], kind: &str, grand_total: u64) {
             share,
             fmt::count(b.events),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn days_rejects_zero_negative_and_impractically_large_windows() {
+        assert_eq!(parse_days("1"), Ok(1));
+        assert_eq!(parse_days("36500"), Ok(36_500));
+        assert!(parse_days("0").is_err());
+        assert!(parse_days("-7").is_err());
+        assert!(parse_days("36501").is_err());
+        assert!(parse_days("nope").is_err());
     }
 }

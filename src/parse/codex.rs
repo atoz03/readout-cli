@@ -111,8 +111,8 @@ pub fn parse_file(path: &Path, cursor: &ParseCursor, bytes: &[u8]) -> FileParse 
                 if let Some(m) = payload.get("model").and_then(Value::as_str) {
                     st.model = Some(normalize_codex_model(m));
                 }
-                if st.cwd.is_none() {
-                    st.cwd = payload.get("cwd").and_then(Value::as_str).map(str::to_string);
+                if let Some(cwd) = payload.get("cwd").and_then(Value::as_str) {
+                    st.cwd = Some(cwd.to_string());
                 }
             }
             "event_msg" => {
@@ -264,28 +264,25 @@ pub fn normalize_codex_model(raw: &str) -> String {
     if let Some(pos) = name.rfind('/') {
         name = name[pos + 1..].to_string();
     }
+    let digits =
+        |value: &str, len: usize| value.len() == len && value.bytes().all(|b| b.is_ascii_digit());
     // `-YYYY-MM-DD`
-    if name.len() > 11 {
-        let suffix = &name[name.len() - 11..];
-        let b = suffix.as_bytes();
-        if suffix.is_ascii()
-            && b[0] == b'-'
-            && b[1..5].iter().all(u8::is_ascii_digit)
-            && b[5] == b'-'
-            && b[6..8].iter().all(u8::is_ascii_digit)
-            && b[8] == b'-'
-            && b[9..11].iter().all(u8::is_ascii_digit)
-        {
-            name.truncate(name.len() - 11);
-            return name;
-        }
+    if let Some((ym, day)) = name.rsplit_once('-')
+        && let Some((y, month)) = ym.rsplit_once('-')
+        && let Some((model, year)) = y.rsplit_once('-')
+        && !model.is_empty()
+        && digits(year, 4)
+        && digits(month, 2)
+        && digits(day, 2)
+    {
+        return model.to_string();
     }
     // `-YYYYMMDD`
-    if name.len() > 9 {
-        let (head, tail) = name.split_at(name.len() - 9);
-        if tail.starts_with('-') && tail[1..].bytes().all(|c| c.is_ascii_digit()) {
-            return head.to_string();
-        }
+    if let Some((model, date)) = name.rsplit_once('-')
+        && !model.is_empty()
+        && digits(date, 8)
+    {
+        return model.to_string();
     }
     name
 }
@@ -334,7 +331,7 @@ mod tests {
         assert_eq!(t.output, 404);
         assert_eq!(out.events[0].model, "gpt-5.6-sol");
         assert_eq!(out.events[0].session, "th-1");
-        assert_eq!(out.events[0].project, "demo-proj");
+        assert_eq!(out.events[0].project, "/home/u/demo-proj");
     }
 
     #[test]
@@ -433,5 +430,18 @@ mod tests {
         assert_eq!(normalize_codex_model("gpt-5.4-2026-03-05"), "gpt-5.4");
         assert_eq!(normalize_codex_model("gpt-5.4-20260305"), "gpt-5.4");
         assert_eq!(normalize_codex_model("gpt-5.3-codex"), "gpt-5.3-codex");
+        assert_eq!(normalize_codex_model("你abcdefghij"), "你abcdefghij");
+        assert_eq!(normalize_codex_model("模型-2026-08-15"), "模型");
+        assert_eq!(normalize_codex_model("模型-20260815"), "模型");
+    }
+
+    #[test]
+    fn a_resumed_turn_uses_its_current_working_directory() {
+        let a = token_event((1000, 0, 100), Some((1000, 0, 100)), "codex");
+        let b = token_event((1500, 0, 200), Some((500, 0, 100)), "codex");
+        let moved = CTX.replace("/home/u/demo-proj", "/work/other-proj");
+        let out = parse(&format!("{META}\n{CTX}\n{a}\n{moved}\n{b}\n"));
+        assert_eq!(out.events[0].project, "/home/u/demo-proj");
+        assert_eq!(out.events[1].project, "/work/other-proj");
     }
 }

@@ -87,13 +87,25 @@ pub struct Filter {
     pub sources: Vec<Source>,
     /// Inclusive lower bound on local date. `None` means no bound.
     pub since: Option<NaiveDate>,
+    /// Inclusive upper bound on local date. This is normally today, so a
+    /// transcript written by a misconfigured future clock cannot enter a
+    /// current window while remaining absent from its chart.
+    pub until: Option<NaiveDate>,
     pub project: Option<String>,
     pub model: Option<String>,
+    pub session: Option<String>,
 }
 
 impl Default for Filter {
     fn default() -> Self {
-        Filter { sources: Source::ALL.to_vec(), since: None, project: None, model: None }
+        Filter {
+            sources: Source::ALL.to_vec(),
+            since: None,
+            until: Some(Local::now().date_naive()),
+            project: None,
+            model: None,
+            session: None,
+        }
     }
 }
 
@@ -101,8 +113,10 @@ impl Filter {
     /// A filter covering the last `days` calendar days including today.
     #[cfg(test)]
     pub fn last_days(days: i64) -> Filter {
+        let today = Local::now().date_naive();
         Filter {
-            since: Some(Local::now().date_naive() - chrono::Duration::days(days - 1)),
+            since: Some(today - chrono::Duration::days(days - 1)),
+            until: Some(today),
             ..Default::default()
         }
     }
@@ -111,10 +125,21 @@ impl Filter {
         if !self.sources.contains(&e.source) {
             return false;
         }
-        if let Some(since) = self.since {
-            // Events with no timestamp cannot be placed on the calendar, so a
-            // date-bounded view must exclude them rather than guess.
-            if e.ts == 0 || local_date(e.ts) < since {
+        // Events with no timestamp cannot be placed on the calendar, so a
+        // lower-bounded view must exclude them rather than guess. An all-time
+        // view still keeps them in the lifetime total, but must continue
+        // through the non-date filters below.
+        if e.ts == 0 {
+            if self.since.is_some() {
+                return false;
+            }
+        } else if self.since.is_some() || self.until.is_some() {
+            let Some(date) = local_datetime(e.ts).map(|dt| dt.date_naive()) else {
+                return false;
+            };
+            if self.since.is_some_and(|since| date < since)
+                || self.until.is_some_and(|until| date > until)
+            {
                 return false;
             }
         }
@@ -128,12 +153,13 @@ impl Filter {
         {
             return false;
         }
+        if let Some(s) = &self.session
+            && &e.session != s
+        {
+            return false;
+        }
         true
     }
-}
-
-pub fn local_date(ts: i64) -> NaiveDate {
-    Local.timestamp_opt(ts, 0).single().map(|dt| dt.date_naive()).unwrap_or_default()
 }
 
 pub fn local_datetime(ts: i64) -> Option<DateTime<Local>> {
@@ -406,12 +432,42 @@ mod tests {
     }
 
     #[test]
+    fn a_current_window_excludes_future_events() {
+        let p = Pricing::builtin();
+        let events = vec![
+            ev(Source::Claude, "claude-opus-5", "a", "past", at(0, 9), 1),
+            ev(Source::Claude, "claude-opus-5", "a", "future", at(-1, 9), 1),
+        ];
+        let s = summarize(&events, &Filter::last_days(7), &p);
+        assert_eq!(s.total.events, 1);
+        assert_eq!(s.daily.len(), 1, "the headline and the calendar must cover the same dates");
+    }
+
+    #[test]
     fn undated_events_are_excluded_from_a_windowed_view_not_guessed_into_it() {
         let p = Pricing::builtin();
         let events = vec![ev(Source::Claude, "claude-opus-5", "a", "s", 0, 5)];
         assert_eq!(summarize(&events, &Filter::last_days(7), &p).total.events, 0);
         // With no window they still count toward lifetime totals.
         assert_eq!(summarize(&events, &Filter::default(), &p).total.events, 1);
+    }
+
+    #[test]
+    fn undated_events_still_respect_non_date_filters() {
+        let p = Pricing::builtin();
+        let events = vec![
+            ev(Source::Claude, "claude-opus-5", "alpha", "wanted", 0, 1),
+            ev(Source::Claude, "claude-opus-5", "beta", "wanted", 0, 1),
+            ev(Source::Claude, "other", "alpha", "wanted", 0, 1),
+            ev(Source::Claude, "claude-opus-5", "alpha", "other", 0, 1),
+        ];
+        let filter = Filter {
+            project: Some("alpha".into()),
+            model: Some("claude-opus-5".into()),
+            session: Some("wanted".into()),
+            ..Default::default()
+        };
+        assert_eq!(summarize(&events, &filter, &p).total.events, 1);
     }
 
     #[test]
@@ -427,6 +483,19 @@ mod tests {
             project: Some("alpha".into()),
             ..Default::default()
         };
+        assert_eq!(summarize(&events, &f, &p).total.events, 1);
+    }
+
+    #[test]
+    fn projects_with_the_same_basename_remain_distinct() {
+        let p = Pricing::builtin();
+        let events = vec![
+            ev(Source::Claude, "claude-opus-5", "/work/client/api", "s1", at(0, 9), 1),
+            ev(Source::Claude, "claude-opus-5", "/home/me/api", "s2", at(0, 9), 1),
+        ];
+        let s = summarize(&events, &Filter::default(), &p);
+        assert_eq!(s.by_project.len(), 2);
+        let f = Filter { project: Some("/work/client/api".into()), ..Default::default() };
         assert_eq!(summarize(&events, &f, &p).total.events, 1);
     }
 

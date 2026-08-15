@@ -6,7 +6,7 @@
 use crate::cache::{self, Cache, FileEntry, FileId, Plan};
 use crate::model::{Source, UsageEvent};
 use crate::parse;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -95,12 +95,15 @@ pub fn discover_claude(root: &Path) -> Vec<Target> {
     out
 }
 
-/// Codex buckets rollouts as `YYYY/MM/DD/*.jsonl`, and also keeps
-/// `archived_sessions/`. Walk the tree rather than hardcode the depth.
+/// Codex buckets active rollouts as `YYYY/MM/DD/*.jsonl`. Archived sessions are
+/// intentionally outside readout's scope and are not discovered.
 pub fn discover_codex(root: &Path) -> Vec<Target> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
+        if dir.file_name().and_then(|name| name.to_str()) == Some("archived_sessions") {
+            continue;
+        }
         let Ok(rd) = std::fs::read_dir(&dir) else { continue };
         for e in rd.flatten() {
             let p = e.path();
@@ -165,12 +168,12 @@ pub fn scan(
     let cache_ref = &*cache;
 
     let parse_start = Instant::now();
-    let results: Vec<Option<(String, FileEntry, ParseOutcome)>> = targets
+    let results: Vec<Result<(String, FileEntry, ParseOutcome)>> = targets
         .par_iter()
         .map(|t| {
             let out = scan_one(t, cache_ref);
             let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-            if let Some((_, _, ref outcome)) = out {
+            if let Ok((_, _, ref outcome)) = out {
                 bytes_read.fetch_add(outcome.bytes_read, Ordering::Relaxed);
             }
             if let Some(cb) = on_progress {
@@ -192,9 +195,12 @@ pub fn scan(
         ..Default::default()
     };
 
+    // Do not partially mutate the cache when one worker failed. The caller can
+    // keep showing the previous complete result and retry the whole scan.
+    let results: Vec<_> = results.into_iter().collect::<Result<_>>()?;
     let mut seen: HashSet<String> = HashSet::with_capacity(total);
     let mut all: Vec<UsageEvent> = Vec::new();
-    for item in results.into_iter().flatten() {
+    for item in results {
         let (key, entry, outcome) = item;
         match outcome.plan {
             Plan::Unchanged => stats.files_reused += 1,
@@ -223,24 +229,23 @@ struct ParseOutcome {
     bytes_read: u64,
 }
 
-fn scan_one(t: &Target, cache: &Cache) -> Option<(String, FileEntry, ParseOutcome)> {
+fn scan_one(t: &Target, cache: &Cache) -> Result<(String, FileEntry, ParseOutcome)> {
     let key = cache::key(&t.path);
-    let meta = std::fs::metadata(&t.path).ok()?;
-    if !meta.is_file() {
-        return None;
-    }
+    let meta = std::fs::metadata(&t.path)
+        .with_context(|| format!("reading metadata for {}", t.path.display()))?;
+    anyhow::ensure!(meta.is_file(), "transcript is no longer a file: {}", t.path.display());
     let existing = cache.files.get(&key);
     let plan = cache::plan(existing, &meta);
 
     match &plan {
         Plan::Unchanged => {
-            let e = existing?.clone();
-            Some((key, e, ParseOutcome { plan, bytes_read: 0 }))
+            let e = existing.context("unchanged scan plan had no cache entry")?.clone();
+            Ok((key, e, ParseOutcome { plan, bytes_read: 0 }))
         }
         Plan::Append { from_offset, cursor } => {
-            let bytes = cache::read_from(&t.path, *from_offset).ok()?;
+            let bytes = cache::read_from(&t.path, *from_offset)?;
             let parsed = run_parser(t, cursor, &bytes);
-            let prev = existing?;
+            let prev = existing.context("append scan plan had no cache entry")?;
             let mut events = prev.events.clone();
             events.extend(parsed.events);
             let entry = FileEntry {
@@ -253,10 +258,11 @@ fn scan_one(t: &Target, cache: &Cache) -> Option<(String, FileEntry, ParseOutcom
                 skipped_synthetic: prev.skipped_synthetic + parsed.skipped_synthetic,
             };
             let read = bytes.len() as u64;
-            Some((key, entry, ParseOutcome { plan, bytes_read: read }))
+            Ok((key, entry, ParseOutcome { plan, bytes_read: read }))
         }
         Plan::Full => {
-            let bytes = std::fs::read(&t.path).ok()?;
+            let bytes = std::fs::read(&t.path)
+                .with_context(|| format!("reading transcript {}", t.path.display()))?;
             let parsed = run_parser(t, &parse::ParseCursor::default(), &bytes);
             let entry = FileEntry {
                 id: FileId::of(&meta),
@@ -268,7 +274,7 @@ fn scan_one(t: &Target, cache: &Cache) -> Option<(String, FileEntry, ParseOutcom
                 skipped_synthetic: parsed.skipped_synthetic,
             };
             let read = bytes.len() as u64;
-            Some((key, entry, ParseOutcome { plan, bytes_read: read }))
+            Ok((key, entry, ParseOutcome { plan, bytes_read: read }))
         }
     }
 }
@@ -437,5 +443,42 @@ mod tests {
         names.sort();
         assert_eq!(names, vec!["agent-1.jsonl", "journal.jsonl", "main.jsonl", "sub.jsonl"]);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_transcript_that_disappears_after_discovery_fails_the_scan() {
+        let target = Target {
+            path: std::env::temp_dir().join(format!(
+                "readout-missing-{}-{}.jsonl",
+                std::process::id(),
+                line!()
+            )),
+            source: Source::Codex,
+        };
+        let mut cache = Cache::default();
+        let err = scan(&[target], &mut cache, None).err().expect("missing file must be reported");
+        assert!(err.to_string().contains("metadata"));
+    }
+
+    #[test]
+    fn codex_discovery_does_not_cross_into_archived_sessions() {
+        let root = std::env::temp_dir().join(format!(
+            "readout-codex-scope-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let sessions = root.join("sessions").join("2026").join("08").join("15");
+        let archived = root.join("archived_sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::create_dir_all(&archived).unwrap();
+        std::fs::write(sessions.join("live.jsonl"), b"").unwrap();
+        std::fs::write(archived.join("old.jsonl"), b"").unwrap();
+
+        // Deliberately pass the broader parent rather than `sessions`: the
+        // discovery layer itself must enforce the archive exclusion too.
+        let found = discover_codex(&root);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].path.file_name().and_then(|s| s.to_str()), Some("live.jsonl"));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

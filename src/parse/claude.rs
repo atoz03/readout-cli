@@ -30,6 +30,7 @@ struct Assistant {
     has_stop_reason: bool,
     ts: i64,
     session: String,
+    cwd: Option<String>,
 }
 
 /// Rank used by the replace rule. Higher wins; ties fall through to
@@ -60,11 +61,11 @@ pub fn parse_file(path: &Path, cursor: &ParseCursor, bytes: &[u8]) -> FileParse 
         if !contains(raw, b"\"assistant\"") || !contains(raw, b"\"usage\"") {
             // `cwd` is on non-assistant records too, and it is the only
             // reliable way to recover the real project path.
-            if cwd.is_none()
-                && contains(raw, b"\"cwd\"")
+            if contains(raw, b"\"cwd\"")
                 && let Ok(v) = serde_json::from_slice::<Value>(raw)
+                && let Some(next) = v.get("cwd").and_then(Value::as_str)
             {
-                cwd = v.get("cwd").and_then(Value::as_str).map(str::to_string);
+                cwd = Some(next.to_string());
             }
             continue;
         }
@@ -72,10 +73,15 @@ pub fn parse_file(path: &Path, cursor: &ParseCursor, bytes: &[u8]) -> FileParse 
         if v.get("type").and_then(Value::as_str) != Some("assistant") {
             continue;
         }
-        if cwd.is_none() {
-            cwd = v.get("cwd").and_then(Value::as_str).map(str::to_string);
+        if let Some(next) = v.get("cwd").and_then(Value::as_str) {
+            cwd = Some(next.to_string());
         }
-        let Some(parsed) = parse_assistant(&v) else { continue };
+        let Some(mut parsed) = parse_assistant(&v) else { continue };
+        // Some transcript variants put `cwd` only on the preceding user or
+        // system record. Snapshot the directory in effect now; using the
+        // parser's final cwd later would reassign earlier requests after a
+        // resumed session changes directories.
+        parsed.cwd = cwd.clone();
         if parsed.model.starts_with('<') {
             skipped_synthetic += 1;
             continue;
@@ -117,7 +123,11 @@ pub fn parse_file(path: &Path, cursor: &ParseCursor, bytes: &[u8]) -> FileParse 
             ts: a.ts,
             model: a.model,
             session: a.session,
-            project: project.clone(),
+            project: a
+                .cwd
+                .as_deref()
+                .map(crate::paths::project_label_from_cwd)
+                .unwrap_or_else(|| project.clone()),
             tokens: a.tokens,
             dedup_rank: rank(a.has_stop_reason),
             dedup_key: Some(a.message_id),
@@ -169,6 +179,7 @@ fn parse_assistant(v: &Value) -> Option<Assistant> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
+        cwd: v.get("cwd").and_then(Value::as_str).map(str::to_string),
     })
 }
 
@@ -245,7 +256,7 @@ mod tests {
         let e = &out.events[0];
         assert_eq!(e.model, "claude-opus-5");
         assert_eq!(e.session, "s1");
-        assert_eq!(e.project, "proj");
+        assert_eq!(e.project, "/home/u/proj");
         assert_eq!(e.tokens.input, 10);
         assert_eq!(e.tokens.output, 20);
         assert_eq!(e.tokens.cache_read, 30);
@@ -336,5 +347,29 @@ mod tests {
         let no_cwd = MSG.replace(r#""cwd":"/home/u/proj","#, "");
         let out = parse(&format!("{no_cwd}\n"));
         assert_eq!(out.events[0].project, "a-b");
+    }
+
+    #[test]
+    fn each_response_keeps_the_cwd_in_effect_for_that_request() {
+        let first = MSG;
+        let second = MSG
+            .replace(r#""id":"msg_1""#, r#""id":"msg_2""#)
+            .replace("/home/u/proj", "/work/other/proj");
+        let out = parse(&format!("{first}\n{second}\n"));
+        let mut projects: Vec<_> = out.events.iter().map(|e| e.project.as_str()).collect();
+        projects.sort();
+        assert_eq!(projects, vec!["/home/u/proj", "/work/other/proj"]);
+    }
+
+    #[test]
+    fn cwd_from_a_preceding_record_is_snapshotted_per_response() {
+        let first = MSG.replace(r#""cwd":"/home/u/proj","#, "");
+        let second = first.replace(r#""id":"msg_1""#, r#""id":"msg_2""#);
+        let home = r#"{"type":"user","cwd":"/home/u/proj"}"#;
+        let work = r#"{"type":"user","cwd":"/work/other/proj"}"#;
+        let out = parse(&format!("{home}\n{first}\n{work}\n{second}\n"));
+        let mut projects: Vec<_> = out.events.iter().map(|e| e.project.as_str()).collect();
+        projects.sort();
+        assert_eq!(projects, vec!["/home/u/proj", "/work/other/proj"]);
     }
 }

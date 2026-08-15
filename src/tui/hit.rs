@@ -22,6 +22,9 @@ pub enum Action {
     ToggleSource(crate::model::Source),
     /// Select row `usize` of the focused list.
     Row(usize),
+    /// A session row shown on Overview; open the Sessions page without
+    /// accidentally interpreting its index as a model row.
+    SessionRow(usize),
     /// Clear any drill-down filter.
     ClearFilter,
     /// Re-run the scan.

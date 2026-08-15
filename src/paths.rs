@@ -6,7 +6,7 @@
 //! not backed up. Nothing in this crate needs them.
 
 use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// `~/.claude/projects` — one subdirectory per project, each holding session
 /// transcripts plus nested subagent/workflow transcripts.
@@ -65,13 +65,19 @@ pub fn project_label_from_claude_dir(dir_name: &str) -> String {
     if trimmed.is_empty() { dir_name.to_string() } else { trimmed.to_string() }
 }
 
-/// Codex records a real `cwd`; take its basename.
+/// Preserve the full working directory as the project identity.
+///
+/// Basenames are pleasant to read but not unique: `/work/client/api` and
+/// `/home/me/api` must not collapse into one project and one CLI filter. The
+/// renderers already ellipsize long labels where necessary.
 pub fn project_label_from_cwd(cwd: &str) -> String {
-    Path::new(cwd)
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| cwd.to_string())
+    let trimmed = cwd.trim();
+    let without_trailing = trimmed.trim_end_matches(['/', '\\']);
+    if without_trailing.is_empty() || without_trailing.ends_with(':') {
+        trimmed.to_string()
+    } else {
+        without_trailing.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -89,8 +95,10 @@ mod tests {
     }
 
     #[test]
-    fn cwd_reduces_to_basename() {
-        assert_eq!(project_label_from_cwd("/home/u/proj/readout-cli"), "readout-cli");
+    fn cwd_remains_an_unambiguous_project_identity() {
+        assert_eq!(project_label_from_cwd("/home/u/proj/readout-cli"), "/home/u/proj/readout-cli");
+        assert_eq!(project_label_from_cwd("/home/u/proj/"), "/home/u/proj");
+        assert_eq!(project_label_from_cwd(r"C:\work\api"), r"C:\work\api");
         assert_eq!(project_label_from_cwd("/"), "/");
     }
 }

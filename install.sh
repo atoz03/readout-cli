@@ -71,23 +71,23 @@ fetch "${base}/${archive}" "${tmp}/${archive}" || die "no build for ${target} in
 
 # Verify against the checksums published with the release. A silent mismatch
 # is the one failure mode worth spending a second on.
-if fetch "${base}/SHA256SUMS" "${tmp}/SHA256SUMS" 2>/dev/null; then
-  expected="$(grep " ${archive}\$" "${tmp}/SHA256SUMS" | awk '{print $1}' || true)"
-  if [ -n "$expected" ]; then
-    if command -v sha256sum >/dev/null 2>&1; then
-      actual="$(sha256sum "${tmp}/${archive}" | awk '{print $1}')"
-    elif command -v shasum >/dev/null 2>&1; then
-      actual="$(shasum -a 256 "${tmp}/${archive}" | awk '{print $1}')"
-    else
-      actual=""
-      say "  no sha256 tool found — skipping checksum verification"
-    fi
-    if [ -n "$actual" ] && [ "$actual" != "$expected" ]; then
-      die "checksum mismatch for ${archive}: expected ${expected}, got ${actual}"
-    fi
-    [ -n "$actual" ] && say "  checksum ok"
-  fi
+fetch "${base}/SHA256SUMS" "${tmp}/SHA256SUMS" 2>/dev/null \
+  || die "could not download SHA256SUMS for ${version}"
+expected="$(awk -v name="$archive" '
+  { file = $2; sub(/^\*/, "", file); if (file == name) { print $1; exit } }
+' "${tmp}/SHA256SUMS")"
+[ -n "$expected" ] || die "SHA256SUMS has no entry for ${archive}"
+if command -v sha256sum >/dev/null 2>&1; then
+  actual="$(sha256sum "${tmp}/${archive}" | awk '{print $1}')"
+elif command -v shasum >/dev/null 2>&1; then
+  actual="$(shasum -a 256 "${tmp}/${archive}" | awk '{print $1}')"
+else
+  die "sha256sum or shasum is required to verify the download"
 fi
+if [ "$actual" != "$expected" ]; then
+  die "checksum mismatch for ${archive}: expected ${expected}, got ${actual}"
+fi
+say "  checksum ok"
 
 tar xzf "${tmp}/${archive}" -C "$tmp"
 binary="${tmp}/readout-${version}-${target}/readout"

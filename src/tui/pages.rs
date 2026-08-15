@@ -979,7 +979,8 @@ fn session_list(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect, sc
         let y = area.y + (i - scroll) as u16;
         let row = Rect { x: area.x, y, width: area.width, height: 1 };
         let selected = app.page == Page::Sessions && i == app.selected;
-        if selected || app.hover == Some(i as u64) {
+        let hover_id = w::hover_id(&format!("session:{i}"));
+        if selected || app.hover == Some(hover_id) {
             w::fill(
                 buf,
                 row,
@@ -1019,7 +1020,9 @@ fn session_list(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect, sc
             &fmt::relative(b.last_ts),
             Style::default().fg(theme::TEXT_MUTED),
         );
-        hits.add_hoverable(row, Action::Row(i), i as u64);
+        let action =
+            if app.page == Page::Overview { Action::SessionRow(i) } else { Action::Row(i) };
+        hits.add_hoverable(row, action, hover_id);
     }
 }
 

@@ -99,26 +99,25 @@
     # Verify against the checksums published with the release. A silent
     # mismatch is the one failure mode worth spending a second on.
     $sums = Join-Path $tmp 'SHA256SUMS'
-    try { Invoke-WebRequest "$base/SHA256SUMS" -OutFile $sums -UseBasicParsing } catch { }
-    if (Test-Path $sums) {
-      # sha256sum wrote the zip in binary mode, so its line reads `<hash> *<name>`
-      # while the tarballs read `<hash>  <name>`. Tolerate both markers.
-      $expected = Get-Content $sums | ForEach-Object {
-        if ($_ -match '^([0-9a-fA-F]{64})\s+\*?(.+)$' -and $matches[2] -eq $archive) { $matches[1] }
-      } | Select-Object -First 1
-      if ($expected) {
-        # Get-FileHash returns uppercase hex and sha256sum writes lowercase.
-        # PowerShell's -ne on strings is case-insensitive, which is what we want
-        # here and the reason this is not comparing normalized copies.
-        $actual = (Get-FileHash $zip -Algorithm SHA256).Hash
-        if ($actual -ne $expected) {
-          die "checksum mismatch for ${archive}: expected $expected, got $actual"
-        }
-        say '  checksum ok'
-      }
-    } else {
-      say '  no SHA256SUMS published for this release - skipping checksum verification'
+    try {
+      Invoke-WebRequest "$base/SHA256SUMS" -OutFile $sums -UseBasicParsing
+    } catch {
+      die "could not download SHA256SUMS for $version"
     }
+    # sha256sum wrote the zip in binary mode, so its line reads `<hash> *<name>`
+    # while the tarballs read `<hash>  <name>`. Tolerate both markers.
+    $expected = Get-Content $sums | ForEach-Object {
+      if ($_ -match '^([0-9a-fA-F]{64})\s+\*?(.+)$' -and $matches[2] -eq $archive) { $matches[1] }
+    } | Select-Object -First 1
+    if (-not $expected) { die "SHA256SUMS has no entry for $archive" }
+    # Get-FileHash returns uppercase hex and sha256sum writes lowercase.
+    # PowerShell's -ne on strings is case-insensitive, which is what we want
+    # here and the reason this is not comparing normalized copies.
+    $actual = (Get-FileHash $zip -Algorithm SHA256).Hash
+    if ($actual -ne $expected) {
+      die "checksum mismatch for ${archive}: expected $expected, got $actual"
+    }
+    say '  checksum ok'
 
     Expand-Archive -Path $zip -DestinationPath $tmp -Force
     $binary = Join-Path $tmp "readout-$version-$target\readout.exe"

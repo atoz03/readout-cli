@@ -102,7 +102,7 @@ pub struct UsageEvent {
     pub model: String,
     /// Session / thread identifier.
     pub session: String,
-    /// Human-facing project name (decoded working directory basename).
+    /// Full working directory used as an unambiguous project identity.
     pub project: String,
     pub tokens: Tokens,
     /// Stable id used to drop duplicates seen across forked transcripts.
@@ -148,12 +148,12 @@ const EFFORT_SUFFIXES: [&str; 5] = ["-minimal", "-low", "-medium", "-high", "-xh
 /// every id of the same model shares one price row. Charts still bucket by the
 /// raw model id — this is a pricing lookup, not a display grouping.
 pub fn pricing_key(model: &str) -> &str {
-    let bytes = model.as_bytes();
-    if bytes.len() > 9 {
-        let (head, tail) = model.split_at(bytes.len() - 9);
-        if tail.starts_with('-') && tail[1..].bytes().all(|b| b.is_ascii_digit()) {
-            return head;
-        }
+    if let Some((head, date)) = model.rsplit_once('-')
+        && !head.is_empty()
+        && date.len() == 8
+        && date.bytes().all(|b| b.is_ascii_digit())
+    {
+        return head;
     }
     for suffix in EFFORT_SUFFIXES {
         if let Some(head) = model.strip_suffix(suffix)
@@ -206,5 +206,9 @@ mod tests {
         assert_eq!(pricing_key("gpt-5.2"), "gpt-5.2");
         // Not a date: must not be trimmed.
         assert_eq!(pricing_key("model-abcdefgh"), "model-abcdefgh");
+        // Transcript fields are external input. Byte-counted ASCII suffix
+        // checks must not slice through a multi-byte character.
+        assert_eq!(pricing_key("你abcdefgh"), "你abcdefgh");
+        assert_eq!(pricing_key("模型-20260815"), "模型");
     }
 }

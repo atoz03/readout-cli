@@ -226,14 +226,14 @@ pub fn json(s: &Summary, stats: &ScanStats, days: Option<i64>) -> String {
 }
 
 /// Daily CSV — the shape most useful to pipe into a spreadsheet.
-pub fn csv(s: &Summary, days: i64) -> String {
-    let mut o = String::from("date,tokens,cost_usd,requests\n");
-    let dense = dense_daily(&s.daily, days as usize);
+pub fn csv(s: &Summary, days: usize) -> String {
+    let mut o = String::from("date,tokens,cost_usd,cost_coverage,requests\n");
+    let dense = dense_daily(&s.daily, days);
     let by_date: std::collections::HashMap<_, _> =
-        s.daily.iter().map(|d| (d.date, d.bucket.events)).collect();
+        s.daily.iter().map(|d| (d.date, (d.bucket.events, d.bucket.priced.coverage()))).collect();
     for (date, tokens, cost) in dense {
-        let requests = by_date.get(&date).copied().unwrap_or(0);
-        let _ = writeln!(o, "{date},{tokens},{cost:.6},{requests}");
+        let (requests, coverage) = by_date.get(&date).copied().unwrap_or((0, 1.0));
+        let _ = writeln!(o, "{date},{tokens},{cost:.6},{coverage:.6},{requests}");
     }
     o
 }
@@ -337,7 +337,9 @@ mod tests {
         let s = summarize(&sample(), &Filter::default(), &p);
         let out = csv(&s, 7);
         assert_eq!(out.lines().count(), 8, "header plus seven days");
-        assert!(out.starts_with("date,tokens,cost_usd,requests\n"));
+        assert!(out.starts_with("date,tokens,cost_usd,cost_coverage,requests\n"));
+        let today: Vec<_> = out.lines().last().unwrap().split(',').collect();
+        assert!(today[3].parse::<f64>().unwrap() < 1.0, "partial cost must be explicit in CSV");
     }
 
     #[test]

@@ -22,7 +22,8 @@ readout summary --json   # …for a script
 `readout` opens exactly two directories:
 
 - `~/.claude/projects/**/*.jsonl`
-- `~/.codex/sessions/**/*.jsonl` (and `archived_sessions/`)
+- `~/.codex/sessions/**/*.jsonl` (active sessions only; `archived_sessions/` is
+  intentionally out of scope)
 
 It never opens `~/.claude/settings.json`, `~/.codex/config.toml`, or
 `~/.codex/auth.json`. Those files hold live API credentials, and nothing here
@@ -100,7 +101,8 @@ Everything on screen that means something is clickable.
 | Sidebar entry | switch page |
 | `Today` `7d` `30d` `90d` `All` | change the time window |
 | `● Claude Code` / `● Codex` | include or exclude that tool |
-| A row in any list | select it; click again to filter the whole dashboard by it |
+| A model, project, or session row | select it; click again to filter the dashboard by it |
+| A day or rate row | select it |
 | A KPI tile | jump to the page that breaks it down |
 | A card header (`›`) | open the full page for that card |
 | `● live`, bottom right | start or stop watching |
@@ -112,7 +114,7 @@ Everything on screen that means something is clickable.
 |---|---|
 | `↑` `↓` / `j` `k` | move the selection (the window scrolls to follow) |
 | `PgUp` `PgDn` `Home` `End` | move it faster |
-| `Enter` | filter everything by the selected row |
+| `Enter` | filter by the selected model, project, or session |
 | `Esc` | clear that filter |
 | `Tab` / `Shift-Tab`, `←` `→` | change page |
 | `t` / `1` `2` `3` `4` | today / 7d / 30d / 90d / all time |
@@ -177,15 +179,17 @@ readout snapshot [--width N] [--height N] [--page overview|daily|models|projects
 Filters apply to every subcommand, the dashboard included:
 
 ```
--d, --days N        the last N days (default: all time)
+-d, --days N        the last N days, 1–36500 (default: all time)
 -s, --source S      claude or codex
--p, --project P     one project
+-p, --project P     one project, identified by its full working directory
 -m, --model M       one model
     --no-cache      reparse everything, ignoring the incremental cache
 ```
 
 `snapshot` prints a single dashboard frame at a fixed size, with no terminal
 setup and no input — useful in a bug report, a diff, or a layout check.
+Daily CSV includes `cost_coverage`, so a partial estimate cannot be mistaken
+for a complete cost.
 
 ## Cost, and what `+` means
 
@@ -223,9 +227,9 @@ readout pricing --init      # writes ~/.cache/readout/pricing.json,
                             # pre-filled with every model in your data
 ```
 
-Known models come out at their built-in rate; unknown ones come out zeroed, so
-the ones that need your attention are the ones reading `0.00`. Edit the `input`
-/ `output` numbers (USD per million tokens) and they take precedence over the
+Known models come out at their built-in rate; unknown ones come out zeroed as
+placeholders, but remain unpriced until you edit their `input` / `output`
+numbers (USD per million tokens). The edited values take precedence over the
 built-in table on the next run. `--init` will not overwrite a file that already
 exists.
 

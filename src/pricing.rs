@@ -86,6 +86,37 @@ impl Rate {
             + per(t.cache_write_5m, self.cache_write_5m_rate())
             + per(t.cache_write_1h, self.cache_write_1h_rate())
     }
+
+    fn validate(&self, model: &str) -> Result<()> {
+        let fields = [
+            ("input", Some(self.input)),
+            ("output", Some(self.output)),
+            ("cache_read", self.cache_read),
+            ("cache_write_5m", self.cache_write_5m),
+            ("cache_write_1h", self.cache_write_1h),
+        ];
+        for (field, value) in fields {
+            if let Some(value) = value
+                && (!value.is_finite() || value < 0.0)
+            {
+                anyhow::bail!(
+                    "invalid {field} rate for `{model}`: expected a finite non-negative number"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// `pricing --init` writes unknown models as zeroed placeholders. They are
+    /// deliberately not rates: merely creating the starter file must not turn
+    /// an unknown cost into a confidently reported `$0`.
+    fn is_zero_placeholder(&self) -> bool {
+        self.input == 0.0
+            && self.output == 0.0
+            && self.cache_read.unwrap_or(0.0) == 0.0
+            && self.cache_write_5m.unwrap_or(0.0) == 0.0
+            && self.cache_write_1h.unwrap_or(0.0) == 0.0
+    }
 }
 
 /// Anthropic first-party list prices (source: bundled `claude-api` skill
@@ -184,9 +215,24 @@ impl Pricing {
             format!("parsing {} (expected {{model: {{input, output}}}})", path.display())
         })?;
         for (model, rate) in overrides {
-            pricing.rates.insert(model, rate);
+            pricing.apply_override(model, rate)?;
         }
         Ok(pricing)
+    }
+
+    fn apply_override(&mut self, model: String, rate: Rate) -> Result<()> {
+        rate.validate(&model)?;
+        if rate.is_zero_placeholder() {
+            if self.rates.contains_key(&model) {
+                anyhow::bail!(
+                    "zeroed rate for built-in model `{model}` is ambiguous; remove the row to use the built-in rate"
+                );
+            }
+            // Unknown starter rows remain unpriced until the user fills them.
+            return Ok(());
+        }
+        self.rates.insert(model, rate);
+        Ok(())
     }
 
     pub fn rate(&self, model: &str) -> Option<Rate> {
@@ -223,18 +269,17 @@ impl Pricing {
 
     /// Emit a starter override file listing every model in `models`, with
     /// built-in rates filled in and unknown ones zeroed for the user to edit.
-    pub fn starter_override(&self, models: &[String]) -> String {
-        let mut out = String::from("{\n");
-        for (i, m) in models.iter().enumerate() {
-            let r = self.rate(m).unwrap_or(Rate::new(0.0, 0.0));
-            let comma = if i + 1 == models.len() { "" } else { "," };
-            out.push_str(&format!(
-                "  \"{m}\": {{ \"input\": {:.2}, \"output\": {:.2} }}{comma}\n",
-                r.input, r.output
-            ));
-        }
-        out.push_str("}\n");
-        out
+    pub fn starter_override(&self, models: &[String]) -> Result<String> {
+        let rows: std::collections::BTreeMap<_, _> = models
+            .iter()
+            .map(|model| {
+                let rate = self.rate(model).unwrap_or(Rate::new(0.0, 0.0));
+                (model.clone(), rate)
+            })
+            .collect();
+        let mut out = serde_json::to_string_pretty(&rows).context("serializing pricing starter")?;
+        out.push('\n');
+        Ok(out)
     }
 }
 
@@ -351,5 +396,29 @@ mod tests {
         acc.add(&Priced { cost: 0.0, priced_tokens: 0, unpriced_tokens: 100 });
         assert_eq!(acc.total_tokens(), 400);
         assert!((acc.coverage() - 0.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn zeroed_unknown_override_rows_remain_unpriced() {
+        let mut p = Pricing::builtin();
+        p.apply_override("future-model".into(), Rate::new(0.0, 0.0)).unwrap();
+        assert!(!p.is_priced("future-model"));
+        assert!(p.apply_override("gpt-5.2".into(), Rate::new(0.0, 0.0)).is_err());
+    }
+
+    #[test]
+    fn invalid_rates_are_rejected() {
+        let mut p = Pricing::builtin();
+        assert!(p.apply_override("bad".into(), Rate::new(-1.0, 2.0)).is_err());
+        assert!(p.apply_override("bad".into(), Rate::new(f64::INFINITY, 2.0)).is_err());
+    }
+
+    #[test]
+    fn starter_override_escapes_model_names_and_preserves_explicit_cache_rates() {
+        let p = Pricing::builtin();
+        let text = p.starter_override(&["odd\"model\\name".into(), "gpt-5.2".into()]).unwrap();
+        let rows: HashMap<String, Rate> = serde_json::from_str(&text).unwrap();
+        assert!(rows.contains_key("odd\"model\\name"));
+        assert_eq!(rows["gpt-5.2"].cache_write_5m, Some(0.0));
     }
 }

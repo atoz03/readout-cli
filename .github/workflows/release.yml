@@ -131,7 +131,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
+      - name: Verify tag matches crate version
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          crate_version="v$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "readout") | .version')"
+          if [ "$RELEASE_TAG" != "$crate_version" ]; then
+            echo "release tag $RELEASE_TAG does not match crate version $crate_version" >&2
+            exit 1
+          fi
       - name: cargo publish
         env:
           TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

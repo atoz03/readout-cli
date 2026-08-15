@@ -143,6 +143,7 @@ pub enum Drill {
     None,
     Model(String),
     Project(String),
+    Session(String),
 }
 
 impl Drill {
@@ -151,6 +152,7 @@ impl Drill {
             Drill::None => None,
             Drill::Model(m) => Some(format!("model: {m}")),
             Drill::Project(p) => Some(format!("project: {p}")),
+            Drill::Session(s) => Some(format!("session: {s}")),
         }
     }
 }
@@ -285,15 +287,15 @@ impl App {
     }
 
     pub fn filter(&self) -> Filter {
+        let today = chrono::Local::now().date_naive();
         let mut f = Filter { sources: self.active_sources(), ..Default::default() };
-        f.since = self
-            .range
-            .days()
-            .map(|d| chrono::Local::now().date_naive() - chrono::Duration::days(d - 1));
+        f.since = self.range.days().map(|d| today - chrono::Duration::days(d - 1));
+        f.until = Some(today);
         match &self.drill {
             Drill::None => {}
             Drill::Model(m) => f.model = Some(m.clone()),
             Drill::Project(p) => f.project = Some(p.clone()),
+            Drill::Session(s) => f.session = Some(s.clone()),
         }
         f
     }
@@ -525,6 +527,9 @@ impl App {
             }
             Page::Projects => {
                 self.summary.by_project.get(self.selected).map(|b| Drill::Project(b.label.clone()))
+            }
+            Page::Sessions => {
+                self.summary.by_session.get(self.selected).map(|b| Drill::Session(b.label.clone()))
             }
             _ => None,
         };
