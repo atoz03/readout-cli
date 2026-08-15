@@ -74,14 +74,21 @@ pub fn text(s: &Summary, stats: &ScanStats, days: Option<i64>) -> String {
 
     if !s.by_model.is_empty() {
         let _ = writeln!(o, "\n  By model");
-        let width = s.by_model.iter().take(12).map(|b| b.label.chars().count()).max().unwrap_or(8);
+        let width = s
+            .by_model
+            .iter()
+            .take(12)
+            .map(|b| fmt::terminal_ellipsize(&b.label, 48).chars().count())
+            .max()
+            .unwrap_or(8);
         for b in s.by_model.iter().take(12) {
+            let label = fmt::terminal_ellipsize(&b.label, 48);
             let cost =
                 if b.priced.is_complete() { fmt::money(b.priced.cost) } else { "—".to_string() };
             let _ = writeln!(
                 o,
                 "    {:<width$}  {:>15}  {:>10}",
-                b.label,
+                label,
                 fmt::count(b.tokens.total()),
                 cost,
             );
@@ -94,14 +101,14 @@ pub fn text(s: &Summary, stats: &ScanStats, days: Option<i64>) -> String {
             .by_project
             .iter()
             .take(10)
-            .map(|b| b.label.chars().count().min(32))
+            .map(|b| fmt::terminal_text(&b.label).chars().count().min(32))
             .max()
             .unwrap_or(8);
         for b in s.by_project.iter().take(10) {
             let _ = writeln!(
                 o,
                 "    {:<width$}  {:>15}  {:>10}  {}",
-                fmt::ellipsize(&b.label, 32),
+                fmt::terminal_ellipsize(&b.label, 32),
                 fmt::count(b.tokens.total()),
                 fmt::money_partial(b.priced.cost, b.priced.coverage()),
                 fmt::relative(b.last_ts),
@@ -115,7 +122,11 @@ pub fn text(s: &Summary, stats: &ScanStats, days: Option<i64>) -> String {
             "\n  {} of tokens are on {} with no price on file: {}",
             fmt::share(1.0 - s.total.priced.coverage()),
             if s.unpriced_models.len() == 1 { "a model" } else { "models" },
-            s.unpriced_models.join(", "),
+            s.unpriced_models
+                .iter()
+                .map(|model| fmt::terminal_text(model))
+                .collect::<Vec<_>>()
+                .join(", "),
         );
         let _ = writeln!(o, "  Add rates with `readout pricing --init` to include them in cost.");
     }
@@ -256,6 +267,7 @@ pub fn pricing_table(p: &Pricing, observed: &[String]) -> String {
         "model", "input", "output", "cache read", "cache write"
     );
     for (model, rate) in p.known_models() {
+        let model = fmt::terminal_text(&model);
         let _ = writeln!(
             o,
             "  {model:<28} {:>9.2} {:>9.2} {:>11.2} {:>12.2}",
@@ -269,7 +281,7 @@ pub fn pricing_table(p: &Pricing, observed: &[String]) -> String {
     if !unpriced.is_empty() {
         let _ = writeln!(o, "\n  No rate on file (tokens counted, cost shown as —):");
         for m in unpriced {
-            let _ = writeln!(o, "    {m}");
+            let _ = writeln!(o, "    {}", fmt::terminal_text(&m));
         }
     }
     o

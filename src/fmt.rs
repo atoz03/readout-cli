@@ -124,6 +124,26 @@ pub fn ellipsize(s: &str, max: usize) -> String {
     out
 }
 
+/// 把外部标签变成安全的单行终端文本，避免控制序列和双向文本伪装。
+pub fn terminal_text(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() || is_bidi_control(c) { '�' } else { c }).collect()
+}
+
+pub fn terminal_ellipsize(s: &str, max: usize) -> String {
+    ellipsize(&terminal_text(s), max)
+}
+
+fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
+
 /// `1.4 GB`, `66 MB`.
 pub fn bytes(n: u64) -> String {
     const UNITS: [(u64, &str); 3] = [(1 << 30, "GB"), (1 << 20, "MB"), (1 << 10, "kB")];
@@ -201,6 +221,14 @@ mod tests {
         assert_eq!(ellipsize("hello", 0), "");
         // Multi-byte input must not be sliced mid-character.
         assert_eq!(ellipsize("你好世界", 3), "你好…");
+    }
+
+    #[test]
+    fn terminal_text_neutralizes_layout_and_bidi_controls() {
+        let safe = terminal_text("ok\n\x1b]8;;https://evil\x07x\u{202e}txt");
+        assert!(!safe.chars().any(char::is_control));
+        assert!(!safe.contains('\u{202e}'));
+        assert_eq!(safe, "ok��]8;;https://evil�x�txt");
     }
 
     #[test]

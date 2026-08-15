@@ -65,12 +65,15 @@ pub struct Tokens {
 
 impl Tokens {
     pub fn cache_write(&self) -> u64 {
-        self.cache_write_5m + self.cache_write_1h
+        self.cache_write_5m.saturating_add(self.cache_write_1h)
     }
 
     /// Every token the request was billed for, cached or not.
     pub fn total(&self) -> u64 {
-        self.input + self.output + self.cache_read + self.cache_write()
+        self.input
+            .saturating_add(self.output)
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_write())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -78,11 +81,11 @@ impl Tokens {
     }
 
     pub fn add(&mut self, other: &Tokens) {
-        self.input += other.input;
-        self.output += other.output;
-        self.cache_read += other.cache_read;
-        self.cache_write_5m += other.cache_write_5m;
-        self.cache_write_1h += other.cache_write_1h;
+        self.input = self.input.saturating_add(other.input);
+        self.output = self.output.saturating_add(other.output);
+        self.cache_read = self.cache_read.saturating_add(other.cache_read);
+        self.cache_write_5m = self.cache_write_5m.saturating_add(other.cache_write_5m);
+        self.cache_write_1h = self.cache_write_1h.saturating_add(other.cache_write_1h);
     }
 }
 
@@ -175,6 +178,14 @@ mod tests {
             Tokens { input: 1, output: 2, cache_read: 4, cache_write_5m: 8, cache_write_1h: 16 };
         assert_eq!(t.cache_write(), 24);
         assert_eq!(t.total(), 31);
+    }
+
+    #[test]
+    fn hostile_counts_saturate_instead_of_wrapping() {
+        let mut t = Tokens { input: u64::MAX, ..Default::default() };
+        t.add(&Tokens { input: 1, output: u64::MAX, ..Default::default() });
+        assert_eq!(t.input, u64::MAX);
+        assert_eq!(t.total(), u64::MAX);
     }
 
     #[test]

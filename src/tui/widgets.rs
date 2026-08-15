@@ -38,7 +38,8 @@ pub fn text(buf: &mut Buffer, x: u16, y: u16, max_w: u16, s: &str, style: Style)
     if max_w == 0 || y < area.y || y >= area.bottom() || x < area.x || x >= area.right() {
         return 0;
     }
-    let (end_x, _) = buf.set_stringn(x, y, s, max_w as usize, style);
+    let safe = fmt::terminal_text(s);
+    let (end_x, _) = buf.set_stringn(x, y, &safe, max_w as usize, style);
     end_x.saturating_sub(x)
 }
 

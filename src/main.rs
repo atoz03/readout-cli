@@ -139,7 +139,17 @@ enum Command {
     },
 }
 
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {}", fmt::terminal_text(&format!("{error:#}")));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     let sources = resolve_sources(&cli.common)?;
 
@@ -213,17 +223,23 @@ fn main() -> Result<()> {
             if init {
                 let path = paths::pricing_override_file()?;
                 if path.exists() {
-                    eprintln!("{} already exists; not overwriting.", path.display());
+                    eprintln!(
+                        "{} already exists; not overwriting.",
+                        fmt::terminal_text(&path.display().to_string())
+                    );
                 } else {
                     std::fs::write(&path, pricing.starter_override(&observed)?)?;
-                    println!("Wrote {}", path.display());
+                    println!("Wrote {}", fmt::terminal_text(&path.display().to_string()));
                     println!("Edit the zeroed rows to price the models readout has no rate for.");
                 }
             } else {
                 print!("{}", report::pricing_table(&pricing, &observed));
                 if let Ok(p) = paths::pricing_override_file() {
                     let state = if p.exists() { "in use" } else { "not present" };
-                    println!("\n  Overrides: {} ({state})", p.display());
+                    println!(
+                        "\n  Overrides: {} ({state})",
+                        fmt::terminal_text(&p.display().to_string())
+                    );
                 }
             }
             Ok(())
@@ -233,9 +249,9 @@ fn main() -> Result<()> {
             if clear {
                 if path.exists() {
                     std::fs::remove_file(&path)?;
-                    println!("Removed {}", path.display());
+                    println!("Removed {}", fmt::terminal_text(&path.display().to_string()));
                 } else {
-                    println!("No cache at {}", path.display());
+                    println!("No cache at {}", fmt::terminal_text(&path.display().to_string()));
                 }
                 return Ok(());
             }
@@ -296,8 +312,12 @@ fn resolve_sources(common: &Common) -> Result<Vec<Source>> {
 }
 
 fn print_buckets(buckets: &[agg::Bucket], kind: &str, grand_total: u64) {
-    let width =
-        buckets.iter().map(|b| b.label.chars().count().min(36)).max().unwrap_or(8).max(kind.len());
+    let width = buckets
+        .iter()
+        .map(|b| fmt::terminal_text(&b.label).chars().count().min(36))
+        .max()
+        .unwrap_or(8)
+        .max(kind.len());
     println!("{:<width$} {:>15} {:>10} {:>7} {:>9}", kind, "tokens", "cost", "share", "requests");
     for b in buckets {
         let share = if grand_total == 0 {
@@ -307,7 +327,7 @@ fn print_buckets(buckets: &[agg::Bucket], kind: &str, grand_total: u64) {
         };
         println!(
             "{:<width$} {:>15} {:>10} {:>6.1}% {:>9}",
-            fmt::ellipsize(&b.label, 36),
+            fmt::terminal_ellipsize(&b.label, 36),
             fmt::count(b.tokens.total()),
             fmt::money_partial(b.priced.cost, b.priced.coverage()),
             share,

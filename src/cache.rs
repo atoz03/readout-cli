@@ -18,12 +18,23 @@ use crate::parse::ParseCursor;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 /// Bumped whenever the parsers or the on-disk shape change meaning. A stale
 /// cache is discarded silently and rebuilt rather than migrated.
 pub const SCHEMA_VERSION: u32 = 2;
+
+/// 损坏或被替换的缓存不能迫使进程分配无限内存。
+const MAX_CACHE_BYTES: u64 = 512 * 1024 * 1024;
+pub const MAX_EVENTS_PER_FILE: usize = 250_000;
+pub const MAX_EVENTS_TOTAL: usize = 1_000_000;
+pub const MAX_EVENT_TEXT_BYTES_PER_FILE: usize = 64 * 1024 * 1024;
+pub const MAX_EVENT_TEXT_BYTES_TOTAL: usize = 128 * 1024 * 1024;
 
 /// Identity of a file, used to detect replacement under a stable path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -94,11 +105,38 @@ impl Cache {
     /// different schema version. A broken cache is never fatal — it only costs
     /// one cold scan.
     pub fn load(path: &Path) -> Cache {
-        let Ok(text) = std::fs::read_to_string(path) else { return Cache::default() };
-        match serde_json::from_str::<Cache>(&text) {
-            Ok(c) if c.version == SCHEMA_VERSION => c,
+        let Ok(file) = File::open(path) else { return Cache::default() };
+        let Ok(meta) = file.metadata() else { return Cache::default() };
+        if !meta.is_file() || meta.len() > MAX_CACHE_BYTES {
+            return Cache::default();
+        }
+        match serde_json::from_reader::<_, Cache>(file) {
+            Ok(c) if c.version == SCHEMA_VERSION && c.has_safe_shape() => c,
             _ => Cache::default(),
         }
+    }
+
+    fn has_safe_shape(&self) -> bool {
+        let mut total = 0usize;
+        let mut total_text_bytes = 0usize;
+        for entry in self.files.values() {
+            if entry.events.len() > MAX_EVENTS_PER_FILE {
+                return false;
+            }
+            let file_text_bytes = event_text_bytes(&entry.events);
+            if file_text_bytes > MAX_EVENT_TEXT_BYTES_PER_FILE {
+                return false;
+            }
+            total = total.saturating_add(entry.events.len());
+            total_text_bytes = total_text_bytes.saturating_add(file_text_bytes);
+            if total > MAX_EVENTS_TOTAL {
+                return false;
+            }
+            if total_text_bytes > MAX_EVENT_TEXT_BYTES_TOTAL {
+                return false;
+            }
+        }
+        true
     }
 
     /// Write atomically: a partial cache file left by a kill would otherwise
@@ -109,11 +147,30 @@ impl Cache {
     /// another terminal. Sharing one scratch path would let each truncate the
     /// other's half-written file and rename the result into place.
     pub fn save(&self, path: &Path) -> Result<()> {
-        let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-        let text = serde_json::to_string(self).context("serializing cache")?;
-        std::fs::write(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
-        std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
-        Ok(())
+        anyhow::ensure!(self.has_safe_shape(), "cache exceeds its event safety limits");
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let tmp = path.with_extension(format!("json.tmp.{}.{nonce}", std::process::id()));
+
+        let result = (|| {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            let file = options.open(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+            let mut writer = BufWriter::new(file);
+            serde_json::to_writer(&mut writer, self).context("serializing cache")?;
+            writer.flush().with_context(|| format!("writing {}", tmp.display()))?;
+            writer.get_ref().sync_all().with_context(|| format!("syncing {}", tmp.display()))?;
+            std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result
     }
 
     /// Forget files that no longer exist, so a long-lived cache does not grow
@@ -125,6 +182,16 @@ impl Cache {
         self.files.retain(|k, _| seen.contains(k));
         before - self.files.len()
     }
+}
+
+pub fn event_text_bytes(events: &[UsageEvent]) -> usize {
+    events.iter().fold(0usize, |total, event| {
+        total
+            .saturating_add(event.model.len())
+            .saturating_add(event.session.len())
+            .saturating_add(event.project.len())
+            .saturating_add(event.dedup_key.as_ref().map_or(0, String::len))
+    })
 }
 
 /// How a file should be handled this scan.
@@ -171,18 +238,6 @@ pub fn mtime_ns(meta: &std::fs::Metadata) -> i128 {
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_nanos() as i128)
         .unwrap_or(0)
-}
-
-/// Read `path` from `offset` to EOF.
-pub fn read_from(path: &Path, offset: u64) -> Result<Vec<u8>> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    if offset > 0 {
-        f.seek(SeekFrom::Start(offset))?;
-    }
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf)?;
-    Ok(buf)
 }
 
 pub fn key(path: &Path) -> String {
@@ -234,7 +289,6 @@ mod tests {
             plan(Some(&e), &meta2),
             Plan::Append { from_offset: 6, cursor: ParseCursor::default() }
         );
-        assert_eq!(read_from(&p, 6).unwrap(), b"line2\n");
     }
 
     #[test]
@@ -278,6 +332,15 @@ mod tests {
     }
 
     #[test]
+    fn an_oversized_cache_is_ignored_without_reading_it() {
+        let dir = temp_dir();
+        let p = dir.join("oversized.json");
+        File::create(&p).unwrap().set_len(MAX_CACHE_BYTES + 1).unwrap();
+        assert!(Cache::load(&p).files.is_empty());
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
     fn save_then_load_round_trips() {
         let dir = temp_dir();
         let p = dir.join("rt.json");
@@ -298,5 +361,16 @@ mod tests {
         let back = Cache::load(&p);
         assert_eq!(back.files.len(), 1);
         assert_eq!(back.files["k"].offset, 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir();
+        let p = dir.join("private.json");
+        Cache::default().save(&p).unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
     }
 }

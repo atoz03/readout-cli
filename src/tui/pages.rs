@@ -656,8 +656,8 @@ fn fit_day(hourly: &[u64], width: u16) -> (Vec<u64>, Vec<String>, impl Fn(usize)
     let mut labels = vec![String::new(); cols];
     for (c, label) in labels.iter_mut().enumerate() {
         let hour = (c / per_hour) * per_col;
-        let sum: u64 =
-            (hour..(hour + per_col).min(24)).map(|h| hourly.get(h).copied().unwrap_or(0)).sum();
+        let sum = (hour..(hour + per_col).min(24))
+            .fold(0u64, |total, h| total.saturating_add(hourly.get(h).copied().unwrap_or(0)));
         // When an hour spans two columns both carry its full height: the bar
         // gets wider, not taller. Splitting the sum between them would halve
         // the silhouette purely because the terminal was wide.
@@ -1231,6 +1231,12 @@ mod tests {
             assert!(values.len() <= width.max(1) as usize, "width {width} overflowed its plot");
             assert_eq!(labels.len(), values.len());
         }
+    }
+
+    #[test]
+    fn merged_hours_saturate_instead_of_wrapping() {
+        let (values, _, _) = fit_day(&[u64::MAX; 24], 1);
+        assert_eq!(values, vec![u64::MAX]);
     }
 
     #[test]

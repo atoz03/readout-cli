@@ -33,13 +33,15 @@ impl Bucket {
     fn absorb(&mut self, e: &UsageEvent, pricing: &Pricing) {
         self.tokens += &e.tokens;
         self.priced.add(&price(pricing, &e.model, &e.tokens));
-        self.events += 1;
+        self.events = self.events.saturating_add(1);
         if !e.session.is_empty() {
             self.sessions.insert(e.session.clone());
         }
         self.last_ts = self.last_ts.max(e.ts);
-        *self.models.entry(e.model.clone()).or_default() += e.tokens.total();
-        *self.projects.entry(e.project.clone()).or_default() += e.tokens.total();
+        let model_tokens = self.models.entry(e.model.clone()).or_default();
+        *model_tokens = model_tokens.saturating_add(e.tokens.total());
+        let project_tokens = self.projects.entry(e.project.clone()).or_default();
+        *project_tokens = project_tokens.saturating_add(e.tokens.total());
     }
 
     pub fn session_count(&self) -> usize {

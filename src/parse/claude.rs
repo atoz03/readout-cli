@@ -83,7 +83,7 @@ pub fn parse_file(path: &Path, cursor: &ParseCursor, bytes: &[u8]) -> FileParse 
         // resumed session changes directories.
         parsed.cwd = cwd.clone();
         if parsed.model.starts_with('<') {
-            skipped_synthetic += 1;
+            skipped_synthetic = skipped_synthetic.saturating_add(1);
             continue;
         }
         // Billable gate: any nonzero token class counts. An earlier, stricter
@@ -202,8 +202,8 @@ fn split_cache_creation(breakdown: Option<&Value>, total: u64) -> (u64, u64) {
     let g = |k: &str| obj.get(k).and_then(Value::as_u64).unwrap_or(0);
     let five = g("ephemeral_5m_input_tokens");
     let hour = g("ephemeral_1h_input_tokens");
-    let sum = five + hour;
-    if sum == total {
+    let sum = five as u128 + hour as u128;
+    if sum == total as u128 {
         return (five, hour);
     }
     if sum == 0 {
@@ -211,7 +211,7 @@ fn split_cache_creation(breakdown: Option<&Value>, total: u64) -> (u64, u64) {
     }
     // Scale to the authoritative total, giving the remainder to the 1-hour
     // tier so the pair always re-sums exactly.
-    let scaled_five = (five as u128 * total as u128 / sum as u128) as u64;
+    let scaled_five = (five as u128 * total as u128 / sum) as u64;
     (scaled_five, total - scaled_five)
 }
 
@@ -334,6 +334,17 @@ mod tests {
             serde_json::json!({"ephemeral_5m_input_tokens": 1, "ephemeral_1h_input_tokens": 1});
         let (w5, w1) = split_cache_creation(Some(&v2), 100);
         assert_eq!((w5, w1), (50, 50));
+    }
+
+    #[test]
+    fn hostile_cache_breakdowns_do_not_overflow() {
+        let v: Value = serde_json::json!({
+            "ephemeral_5m_input_tokens": u64::MAX,
+            "ephemeral_1h_input_tokens": u64::MAX
+        });
+        let (w5, w1) = split_cache_creation(Some(&v), u64::MAX);
+        assert_eq!(w5.saturating_add(w1), u64::MAX);
+        assert_eq!(w5, u64::MAX / 2);
     }
 
     #[test]

@@ -21,7 +21,10 @@ use crate::model::{Tokens, pricing_key};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs::File;
 use std::path::Path;
+
+const MAX_PRICING_FILE_BYTES: u64 = 1024 * 1024;
 
 pub const CACHE_READ_MULTIPLIER: f64 = 0.10;
 pub const CACHE_WRITE_5M_MULTIPLIER: f64 = 1.25;
@@ -104,6 +107,17 @@ impl Rate {
                 );
             }
         }
+        let largest = Tokens {
+            input: u64::MAX,
+            output: u64::MAX,
+            cache_read: u64::MAX,
+            cache_write_5m: u64::MAX,
+            cache_write_1h: u64::MAX,
+        };
+        anyhow::ensure!(
+            self.cost(&largest).is_finite(),
+            "invalid rates for `{model}`: values are too large to calculate safely"
+        );
         Ok(())
     }
 
@@ -209,11 +223,18 @@ impl Pricing {
         if !path.exists() {
             return Ok(pricing);
         }
-        let text =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let overrides: HashMap<String, Rate> = serde_json::from_str(&text).with_context(|| {
-            format!("parsing {} (expected {{model: {{input, output}}}})", path.display())
-        })?;
+        let file = File::open(path).with_context(|| format!("reading {}", path.display()))?;
+        let size = file.metadata().with_context(|| format!("reading {}", path.display()))?.len();
+        anyhow::ensure!(
+            size <= MAX_PRICING_FILE_BYTES,
+            "pricing override is larger than {} bytes: {}",
+            MAX_PRICING_FILE_BYTES,
+            path.display()
+        );
+        let overrides: HashMap<String, Rate> =
+            serde_json::from_reader(file).with_context(|| {
+                format!("parsing {} (expected {{model: {{input, output}}}})", path.display())
+            })?;
         for (model, rate) in overrides {
             pricing.apply_override(model, rate)?;
         }
@@ -247,7 +268,7 @@ impl Pricing {
     /// Cost for a model's tokens. `None` means "we have no rate", which the
     /// caller must render as unknown rather than as zero.
     pub fn cost(&self, model: &str, tokens: &Tokens) -> Option<f64> {
-        self.rate(model).map(|rate| rate.cost(tokens))
+        self.rate(model).map(|rate| rate.cost(tokens)).filter(|cost| cost.is_finite())
     }
 
     /// Of the models actually observed, those we have no rate for.
@@ -296,19 +317,20 @@ pub struct Priced {
 
 impl Priced {
     pub fn add(&mut self, other: &Priced) {
-        self.cost += other.cost;
-        self.priced_tokens += other.priced_tokens;
-        self.unpriced_tokens += other.unpriced_tokens;
+        let cost = self.cost + other.cost;
+        self.cost = if cost.is_finite() { cost } else { f64::MAX };
+        self.priced_tokens = self.priced_tokens.saturating_add(other.priced_tokens);
+        self.unpriced_tokens = self.unpriced_tokens.saturating_add(other.unpriced_tokens);
     }
 
     pub fn total_tokens(&self) -> u64 {
-        self.priced_tokens + self.unpriced_tokens
+        self.priced_tokens.saturating_add(self.unpriced_tokens)
     }
 
     /// Fraction of tokens the cost covers, in 0.0..=1.0. Empty input is
     /// fully covered by convention.
     pub fn coverage(&self) -> f64 {
-        let total = self.total_tokens();
+        let total = self.priced_tokens as u128 + self.unpriced_tokens as u128;
         if total == 0 { 1.0 } else { self.priced_tokens as f64 / total as f64 }
     }
 
@@ -399,6 +421,16 @@ mod tests {
     }
 
     #[test]
+    fn priced_totals_saturate_instead_of_wrapping() {
+        let mut acc = Priced { cost: f64::MAX, priced_tokens: u64::MAX, unpriced_tokens: 0 };
+        acc.add(&Priced { cost: f64::MAX, priced_tokens: 1, unpriced_tokens: u64::MAX });
+        assert_eq!(acc.cost, f64::MAX);
+        assert_eq!(acc.priced_tokens, u64::MAX);
+        assert_eq!(acc.total_tokens(), u64::MAX);
+        assert!(acc.coverage().is_finite());
+    }
+
+    #[test]
     fn zeroed_unknown_override_rows_remain_unpriced() {
         let mut p = Pricing::builtin();
         p.apply_override("future-model".into(), Rate::new(0.0, 0.0)).unwrap();
@@ -411,6 +443,7 @@ mod tests {
         let mut p = Pricing::builtin();
         assert!(p.apply_override("bad".into(), Rate::new(-1.0, 2.0)).is_err());
         assert!(p.apply_override("bad".into(), Rate::new(f64::INFINITY, 2.0)).is_err());
+        assert!(p.apply_override("bad".into(), Rate::new(f64::MAX, 2.0)).is_err());
     }
 
     #[test]

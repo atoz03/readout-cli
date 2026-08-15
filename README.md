@@ -40,13 +40,13 @@ out of scope. This tool answers "what did I spend", and nothing else.
 Linux and macOS:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/atoz03/readout-cli/main/install.sh | sh
+curl -fsSL https://github.com/atoz03/readout-cli/releases/latest/download/install.sh | sh
 ```
 
 Windows:
 
 ```powershell
-powershell -c "irm https://raw.githubusercontent.com/atoz03/readout-cli/main/install.ps1 | iex"
+powershell -c "irm https://github.com/atoz03/readout-cli/releases/latest/download/install.ps1 | iex"
 ```
 
 Either one downloads the binary for your platform — into `~/.local/bin`, or

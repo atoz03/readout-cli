@@ -9,9 +9,16 @@ use crate::parse;
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
+
+/// 单个 transcript 和单行都必须有硬边界；流式读取只保留当前行。
+const MAX_TRANSCRIPT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const MAX_JSONL_LINE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_SCAN_THREADS: usize = 4;
 
 /// A transcript file to consider.
 #[derive(Debug, Clone)]
@@ -60,7 +67,7 @@ pub fn discover_claude(root: &Path) -> Vec<Target> {
     let Ok(projects) = std::fs::read_dir(root) else { return out };
     for project in projects.flatten() {
         let pdir = project.path();
-        if !pdir.is_dir() {
+        if !entry_is_real_dir(&project) {
             continue;
         }
         // <project>/*.jsonl — main sessions
@@ -69,11 +76,11 @@ pub fn discover_claude(root: &Path) -> Vec<Target> {
         let Ok(sessions) = std::fs::read_dir(&pdir) else { continue };
         for session in sessions.flatten() {
             let sdir = session.path();
-            if !sdir.is_dir() {
+            if !entry_is_real_dir(&session) {
                 continue;
             }
             let subagents = sdir.join("subagents");
-            if !subagents.is_dir() {
+            if !path_is_real_dir(&subagents) {
                 continue;
             }
             // <session>/subagents/*.jsonl — Task/Agent subagents
@@ -83,16 +90,27 @@ pub fn discover_claude(root: &Path) -> Vec<Target> {
             // Skipping this level makes every token spent inside a Workflow
             // vanish from the totals.
             let workflows = subagents.join("workflows");
+            if !path_is_real_dir(&workflows) {
+                continue;
+            }
             let Ok(wfs) = std::fs::read_dir(&workflows) else { continue };
             for wf in wfs.flatten() {
                 let wdir = wf.path();
-                if wdir.is_dir() {
+                if entry_is_real_dir(&wf) {
                     push_jsonl(&wdir, Source::Claude, &mut out);
                 }
             }
         }
     }
     out
+}
+
+fn entry_is_real_dir(entry: &std::fs::DirEntry) -> bool {
+    entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
+}
+
+fn path_is_real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).map(|meta| meta.file_type().is_dir()).unwrap_or(false)
 }
 
 /// Codex buckets active rollouts as `YYYY/MM/DD/*.jsonl`. Archived sessions are
@@ -168,23 +186,32 @@ pub fn scan(
     let cache_ref = &*cache;
 
     let parse_start = Instant::now();
-    let results: Vec<Result<(String, FileEntry, ParseOutcome)>> = targets
-        .par_iter()
-        .map(|t| {
-            let out = scan_one(t, cache_ref);
-            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-            if let Ok((_, _, ref outcome)) = out {
-                bytes_read.fetch_add(outcome.bytes_read, Ordering::Relaxed);
-            }
-            if let Some(cb) = on_progress {
-                // Report every file for small corpora, sparsely for large ones.
-                if total < 200 || n.is_multiple_of(16) || n == total {
-                    cb(Progress { done: n, total, bytes_read: bytes_read.load(Ordering::Relaxed) });
+    let results: Vec<Result<(String, FileEntry, ParseOutcome)>> = scan_pool().install(|| {
+        targets
+            .par_iter()
+            .map(|t| {
+                let out = scan_one(t, cache_ref);
+                let n = done.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+                if let Ok((_, _, ref outcome)) = out {
+                    let _ =
+                        bytes_read.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                            Some(value.saturating_add(outcome.bytes_read))
+                        });
                 }
-            }
-            out
-        })
-        .collect();
+                if let Some(cb) = on_progress {
+                    // 小语料逐文件报告进度，大语料降低回调频率。
+                    if total < 200 || n.is_multiple_of(16) || n == total {
+                        cb(Progress {
+                            done: n,
+                            total,
+                            bytes_read: bytes_read.load(Ordering::Relaxed),
+                        });
+                    }
+                }
+                out
+            })
+            .collect()
+    });
     let parse_ms = parse_start.elapsed().as_millis();
 
     let mut stats = ScanStats {
@@ -200,15 +227,40 @@ pub fn scan(
     let results: Vec<_> = results.into_iter().collect::<Result<_>>()?;
     let mut seen: HashSet<String> = HashSet::with_capacity(total);
     let mut all: Vec<UsageEvent> = Vec::new();
+    let mut all_text_bytes = 0usize;
     for item in results {
         let (key, entry, outcome) = item;
+        anyhow::ensure!(
+            entry.events.len() <= cache::MAX_EVENTS_PER_FILE,
+            "transcript produced more than {} usage events: {}",
+            cache::MAX_EVENTS_PER_FILE,
+            key
+        );
+        anyhow::ensure!(
+            all.len().saturating_add(entry.events.len()) <= cache::MAX_EVENTS_TOTAL,
+            "scan produced more than {} usage events",
+            cache::MAX_EVENTS_TOTAL
+        );
+        let file_text_bytes = cache::event_text_bytes(&entry.events);
+        anyhow::ensure!(
+            file_text_bytes <= cache::MAX_EVENT_TEXT_BYTES_PER_FILE,
+            "transcript event text exceeds the {} byte safety limit: {}",
+            cache::MAX_EVENT_TEXT_BYTES_PER_FILE,
+            key
+        );
+        all_text_bytes = all_text_bytes.saturating_add(file_text_bytes);
+        anyhow::ensure!(
+            all_text_bytes <= cache::MAX_EVENT_TEXT_BYTES_TOTAL,
+            "scan event text exceeds the {} byte safety limit",
+            cache::MAX_EVENT_TEXT_BYTES_TOTAL
+        );
         match outcome.plan {
             Plan::Unchanged => stats.files_reused += 1,
             Plan::Append { .. } => stats.files_appended += 1,
             Plan::Full => stats.files_full += 1,
         }
-        stats.bytes_total += entry.size;
-        stats.skipped_synthetic += entry.skipped_synthetic;
+        stats.bytes_total = stats.bytes_total.saturating_add(entry.size);
+        stats.skipped_synthetic = stats.skipped_synthetic.saturating_add(entry.skipped_synthetic);
         all.extend(entry.events.iter().cloned());
         seen.insert(key.clone());
         cache.files.insert(key, entry);
@@ -224,8 +276,27 @@ pub fn scan(
     Ok(ScanResult { events, stats })
 }
 
+fn scan_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let available = std::thread::available_parallelism().map_or(1, usize::from);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(available.min(MAX_SCAN_THREADS))
+            .build()
+            .expect("building the bounded transcript scan pool")
+    })
+}
+
 struct ParseOutcome {
     plan: Plan,
+    bytes_read: u64,
+}
+
+struct StreamParse {
+    events: Vec<UsageEvent>,
+    cursor: parse::ParseCursor,
+    skipped_synthetic: u32,
+    offset: u64,
     bytes_read: u64,
 }
 
@@ -234,6 +305,12 @@ fn scan_one(t: &Target, cache: &Cache) -> Result<(String, FileEntry, ParseOutcom
     let meta = std::fs::metadata(&t.path)
         .with_context(|| format!("reading metadata for {}", t.path.display()))?;
     anyhow::ensure!(meta.is_file(), "transcript is no longer a file: {}", t.path.display());
+    anyhow::ensure!(
+        meta.len() <= MAX_TRANSCRIPT_BYTES,
+        "transcript exceeds the {} byte safety limit: {}",
+        MAX_TRANSCRIPT_BYTES,
+        t.path.display()
+    );
     let existing = cache.files.get(&key);
     let plan = cache::plan(existing, &meta);
 
@@ -243,40 +320,108 @@ fn scan_one(t: &Target, cache: &Cache) -> Result<(String, FileEntry, ParseOutcom
             Ok((key, e, ParseOutcome { plan, bytes_read: 0 }))
         }
         Plan::Append { from_offset, cursor } => {
-            let bytes = cache::read_from(&t.path, *from_offset)?;
-            let parsed = run_parser(t, cursor, &bytes);
+            let parsed = parse_stream(t, cursor, *from_offset)?;
             let prev = existing.context("append scan plan had no cache entry")?;
             let mut events = prev.events.clone();
             events.extend(parsed.events);
+            let events = dedup(events);
             let entry = FileEntry {
                 id: FileId::of(&meta),
-                offset: from_offset + parsed.consumed as u64,
+                offset: parsed.offset,
                 size: meta.len(),
                 mtime_ns: cache::mtime_ns(&meta),
                 cursor: parsed.cursor,
                 events,
-                skipped_synthetic: prev.skipped_synthetic + parsed.skipped_synthetic,
+                skipped_synthetic: prev.skipped_synthetic.saturating_add(parsed.skipped_synthetic),
             };
-            let read = bytes.len() as u64;
-            Ok((key, entry, ParseOutcome { plan, bytes_read: read }))
+            Ok((key, entry, ParseOutcome { plan, bytes_read: parsed.bytes_read }))
         }
         Plan::Full => {
-            let bytes = std::fs::read(&t.path)
-                .with_context(|| format!("reading transcript {}", t.path.display()))?;
-            let parsed = run_parser(t, &parse::ParseCursor::default(), &bytes);
+            let parsed = parse_stream(t, &parse::ParseCursor::default(), 0)?;
             let entry = FileEntry {
                 id: FileId::of(&meta),
-                offset: parsed.consumed as u64,
+                offset: parsed.offset,
                 size: meta.len(),
                 mtime_ns: cache::mtime_ns(&meta),
                 cursor: parsed.cursor,
-                events: parsed.events,
+                events: dedup(parsed.events),
                 skipped_synthetic: parsed.skipped_synthetic,
             };
-            let read = bytes.len() as u64;
-            Ok((key, entry, ParseOutcome { plan, bytes_read: read }))
+            Ok((key, entry, ParseOutcome { plan, bytes_read: parsed.bytes_read }))
         }
     }
+}
+
+fn parse_stream(t: &Target, cursor: &parse::ParseCursor, from_offset: u64) -> Result<StreamParse> {
+    anyhow::ensure!(from_offset <= MAX_TRANSCRIPT_BYTES, "cached transcript offset is too large");
+    let mut file = std::fs::File::open(&t.path)
+        .with_context(|| format!("opening transcript {}", t.path.display()))?;
+    file.seek(SeekFrom::Start(from_offset))
+        .with_context(|| format!("seeking transcript {}", t.path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut events = Vec::new();
+    let mut event_text_bytes = 0usize;
+    let mut next_cursor = cursor.clone();
+    let mut skipped_synthetic = 0u32;
+    let mut offset = from_offset;
+    let mut bytes_read = 0u64;
+
+    loop {
+        line.clear();
+        let mut limited = (&mut reader).take(MAX_JSONL_LINE_BYTES as u64 + 1);
+        let read = limited
+            .read_until(b'\n', &mut line)
+            .with_context(|| format!("reading transcript {}", t.path.display()))?;
+        if read == 0 {
+            break;
+        }
+        bytes_read = bytes_read.saturating_add(read as u64);
+        anyhow::ensure!(
+            from_offset.saturating_add(bytes_read) <= MAX_TRANSCRIPT_BYTES,
+            "transcript grew beyond the {} byte safety limit: {}",
+            MAX_TRANSCRIPT_BYTES,
+            t.path.display()
+        );
+
+        if line.last() != Some(&b'\n') {
+            anyhow::ensure!(
+                line.len() <= MAX_JSONL_LINE_BYTES,
+                "JSONL line exceeds the {} byte safety limit: {}",
+                MAX_JSONL_LINE_BYTES,
+                t.path.display()
+            );
+            // 正在写入的末行留到下次扫描，避免解析半条 JSON。
+            break;
+        }
+
+        let parsed = run_parser(t, &next_cursor, &line);
+        anyhow::ensure!(
+            parsed.consumed == line.len(),
+            "parser did not consume a complete JSONL line: {}",
+            t.path.display()
+        );
+        offset =
+            offset.checked_add(parsed.consumed as u64).context("transcript offset overflow")?;
+        next_cursor = parsed.cursor;
+        event_text_bytes = event_text_bytes.saturating_add(cache::event_text_bytes(&parsed.events));
+        events.extend(parsed.events);
+        anyhow::ensure!(
+            events.len() <= cache::MAX_EVENTS_PER_FILE,
+            "transcript produced more than {} usage events: {}",
+            cache::MAX_EVENTS_PER_FILE,
+            t.path.display()
+        );
+        anyhow::ensure!(
+            event_text_bytes <= cache::MAX_EVENT_TEXT_BYTES_PER_FILE,
+            "transcript event text exceeds the {} byte safety limit: {}",
+            cache::MAX_EVENT_TEXT_BYTES_PER_FILE,
+            t.path.display()
+        );
+        skipped_synthetic = skipped_synthetic.saturating_add(parsed.skipped_synthetic);
+    }
+
+    Ok(StreamParse { events, cursor: next_cursor, skipped_synthetic, offset, bytes_read })
 }
 
 fn run_parser(t: &Target, cursor: &parse::ParseCursor, bytes: &[u8]) -> parse::FileParse {
@@ -443,6 +588,85 @@ mod tests {
         names.sort();
         assert_eq!(names, vec!["agent-1.jsonl", "journal.jsonl", "main.jsonl", "sub.jsonl"]);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_does_not_follow_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::temp_dir().join(format!(
+            "readout-symlink-scope-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let claude = base.join("claude");
+        let codex = base.join("codex");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::create_dir_all(&codex).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("leak.jsonl"), b"{}\n").unwrap();
+        symlink(&outside, claude.join("linked-project")).unwrap();
+        symlink(&outside, codex.join("linked-year")).unwrap();
+
+        assert!(discover_claude(&claude).is_empty());
+        assert!(discover_codex(&codex).is_empty());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn streaming_scan_leaves_a_torn_tail_for_the_next_append() {
+        use std::io::Write;
+
+        let path = std::env::temp_dir().join(format!(
+            "readout-stream-{}-{}.jsonl",
+            std::process::id(),
+            line!()
+        ));
+        let line1 = claude_record("msg_1", 10);
+        let line2 = claude_record("msg_2", 20);
+        let split = line2.len() / 2;
+        std::fs::write(&path, format!("{line1}\n{}", &line2[..split])).unwrap();
+
+        let target = Target { path: path.clone(), source: Source::Claude };
+        let mut cache = Cache::default();
+        let first = scan(std::slice::from_ref(&target), &mut cache, None).unwrap();
+        assert_eq!(first.events.len(), 1);
+        assert_eq!(cache.files[&cache::key(&path)].offset, (line1.len() + 1) as u64);
+
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "{}", &line2[split..]).unwrap();
+        let second = scan(&[target], &mut cache, None).unwrap();
+        assert_eq!(second.events.len(), 2);
+        assert_eq!(second.stats.files_appended, 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn streamed_claude_records_are_deduplicated_inside_the_cache() {
+        let path = std::env::temp_dir().join(format!(
+            "readout-stream-dedup-{}-{}.jsonl",
+            std::process::id(),
+            line!()
+        ));
+        let partial = claude_record("same", 50);
+        let finished = claude_record("same", 5)
+            .replace(r#""stop_reason":null"#, r#""stop_reason":"end_turn""#);
+        std::fs::write(&path, format!("{partial}\n{finished}\n")).unwrap();
+        let target = Target { path: path.clone(), source: Source::Claude };
+        let mut cache = Cache::default();
+        scan(&[target], &mut cache, None).unwrap();
+        let events = &cache.files[&cache::key(&path)].events;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tokens.output, 5);
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn claude_record(id: &str, output: u64) -> String {
+        format!(
+            r#"{{"type":"assistant","timestamp":"2026-08-15T00:00:00Z","sessionId":"s","cwd":"/tmp/p","message":{{"id":"{id}","model":"claude-opus-5","stop_reason":null,"usage":{{"input_tokens":1,"output_tokens":{output}}}}}}}"#
+        )
     }
 
     #[test]

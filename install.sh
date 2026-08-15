@@ -1,7 +1,7 @@
 #!/bin/sh
 # Install readout — usage statistics for Claude Code and Codex.
 #
-#   curl -fsSL https://raw.githubusercontent.com/atoz03/readout-cli/main/install.sh | sh
+#   curl -fsSL https://github.com/atoz03/readout-cli/releases/latest/download/install.sh | sh
 #
 # Downloads the release binary for this platform, verifies its published
 # SHA-256, and installs it. Nothing else on the system is touched.
@@ -20,6 +20,8 @@ need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required but not installe
 need uname
 need mkdir
 need tar
+need awk
+need mktemp
 
 if command -v curl >/dev/null 2>&1; then
   fetch() { curl -fsSL "$1" -o "$2"; }
@@ -59,6 +61,9 @@ if [ -z "$version" ]; then
     | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)"
   [ -n "$version" ] || die "could not determine the latest release; set READOUT_VERSION to pin one"
 fi
+if ! printf '%s\n' "$version" | awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/ { ok = 1 } END { exit !ok }'; then
+  die "invalid release version: $version (expected vX.Y.Z)"
+fi
 
 archive="readout-${version}-${target}.tar.gz"
 base="https://github.com/${REPO}/releases/download/${version}"
@@ -89,9 +94,12 @@ if [ "$actual" != "$expected" ]; then
 fi
 say "  checksum ok"
 
-tar xzf "${tmp}/${archive}" -C "$tmp"
-binary="${tmp}/readout-${version}-${target}/readout"
-[ -f "$binary" ] || die "the archive did not contain a readout binary"
+# 只把精确匹配的二进制成员输出到普通文件，不信任归档里的路径、链接、属主或权限。
+member="readout-${version}-${target}/readout"
+binary="${tmp}/readout"
+tar xOzf "${tmp}/${archive}" "$member" > "$binary" \
+  || die "the archive did not contain a readable readout binary"
+[ -s "$binary" ] || die "the archive contained an empty readout binary"
 
 mkdir -p "$INSTALL_DIR"
 chmod +x "$binary"

@@ -34,6 +34,7 @@ pub fn state_dir() -> Result<PathBuf> {
     if let Ok(v) = std::env::var("READOUT_STATE_DIR") {
         let p = PathBuf::from(v);
         std::fs::create_dir_all(&p).with_context(|| format!("creating {}", p.display()))?;
+        make_private_dir(&p)?;
         return Ok(p);
     }
     let base = dirs::cache_dir()
@@ -41,7 +42,18 @@ pub fn state_dir() -> Result<PathBuf> {
         .context("cannot locate a cache or home directory")?;
     let dir = base.join("readout");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    make_private_dir(&dir)?;
     Ok(dir)
+}
+
+fn make_private_dir(path: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("securing {}", path.display()))?;
+    }
+    Ok(())
 }
 
 pub fn cache_file() -> Result<PathBuf> {

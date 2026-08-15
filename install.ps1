@@ -1,6 +1,6 @@
 # Install readout — usage statistics for Claude Code and Codex.
 #
-#   powershell -c "irm https://raw.githubusercontent.com/atoz03/readout-cli/main/install.ps1 | iex"
+#   powershell -c "irm https://github.com/atoz03/readout-cli/releases/latest/download/install.ps1 | iex"
 #
 # Downloads the release binary for this platform, verifies its published
 # SHA-256, and installs it. Nothing else on the system is touched — PATH
@@ -27,7 +27,7 @@
   function die($msg) { throw "install: $msg" }
 
   if ($PSVersionTable.PSVersion.Major -lt 5) {
-    die 'Windows PowerShell 5.1 or newer is required (for Expand-Archive and Get-FileHash).'
+    die 'Windows PowerShell 5.1 or newer is required (for ZIP and hash support).'
   }
   # $IsWindows only exists on PowerShell 6+; on 5.1 it is $null and the check
   # is moot, because 5.1 is Windows-only.
@@ -79,6 +79,9 @@
     }
     if (-not $version) { die 'could not determine the latest release; set READOUT_VERSION to pin one' }
   }
+  if ($version -cnotmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+    die "invalid release version: $version (expected vX.Y.Z)"
+  }
 
   $archive = "readout-$version-$target.zip"
   $base = "https://github.com/$repo/releases/download/$version"
@@ -119,9 +122,31 @@
     }
     say '  checksum ok'
 
-    Expand-Archive -Path $zip -DestinationPath $tmp -Force
-    $binary = Join-Path $tmp "readout-$version-$target\readout.exe"
-    if (-not (Test-Path $binary)) { die 'the archive did not contain a readout.exe' }
+    # 只读取精确匹配的二进制成员，避免 ZIP 内的路径或链接越过临时目录。
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $reader = [IO.Compression.ZipFile]::OpenRead($zip)
+    try {
+      $member = "readout-$version-$target/readout.exe"
+      $entries = @($reader.Entries | Where-Object {
+        $_.FullName.Replace('\', '/') -ceq $member
+      })
+      if ($entries.Count -ne 1) { die 'the archive did not contain exactly one readout.exe' }
+      $entry = $entries[0]
+      if ($entry.Length -le 0 -or $entry.Length -gt 134217728) {
+        die "the archived readout.exe has an invalid size: $($entry.Length) bytes"
+      }
+      $binary = Join-Path $tmp 'readout.exe'
+      $input = $entry.Open()
+      $output = [IO.File]::Open($binary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+      try {
+        $input.CopyTo($output)
+      } finally {
+        $output.Dispose()
+        $input.Dispose()
+      }
+    } finally {
+      $reader.Dispose()
+    }
 
     New-Item -ItemType Directory -Force -Path $installDir | Out-Null
     $dest = Join-Path $installDir 'readout.exe'
@@ -131,12 +156,6 @@
       # Windows locks a running image, unlike the Unix rename install.sh does.
       die "could not replace ${dest}: close any running readout and try again."
     }
-    # We verified this binary against the checksum the release publishes, so the
-    # download mark only costs the user a SmartScreen prompt on first run.
-    # Wrapped rather than -ErrorAction SilentlyContinue, which does not cover a
-    # terminating error: the install is already done by this line, and nothing
-    # this cmdlet can fail at is worth reporting as a failed install.
-    try { Unblock-File -Path $dest } catch { }
     say "  installed $dest"
   } finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
@@ -150,15 +169,16 @@
   if ($onPath) {
     say "Run 'readout' to open the dashboard."
   } else {
+    $quotedInstallDir = $installDir.Replace("'", "''")
     say "$installDir is not on your PATH. Add it for this session:"
-    say "  `$env:PATH = '$installDir;' + `$env:PATH"
+    say "  `$env:PATH = '$quotedInstallDir;' + `$env:PATH"
     # Deliberately not `setx PATH "$env:PATH;..."`, which is the usual advice
     # and is wrong twice: it truncates at 1024 characters, and $env:PATH is the
     # machine and user paths already merged, so writing it back stamps the whole
     # merged value into the user's own PATH. Reading the User scope and
     # appending to that is the form that cannot eat someone's environment.
     say 'or for good, in this session:'
-    say "  [Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path','User') + ';$installDir', 'User')"
+    say "  [Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path','User') + ';$quotedInstallDir', 'User')"
     say "Then run 'readout' to open the dashboard."
   }
 }
