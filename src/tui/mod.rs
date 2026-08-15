@@ -640,6 +640,11 @@ mod tests {
         // is set to. Measured at ~250µs for the heaviest page on a big
         // terminal; the bound is loose enough for a shared CI runner and still
         // an order of magnitude under the budget.
+        //
+        // Timed only when optimized. An unoptimized frame is an order of
+        // magnitude slower and says nothing about the shipped binary — a debug
+        // number checked against a runtime budget just measures the profile.
+        // The draws still run in debug, so the paths stay exercised.
         let mut a = app_with_many_rows();
         let area = ratatui::layout::Rect { x: 0, y: 0, width: 160, height: 48 };
         for page in Page::ORDER {
@@ -654,6 +659,9 @@ mod tests {
                 pages::draw(&mut a, &mut buf, area);
             }
             let per_frame = started.elapsed() / FRAMES;
+            if cfg!(debug_assertions) {
+                continue;
+            }
             assert!(
                 per_frame < Duration::from_millis(5),
                 "{page:?} takes {per_frame:?} to draw, against a {:?} frame",
