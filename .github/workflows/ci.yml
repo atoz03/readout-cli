@@ -15,7 +15,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned, not `stable`: every Rust release adds lints, and a floating
+      # toolchain turns `-D warnings` into a build that breaks on an untouched
+      # repository. Bump this deliberately and fix the new lints in that commit.
+      - uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2

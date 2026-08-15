@@ -104,10 +104,10 @@ pub fn discover_codex(root: &Path) -> Vec<Target> {
             let p = e.path();
             match e.file_type() {
                 Ok(ft) if ft.is_dir() => stack.push(p),
-                Ok(ft) if ft.is_file() => {
-                    if p.extension().and_then(|s| s.to_str()) == Some("jsonl") {
-                        out.push(Target { path: p, source: Source::Codex });
-                    }
+                Ok(ft)
+                    if ft.is_file() && p.extension().and_then(|s| s.to_str()) == Some("jsonl") =>
+                {
+                    out.push(Target { path: p, source: Source::Codex });
                 }
                 _ => {}
             }
