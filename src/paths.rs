@@ -1,6 +1,7 @@
-//! Where readout reads from, and the one place it writes to.
+//! readout 的 transcript 读取范围，以及自己的 cache/config 写入位置。
 //!
-//! Read scope is deliberately narrow: only the transcript directories.
+//! Transcript read scope is deliberately narrow. Devices 页面会另行按需读取 SSH config
+//! 的 Host 别名，但不会解析或保存认证材料。
 //! `~/.claude/settings.json`, `~/.codex/config.toml` and `~/.codex/auth.json`
 //! hold live API credentials and are never opened — not read, not copied,
 //! not backed up. Nothing in this crate needs them.
@@ -46,18 +47,46 @@ pub fn state_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-fn make_private_dir(path: &std::path::Path) -> Result<()> {
+/// 用户配置目录。设备身份与 SSH remote 不能放进可能被系统清理的 cache 目录。
+pub fn config_dir() -> Result<PathBuf> {
+    if let Ok(v) = std::env::var("READOUT_CONFIG_DIR") {
+        let p = PathBuf::from(v);
+        std::fs::create_dir_all(&p).with_context(|| format!("creating {}", p.display()))?;
+        make_private_dir(&p)?;
+        return Ok(p);
+    }
+    let base = dirs::config_dir()
+        .or_else(dirs::home_dir)
+        .context("cannot locate a config or home directory")?;
+    let dir = base.join("readout");
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    make_private_dir(&dir)?;
+    Ok(dir)
+}
+
+fn make_private_dir(_path: &std::path::Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("securing {}", path.display()))?;
+        std::fs::set_permissions(_path, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("securing {}", _path.display()))?;
     }
     Ok(())
 }
 
 pub fn cache_file() -> Result<PathBuf> {
     Ok(state_dir()?.join("scan-cache.json"))
+}
+
+pub fn settings_file() -> Result<PathBuf> {
+    Ok(config_dir()?.join("settings.json"))
+}
+
+pub fn remote_bundles_dir() -> Result<PathBuf> {
+    let dir = state_dir()?.join("remotes");
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    make_private_dir(&dir)?;
+    Ok(dir)
 }
 
 /// User-editable price overrides. Absent by default.

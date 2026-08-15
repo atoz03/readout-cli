@@ -34,6 +34,10 @@ pub enum Action {
     ReplaySpeed(u8),
     /// 跳到 replay 中的具体事件。
     ReplaySeek(usize),
+    /// 立即切换或轮换一项持久化设置。
+    Setting(usize),
+    /// 在后台拉取所有启用的 SSH remote。
+    SyncDevices,
     /// Clear any drill-down filter.
     ClearFilter,
     /// Re-run the scan.

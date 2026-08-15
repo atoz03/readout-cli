@@ -1,11 +1,12 @@
 //! readout — usage statistics for Claude Code and Codex.
 //!
 //! Strictly read-only with respect to both tools: it reads transcripts under
-//! `~/.claude/projects` and `~/.codex/sessions` and nothing else. Settings
-//! files holding API credentials are never opened.
+//! `~/.claude/projects` and `~/.codex/sessions`. Devices 页面按需读取 SSH config
+//! 的 Host 别名；Claude/Codex 的认证与设置文件始终不会打开。
 
 mod agg;
 mod cache;
+mod devices;
 mod fmt;
 mod model;
 mod parse;
@@ -14,7 +15,9 @@ mod pricing;
 mod replay;
 mod report;
 mod scan;
+mod settings;
 mod tui;
+mod updater;
 
 use agg::{Filter, summarize};
 use anyhow::Result;
@@ -134,10 +137,36 @@ enum Command {
         width: u16,
         #[arg(long, default_value_t = 40)]
         height: u16,
-        /// overview, daily, models, projects, sessions, pricing
+        /// overview, daily, models, projects, sessions, devices, pricing, settings
         #[arg(long, default_value = "overview")]
         page: String,
     },
+    /// SSH 设备协议：导出只含 usage 的 bundle
+    #[command(hide = true)]
+    Export {
+        /// 原子写入文件，而不是输出到 stdout
+        #[arg(long, short = 'o')]
+        output: Option<std::path::PathBuf>,
+    },
+    /// 同步 Devices 页面中已启用的 SSH 设备
+    Sync,
+    /// 从官方 release 安全更新 readout
+    Update,
+    /// 把不同设备的 cwd 映射成统一项目名
+    ProjectAlias {
+        #[command(subcommand)]
+        action: ProjectAliasCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ProjectAliasCommand {
+    /// 添加或替换精确路径映射
+    Set { name: String, path: String },
+    /// 删除路径映射
+    Remove { path: String },
+    /// 列出项目路径映射
+    List,
 }
 
 fn main() -> std::process::ExitCode {
@@ -152,18 +181,23 @@ fn main() -> std::process::ExitCode {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    // 更新器不读取 transcript 或 settings；即使用户配置损坏，也应能修复二进制。
+    if matches!(&cli.command, Some(Command::Update)) {
+        return updater::update();
+    }
     let sources = resolve_sources(&cli.common)?;
+    let mut settings = settings::Settings::load_or_create()?;
 
     match cli.command {
         // `readout -w` and `readout tui -w` are the same request; accepting it
         // only before the subcommand would make the explicit form an error.
         None | Some(Command::Tui { .. }) => {
             let watch = cli.watch || matches!(cli.command, Some(Command::Tui { watch: true }));
-            let filter = build_filter(&cli.common, &sources);
-            tui::run(sources, filter, !cli.common.no_cache, watch)
+            let filter = build_filter(&cli.common, &sources, &settings);
+            tui::run(sources, filter, !cli.common.no_cache, watch, settings)
         }
         Some(Command::Summary { json, csv, timing }) => {
-            let (s, stats, _) = load(&cli.common, &sources)?;
+            let (s, stats, _) = load(&cli.common, &sources, &settings)?;
             if json {
                 println!("{}", report::json(&s, &stats, cli.common.days));
             } else if csv {
@@ -180,7 +214,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         Some(Command::Models { json }) => {
-            let (s, stats, _) = load(&cli.common, &sources)?;
+            let (s, stats, _) = load(&cli.common, &sources, &settings)?;
             if json {
                 println!("{}", report::json(&s, &stats, cli.common.days));
             } else {
@@ -189,7 +223,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         Some(Command::Projects { json }) => {
-            let (s, stats, _) = load(&cli.common, &sources)?;
+            let (s, stats, _) = load(&cli.common, &sources, &settings)?;
             if json {
                 println!("{}", report::json(&s, &stats, cli.common.days));
             } else {
@@ -198,7 +232,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         Some(Command::Daily { json, csv }) => {
-            let (s, stats, _) = load(&cli.common, &sources)?;
+            let (s, stats, _) = load(&cli.common, &sources, &settings)?;
             if json {
                 println!("{}", report::json(&s, &stats, cli.common.days));
             } else if csv {
@@ -219,7 +253,7 @@ fn run() -> Result<()> {
         }
         Some(Command::Pricing { init }) => {
             let pricing = Pricing::load(paths::pricing_override_file().ok().as_deref())?;
-            let (s, _, _) = load(&cli.common, &sources)?;
+            let (s, _, _) = load(&cli.common, &sources, &settings)?;
             let observed: Vec<String> = s.by_model.iter().map(|b| b.label.clone()).collect();
             if init {
                 let path = paths::pricing_override_file()?;
@@ -268,14 +302,79 @@ fn run() -> Result<()> {
                 "models" => tui::app::Page::Models,
                 "projects" => tui::app::Page::Projects,
                 "sessions" => tui::app::Page::Sessions,
+                "devices" => tui::app::Page::Devices,
                 "pricing" => tui::app::Page::Pricing,
+                "settings" => tui::app::Page::Settings,
                 other => anyhow::bail!("unknown page `{other}`"),
             };
-            let filter = build_filter(&cli.common, &sources);
+            let filter = build_filter(&cli.common, &sources, &settings);
             print!(
                 "{}",
-                tui::snapshot(sources, filter, !cli.common.no_cache, width, height, page)?
+                tui::snapshot(
+                    sources,
+                    filter,
+                    !cli.common.no_cache,
+                    width,
+                    height,
+                    page,
+                    settings
+                )?
             );
+            Ok(())
+        }
+        Some(Command::Export { output }) => {
+            let bundle = devices::export_local(&sources, !cli.common.no_cache, &settings)?;
+            if let Some(path) = output {
+                bundle.save(&path)?;
+                println!("Wrote {}", fmt::terminal_text(&path.display().to_string()));
+            } else {
+                let mut writer = std::io::BufWriter::new(std::io::stdout().lock());
+                bundle.write_json(&mut writer)?;
+                std::io::Write::flush(&mut writer)?;
+            }
+            Ok(())
+        }
+        Some(Command::Sync) => {
+            let report = devices::sync_all(&settings, None)?;
+            if !report.synced.is_empty() {
+                println!("Synced {}", report.synced.join(", "));
+            }
+            for failure in &report.failed {
+                eprintln!("Failed {failure}");
+            }
+            anyhow::ensure!(report.failed.is_empty(), "one or more devices failed to sync");
+            Ok(())
+        }
+        Some(Command::Update) => unreachable!("handled before loading settings"),
+        Some(Command::ProjectAlias { action }) => {
+            match action {
+                ProjectAliasCommand::Set { name, path } => {
+                    settings.set_project_alias(path.clone(), name.clone())?;
+                    settings.save()?;
+                    println!("Mapped {} to {name}", fmt::terminal_text(&path));
+                }
+                ProjectAliasCommand::Remove { path } => {
+                    anyhow::ensure!(
+                        settings.remove_project_alias(&path),
+                        "unknown project path `{}`",
+                        fmt::terminal_text(&path)
+                    );
+                    settings.save()?;
+                    println!("Removed project alias for {}", fmt::terminal_text(&path));
+                }
+                ProjectAliasCommand::List => {
+                    if settings.project_aliases.is_empty() {
+                        println!("No project aliases configured.");
+                    }
+                    for alias in &settings.project_aliases {
+                        println!(
+                            "{:<24} {}",
+                            fmt::terminal_text(&alias.name),
+                            fmt::terminal_text(&alias.path)
+                        );
+                    }
+                }
+            }
             Ok(())
         }
     }
@@ -283,15 +382,15 @@ fn run() -> Result<()> {
 
 type Loaded = (agg::Summary, scan::ScanStats, Pricing);
 
-fn load(common: &Common, sources: &[Source]) -> Result<Loaded> {
+fn load(common: &Common, sources: &[Source], settings: &settings::Settings) -> Result<Loaded> {
     let pricing = Pricing::load(paths::pricing_override_file().ok().as_deref())?;
-    let result = scan::scan_with_cache(sources, !common.no_cache, None)?;
-    let filter = build_filter(common, sources);
+    let result = devices::load_usage(sources, !common.no_cache, settings, None)?.scan;
+    let filter = build_filter(common, sources, settings);
     let summary = summarize(&result.events, &filter, &pricing);
     Ok((summary, result.stats, pricing))
 }
 
-fn build_filter(common: &Common, sources: &[Source]) -> Filter {
+fn build_filter(common: &Common, sources: &[Source], settings: &settings::Settings) -> Filter {
     let today = chrono::Local::now().date_naive();
     Filter {
         sources: sources.to_vec(),
@@ -300,6 +399,7 @@ fn build_filter(common: &Common, sources: &[Source]) -> Filter {
         project: common.project.clone(),
         model: common.model.clone(),
         session: None,
+        device: (!settings.aggregate_devices).then(|| settings.device.id.clone()),
     }
 }
 

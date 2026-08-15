@@ -14,12 +14,14 @@ pub mod theme;
 pub mod widgets;
 
 use crate::agg::Filter;
+use crate::devices::{self, LoadedUsage, SyncReport};
 use crate::model::Source;
 use crate::pricing::Pricing;
 use crate::replay::{self, ReplayRequest, SessionReplay};
-use crate::scan::{self, Progress};
+use crate::scan::Progress;
+use crate::settings::Settings;
 use anyhow::Result;
-use app::{App, Drill, Loading, Page, Range, Rescan};
+use app::{App, DeviceRequest, Drill, Loading, Page, Range, Rescan};
 use crossterm::cursor;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -39,7 +41,13 @@ use std::time::Duration;
 /// What the scan thread sends back.
 enum ScanMsg {
     Progress(Progress),
-    Done(Box<scan::ScanResult>),
+    Done(Box<LoadedUsage>),
+    Failed(String),
+}
+
+enum DeviceMsg {
+    Synced(SyncReport),
+    Connected { host: String, updated: bool },
     Failed(String),
 }
 
@@ -48,7 +56,13 @@ enum ReplayMsg {
     Failed(String),
 }
 
-pub fn run(sources: Vec<Source>, base: Filter, use_cache: bool, watch: bool) -> Result<()> {
+pub fn run(
+    sources: Vec<Source>,
+    base: Filter,
+    use_cache: bool,
+    watch: bool,
+    settings: Settings,
+) -> Result<()> {
     // Without a terminal there is nothing to put in raw mode, and crossterm
     // reports that as a bare "No such device or address (os error 6)". Say
     // what happened and name the two subcommands that work in a pipe.
@@ -59,7 +73,7 @@ pub fn run(sources: Vec<Source>, base: Filter, use_cache: bool, watch: bool) -> 
         );
     }
     let pricing = Pricing::load(crate::paths::pricing_override_file().ok().as_deref())?;
-    let mut app = App::new(sources.clone(), base, pricing);
+    let mut app = App::with_settings(sources.clone(), base, pricing, settings);
     app.watch = watch;
 
     let (mut terminal, mut guard) = setup()?;
@@ -83,12 +97,14 @@ pub fn snapshot(
     width: u16,
     height: u16,
     page: Page,
+    settings: Settings,
 ) -> Result<String> {
     let pricing = Pricing::load(crate::paths::pricing_override_file().ok().as_deref())?;
-    let mut app = App::new(sources.clone(), base, pricing);
-    let result = scan::scan_with_cache(&sources, use_cache, None)?;
-    app.events = result.events;
-    app.stats = result.stats;
+    let mut app = App::with_settings(sources.clone(), base, pricing, settings.clone());
+    let result = devices::load_usage(&sources, use_cache, &settings, None)?;
+    app.events = result.scan.events;
+    app.stats = result.scan.stats;
+    app.devices = result.devices;
     app.loading = Loading::Done;
     app.set_page(page);
     // Snapshots show the settled state; animating into a still image would
@@ -166,7 +182,7 @@ fn setup() -> Result<(Term, TerminalGuard)> {
     Ok((terminal, guard))
 }
 
-fn spawn_scan(sources: Vec<Source>, use_cache: bool) -> Receiver<ScanMsg> {
+fn spawn_scan(sources: Vec<Source>, use_cache: bool, settings: Settings) -> Receiver<ScanMsg> {
     let (tx, rx) = channel();
     std::thread::spawn(move || {
         let tx2: Sender<ScanMsg> = tx.clone();
@@ -175,7 +191,7 @@ fn spawn_scan(sources: Vec<Source>, use_cache: bool) -> Receiver<ScanMsg> {
             // correct response, not an error.
             let _ = tx2.send(ScanMsg::Progress(p));
         };
-        match scan::scan_with_cache(&sources, use_cache, Some(&report)) {
+        match devices::load_usage(&sources, use_cache, &settings, Some(&report)) {
             Ok(r) => {
                 let _ = tx.send(ScanMsg::Done(Box::new(r)));
             }
@@ -183,6 +199,29 @@ fn spawn_scan(sources: Vec<Source>, use_cache: bool) -> Receiver<ScanMsg> {
                 let _ = tx.send(ScanMsg::Failed(e.to_string()));
             }
         }
+    });
+    rx
+}
+
+fn spawn_device(settings: Settings, request: DeviceRequest) -> Receiver<DeviceMsg> {
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        let result = match request {
+            DeviceRequest::SyncAll => devices::sync_all(&settings, None).map(DeviceMsg::Synced),
+            DeviceRequest::SyncHost(host) => {
+                devices::sync_all(&settings, Some(&host)).map(DeviceMsg::Synced)
+            }
+            DeviceRequest::ConnectHost(host) => devices::sync_host(&settings, &host)
+                .map(|_| DeviceMsg::Connected { host, updated: false }),
+            DeviceRequest::UpdateHost(host) => devices::update_remote(&host)
+                .and_then(|_| devices::sync_host(&settings, &host))
+                .map(|_| DeviceMsg::Connected { host, updated: true }),
+        };
+        let message = match result {
+            Ok(message) => message,
+            Err(error) => DeviceMsg::Failed(error.to_string()),
+        };
+        let _ = tx.send(message);
     });
     rx
 }
@@ -205,8 +244,9 @@ fn event_loop(
     sources: Vec<Source>,
     use_cache: bool,
 ) -> Result<()> {
-    let mut rx = spawn_scan(sources.clone(), use_cache);
+    let mut rx = spawn_scan(sources.clone(), use_cache, app.settings.clone());
     let mut replay_rx: Option<Receiver<ReplayMsg>> = None;
+    let mut device_rx: Option<Receiver<DeviceMsg>> = None;
     app.scan_pending = true;
     let mut kind = Rescan::Manual;
 
@@ -220,6 +260,11 @@ fn event_loop(
             && drain_replay(app, receiver)
         {
             replay_rx = None;
+        }
+        if let Some(receiver) = device_rx.as_ref()
+            && drain_device(app, receiver)
+        {
+            device_rx = None;
         }
 
         if app.needs_redraw {
@@ -235,6 +280,10 @@ fn event_loop(
         if app.watch_due(std::time::Instant::now()) {
             app.request_rescan(Rescan::Watch);
         }
+        if let Some(request) = app.device_requested.take() {
+            app.device_pending = true;
+            device_rx = Some(spawn_device(app.settings.clone(), request));
+        }
 
         if let Some(next) = app.rescan_requested.take() {
             kind = next;
@@ -246,7 +295,7 @@ fn event_loop(
                 app.needs_redraw = true;
             }
             app.scan_pending = true;
-            rx = spawn_scan(sources.clone(), use_cache);
+            rx = spawn_scan(sources.clone(), use_cache, app.settings.clone());
         }
 
         if event::poll(anim::TICK)? {
@@ -271,6 +320,30 @@ fn event_loop(
         }
         if app.should_quit {
             return Ok(());
+        }
+    }
+}
+
+fn drain_device(app: &mut App, rx: &Receiver<DeviceMsg>) -> bool {
+    match rx.try_recv() {
+        Ok(DeviceMsg::Synced(report)) => {
+            app.sync_finished(&report);
+            true
+        }
+        Ok(DeviceMsg::Connected { host, updated }) => {
+            app.connect_finished(&host, updated);
+            true
+        }
+        Ok(DeviceMsg::Failed(error)) => {
+            app.sync_failed(error);
+            true
+        }
+        Err(TryRecvError::Empty) => false,
+        Err(TryRecvError::Disconnected) => {
+            if app.device_pending {
+                app.sync_failed("the device worker stopped without reporting".into());
+            }
+            true
         }
     }
 }
@@ -310,7 +383,11 @@ fn drain_scan(app: &mut App, rx: &Receiver<ScanMsg>, kind: Rescan) {
             }
             Ok(ScanMsg::Done(result)) => {
                 app.scan_pending = false;
-                app.apply_scan(result.events, result.stats, kind);
+                app.devices = result.devices;
+                if app.page == Page::Devices && app.ssh_hosts_loaded {
+                    app.refresh_ssh_hosts();
+                }
+                app.apply_scan(result.scan.events, result.scan.stats, kind);
             }
             Ok(ScanMsg::Failed(e)) => {
                 app.scan_pending = false;
@@ -360,6 +437,24 @@ fn on_key(app: &mut App, k: KeyEvent) {
         }
         if matches!(k.code, KeyCode::Esc | KeyCode::Char(' ' | '1' | '2' | '4' | '[' | ']')) {
             return;
+        }
+    }
+
+    if app.page == Page::Devices {
+        match k.code {
+            KeyCode::Char('r') => {
+                app.request_sync();
+                return;
+            }
+            KeyCode::Delete | KeyCode::Backspace => {
+                app.disable_selected_device();
+                return;
+            }
+            KeyCode::Char('u') => {
+                app.update_selected_device();
+                return;
+            }
+            _ => {}
         }
     }
 
@@ -458,6 +553,11 @@ fn apply(app: &mut App, action: Action) {
         Action::ReplayToggle => app.toggle_replay(),
         Action::ReplaySpeed(speed) => app.set_replay_speed(speed),
         Action::ReplaySeek(i) => app.seek_replay(i),
+        Action::Setting(i) => {
+            app.selected = i;
+            app.activate_setting(i);
+        }
+        Action::SyncDevices => app.request_sync(),
         Action::ClearFilter => app.set_drill(Drill::None),
         Action::Refresh => app.request_rescan(Rescan::Manual),
         Action::ToggleWatch => app.toggle_watch(),
@@ -482,6 +582,7 @@ mod tests {
                 session: format!("s{i}"),
                 project: format!("p{i}"),
                 tokens: Tokens { input: 100 * (i as u64 + 1), output: 10, ..Default::default() },
+                observed_on: Vec::new(),
                 dedup_key: None,
                 dedup_rank: 0,
             })
@@ -578,6 +679,16 @@ mod tests {
         let mut a = app_with_data();
         apply(&mut a, Action::Refresh);
         assert_eq!(a.rescan_requested, Some(Rescan::Manual));
+    }
+
+    #[test]
+    fn devices_refresh_is_manual_and_uses_the_background_sync_worker() {
+        let mut a = app_with_data();
+        a.settings.enable_ssh_host("workstation".into()).unwrap();
+        a.page = Page::Devices;
+        press(&mut a, KeyCode::Char('r'));
+        assert_eq!(a.device_requested, Some(DeviceRequest::SyncAll));
+        assert!(a.rescan_requested.is_none());
     }
 
     #[test]
@@ -824,6 +935,7 @@ mod tests {
                 session: format!("sess-{i:02}"),
                 project: format!("proj-{i:02}"),
                 tokens: Tokens { input: 1_000 * (60 - i as u64), output: 10, ..Default::default() },
+                observed_on: Vec::new(),
                 dedup_key: None,
                 dedup_rank: 0,
             })

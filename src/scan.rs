@@ -53,6 +53,7 @@ pub struct ScanStats {
     pub total_ms: u128,
 }
 
+#[derive(Debug)]
 pub struct ScanResult {
     pub events: Vec<UsageEvent>,
     pub stats: ScanStats,
@@ -439,7 +440,8 @@ fn run_parser(t: &Target, cursor: &parse::ParseCursor, bytes: &[u8]) -> parse::F
 /// keeping the record with the higher rank (a finished response beats a
 /// mid-stream one) and then the larger output count.
 ///
-/// Codex events carry no such key and pass through untouched.
+/// Codex 没有原生事件 ID，但 parser 会从 session、原始时间和 usage 快照生成稳定 key，
+/// 因此复制或恢复出来的同一 rollout 也能在这里折叠。
 fn dedup(events: Vec<UsageEvent>) -> Vec<UsageEvent> {
     let mut best: HashMap<String, usize> = HashMap::new();
     let mut keep: Vec<bool> = vec![true; events.len()];
@@ -515,6 +517,7 @@ mod tests {
             session: "s".into(),
             project: "p".into(),
             tokens: Tokens { output, ..Default::default() },
+            observed_on: Vec::new(),
             dedup_key: key.map(str::to_string),
             dedup_rank: rank,
         }
@@ -680,7 +683,7 @@ mod tests {
             source: Source::Codex,
         };
         let mut cache = Cache::default();
-        let err = scan(&[target], &mut cache, None).err().expect("missing file must be reported");
+        let err = scan(&[target], &mut cache, None).expect_err("missing file must be reported");
         assert!(err.to_string().contains("metadata"));
     }
 

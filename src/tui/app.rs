@@ -5,11 +5,13 @@
 //! is cheap next to the scan — rather than mutating per-view state, so the
 //! pages can never disagree with each other.
 
-use crate::agg::{Filter, Summary, summarize};
+use crate::agg::{Filter, SHARED_DEVICE_ID, Summary, summarize};
+use crate::devices::DeviceRecord;
 use crate::model::{Source, UsageEvent};
 use crate::pricing::Pricing;
 use crate::replay::{ReplayRequest, SessionReplay};
 use crate::scan::{Progress, ScanStats};
+use crate::settings::Settings;
 use crate::tui::anim::{Eased, Pulse};
 use crate::tui::hit::Registry;
 
@@ -21,19 +23,29 @@ pub enum Page {
     Projects,
     Sessions,
     Replay,
+    Devices,
     Pricing,
+    Settings,
 }
 
 impl Page {
     /// Sidebar order, grouped under headings.
     pub const GROUPS: [(&'static str, &'static [Page]); 3] = [
         ("Overview", &[Page::Overview, Page::Daily]),
-        ("Breakdown", &[Page::Models, Page::Projects, Page::Sessions]),
-        ("Config", &[Page::Pricing]),
+        ("Breakdown", &[Page::Models, Page::Projects, Page::Sessions, Page::Devices]),
+        ("Config", &[Page::Pricing, Page::Settings]),
     ];
 
-    pub const ORDER: [Page; 6] =
-        [Page::Overview, Page::Daily, Page::Models, Page::Projects, Page::Sessions, Page::Pricing];
+    pub const ORDER: [Page; 8] = [
+        Page::Overview,
+        Page::Daily,
+        Page::Models,
+        Page::Projects,
+        Page::Sessions,
+        Page::Devices,
+        Page::Pricing,
+        Page::Settings,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
@@ -43,7 +55,9 @@ impl Page {
             Page::Projects => "Projects",
             Page::Sessions => "Sessions",
             Page::Replay => "Session Replay",
+            Page::Devices => "Devices",
             Page::Pricing => "Pricing",
+            Page::Settings => "Settings",
         }
     }
 
@@ -55,7 +69,9 @@ impl Page {
             Page::Projects => "▣",
             Page::Sessions => "◷",
             Page::Replay => "▷",
+            Page::Devices => "◫",
             Page::Pricing => "$",
+            Page::Settings => "⚙",
         }
     }
 
@@ -149,6 +165,7 @@ pub enum Drill {
     None,
     Model(String),
     Project(String),
+    Device(String),
 }
 
 impl Drill {
@@ -157,6 +174,7 @@ impl Drill {
             Drill::None => None,
             Drill::Model(m) => Some(format!("model: {m}")),
             Drill::Project(p) => Some(format!("project: {p}")),
+            Drill::Device(device) => Some(format!("device: {device}")),
         }
     }
 }
@@ -179,6 +197,15 @@ pub enum Loading {
 pub enum Rescan {
     Manual,
     Watch,
+}
+
+/// 设备后台任务。SSH config 只负责发现；首次连接成功后才持久化启用状态。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceRequest {
+    SyncAll,
+    SyncHost(String),
+    ConnectHost(String),
+    UpdateHost(String),
 }
 
 /// Replay 页面自己的短生命周期状态；正文不会进入 usage cache。
@@ -228,6 +255,13 @@ pub struct App {
     pub disabled: Vec<Source>,
 
     pub events: Vec<UsageEvent>,
+    pub devices: Vec<DeviceRecord>,
+    /// Devices 页始终基于全设备事件，避免关闭默认聚合后远端状态一起消失。
+    pub device_summary: Summary,
+    pub settings: Settings,
+    pub settings_path: String,
+    /// SSH config 按需读取一次，不进入主页面首帧的热路径。
+    pub ssh_hosts_loaded: bool,
     pub pricing: Pricing,
     pub summary: Summary,
     pub stats: ScanStats,
@@ -262,6 +296,8 @@ pub struct App {
     pub last_scan: Option<std::time::Instant>,
     /// Re-scan on a timer, so the numbers keep up with the work.
     pub watch: bool,
+    pub device_requested: Option<DeviceRequest>,
+    pub device_pending: bool,
     /// The local date the current summary was built on. Every window is
     /// anchored to "now", so a dashboard left watching past midnight is
     /// showing yesterday's answer until it repaints.
@@ -274,11 +310,24 @@ pub struct App {
 }
 
 impl App {
+    #[cfg(test)]
     pub fn new(sources: Vec<Source>, base: Filter, pricing: Pricing) -> Self {
+        Self::with_settings(sources, base, pricing, Settings::default())
+    }
+
+    pub fn with_settings(
+        sources: Vec<Source>,
+        base: Filter,
+        pricing: Pricing,
+        settings: Settings,
+    ) -> Self {
         // `--days 7` used to open on the 30-day chip: the window was right but
         // the header said otherwise. Land on the chip that matches.
         let today = chrono::Local::now().date_naive();
         let range = Range::for_days(base.since.map(|s| (today - s).num_days() + 1));
+        let settings_path = crate::paths::settings_file()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "unavailable".into());
         App {
             page: Page::Overview,
             range,
@@ -290,6 +339,21 @@ impl App {
             sources,
             disabled: Vec::new(),
             events: Vec::new(),
+            devices: vec![DeviceRecord {
+                id: settings.device.id.clone(),
+                name: settings.device.name.clone(),
+                host: None,
+                exporter_version: Some(env!("CARGO_PKG_VERSION").into()),
+                generated_at: 0,
+                is_local: true,
+                available: true,
+                enabled: true,
+                discovered: true,
+            }],
+            device_summary: Summary::default(),
+            settings,
+            settings_path,
+            ssh_hosts_loaded: false,
             pricing,
             summary: Summary::default(),
             stats: ScanStats::default(),
@@ -308,6 +372,8 @@ impl App {
             scan_pending: false,
             last_scan: None,
             watch: false,
+            device_requested: None,
+            device_pending: false,
             summary_date: today,
             status: None,
             replay: ReplayUi::default(),
@@ -334,6 +400,10 @@ impl App {
             Drill::None => {}
             Drill::Model(m) => f.model = Some(m.clone()),
             Drill::Project(p) => f.project = Some(p.clone()),
+            Drill::Device(device) => f.device = Some(device.clone()),
+        }
+        if f.device.is_none() && !self.settings.aggregate_devices {
+            f.device = Some(self.settings.device.id.clone());
         }
         f
     }
@@ -341,6 +411,9 @@ impl App {
     /// Recompute every rollup and restart the entrance animations.
     pub fn recompute(&mut self, animate: bool) {
         self.summary = summarize(&self.events, &self.filter(), &self.pricing);
+        let mut device_filter = self.filter();
+        device_filter.device = None;
+        self.device_summary = summarize(&self.events, &device_filter, &self.pricing);
         self.summary_date = chrono::Local::now().date_naive();
         let targets = [
             self.summary.total.tokens.total() as f64,
@@ -447,10 +520,52 @@ impl App {
 
     /// Ask for a rescan, unless one is already under way.
     pub fn request_rescan(&mut self, kind: Rescan) {
-        if self.scan_pending || self.rescan_requested.is_some() {
+        if self.scan_pending || self.device_pending || self.rescan_requested.is_some() {
             return;
         }
         self.rescan_requested = Some(kind);
+    }
+
+    /// 合并 SSH config 中发现的别名与已启用设备，不发起任何网络连接。
+    pub fn refresh_ssh_hosts(&mut self) {
+        match crate::devices::discover_ssh_hosts() {
+            Ok(hosts) => self.apply_discovered_ssh_hosts(hosts),
+            Err(error) => {
+                self.status = Some(format!("could not read SSH config: {error}"));
+            }
+        }
+        self.needs_redraw = true;
+    }
+
+    fn apply_discovered_ssh_hosts(&mut self, hosts: Vec<String>) {
+        for device in self.devices.iter_mut().filter(|device| !device.is_local) {
+            let host = device.host.as_deref();
+            device.discovered = host.is_some_and(|host| hosts.iter().any(|item| item == host));
+            device.enabled = host.is_some_and(|host| self.settings.ssh_host_enabled(host));
+        }
+        for host in hosts {
+            if self.devices.iter().any(|device| device.host.as_deref() == Some(&host)) {
+                continue;
+            }
+            self.devices.push(DeviceRecord {
+                id: format!("ssh:{host}"),
+                name: host.clone(),
+                host: Some(host.clone()),
+                exporter_version: None,
+                generated_at: 0,
+                is_local: false,
+                available: false,
+                enabled: self.settings.ssh_host_enabled(&host),
+                discovered: true,
+            });
+        }
+        self.devices.sort_by(|a, b| {
+            b.is_local.cmp(&a.is_local).then_with(|| {
+                a.host.as_deref().unwrap_or(&a.name).cmp(b.host.as_deref().unwrap_or(&b.name))
+            })
+        });
+        self.ssh_hosts_loaded = true;
+        self.clamp_selection();
     }
 
     /// Rows on the currently focused list, used to bound selection.
@@ -462,7 +577,9 @@ impl App {
             Page::Projects => self.summary.by_project.len(),
             Page::Sessions => self.summary.by_session.len(),
             Page::Replay => self.replay.data.as_ref().map_or(0, |replay| replay.events.len()),
+            Page::Devices => self.device_row_count(),
             Page::Pricing => self.pricing.known_models().len(),
+            Page::Settings => 1,
         }
     }
 
@@ -483,6 +600,11 @@ impl App {
             self.scroll = 0;
             self.grow = Eased::from_zero(1.0).with_rate(crate::tui::anim::RATE_FAST);
             self.needs_redraw = true;
+        }
+        // 单元测试不应依赖运行测试的机器恰好有哪些 SSH Host；解析器本身有独立测试。
+        #[cfg(not(test))]
+        if page == Page::Devices && !self.ssh_hosts_loaded {
+            self.refresh_ssh_hosts();
         }
     }
 
@@ -579,6 +701,36 @@ impl App {
             Page::Projects => self.open_project(self.selected),
             Page::Sessions => self.open_session(self.selected),
             Page::Replay => self.seek_replay(self.selected),
+            Page::Devices => {
+                let Some(record) = self.devices.get(self.selected).cloned() else {
+                    if self.selected == self.devices.len() && self.has_shared_device() {
+                        self.set_drill(Drill::Device(SHARED_DEVICE_ID.into()));
+                        self.status = Some("showing copied history".into());
+                        self.set_page(Page::Overview);
+                    }
+                    return;
+                };
+                let Some(host) = record.host.clone() else {
+                    let label = record.name;
+                    self.set_drill(Drill::Device(record.id));
+                    self.status = Some(format!("showing device {label}"));
+                    self.set_page(Page::Overview);
+                    return;
+                };
+                if !record.discovered {
+                    self.status = Some(format!("SSH Host `{host}` is no longer in your config"));
+                } else if !record.enabled {
+                    self.request_device(DeviceRequest::ConnectHost(host));
+                } else if !record.available {
+                    self.request_device(DeviceRequest::SyncHost(host));
+                } else {
+                    let label = record.name;
+                    self.set_drill(Drill::Device(record.id));
+                    self.status = Some(format!("showing device {label}"));
+                    self.set_page(Page::Overview);
+                }
+            }
+            Page::Settings => self.activate_setting(self.selected),
             _ => {}
         }
     }
@@ -596,20 +748,52 @@ impl App {
     pub fn open_session(&mut self, index: usize) {
         let Some(bucket) = self.summary.by_session.get(index) else { return };
         let session = bucket.label.clone();
+        let bucket_source = bucket.sources.iter().next().copied();
         let project = bucket.top_project().unwrap_or("unknown").to_string();
         let model = bucket.top_model().unwrap_or("unknown").to_string();
         let filter = self.filter();
-        let source = self
+        let matching: Vec<_> = self
             .events
             .iter()
-            .filter(|event| event.session == session && filter.admits(event))
-            .max_by_key(|event| event.ts)
-            .map(|event| event.source);
+            .filter(|event| {
+                event.session == session
+                    && bucket_source.is_none_or(|source| event.source == source)
+                    && filter.admits(event)
+            })
+            .collect();
+        let source = matching.iter().max_by_key(|event| event.ts).map(|event| event.source);
         let Some(source) = source else {
             self.status = Some("could not locate the session source".into());
             return;
         };
         let request = ReplayRequest { source, session, project, model };
+        let local = matching.iter().any(|event| {
+            event.observed_on.is_empty()
+                || event.observed_on.iter().any(|id| id == &self.settings.device.id)
+        });
+        if !local {
+            let mut names: Vec<_> = matching
+                .iter()
+                .flat_map(|event| event.observed_on.iter())
+                .map(|id| self.device_name(id).to_string())
+                .collect();
+            names.sort();
+            names.dedup();
+            self.replay = ReplayUi {
+                request: Some(request),
+                error: Some(format!(
+                    "usage-only remote session; Replay remains on {}",
+                    names.join(", ")
+                )),
+                return_session_index: index,
+                ..ReplayUi::default()
+            };
+            self.page = Page::Replay;
+            self.selected = 0;
+            self.scroll = 0;
+            self.needs_redraw = true;
+            return;
+        }
         self.replay = ReplayUi {
             request: Some(request.clone()),
             loading: true,
@@ -638,6 +822,155 @@ impl App {
     pub fn fail_replay(&mut self, error: String) {
         self.replay.loading = false;
         self.replay.error = Some(error);
+        self.needs_redraw = true;
+    }
+
+    pub fn device_name<'a>(&'a self, id: &'a str) -> &'a str {
+        if id == SHARED_DEVICE_ID {
+            return "Shared";
+        }
+        self.devices.iter().find(|device| device.id == id).map_or(id, |device| device.name.as_str())
+    }
+
+    pub fn has_shared_device(&self) -> bool {
+        self.device_summary.by_device.iter().any(|bucket| bucket.label == SHARED_DEVICE_ID)
+    }
+
+    pub fn device_row_count(&self) -> usize {
+        self.devices.len() + usize::from(self.has_shared_device())
+    }
+
+    pub fn activate_setting(&mut self, index: usize) {
+        let before = self.settings.clone();
+        match index {
+            0 => self.settings.aggregate_devices = !self.settings.aggregate_devices,
+            _ => return,
+        }
+        if let Err(error) = self.settings.save() {
+            self.settings = before;
+            self.status = Some(format!("could not save settings: {error}"));
+            return;
+        }
+        self.status = Some("settings saved".into());
+        self.recompute(true);
+    }
+
+    pub fn request_sync(&mut self) {
+        self.request_device(DeviceRequest::SyncAll);
+    }
+
+    fn request_device(&mut self, request: DeviceRequest) {
+        if self.scan_pending {
+            self.status = Some("wait for the current scan before contacting devices".into());
+            self.needs_redraw = true;
+            return;
+        }
+        if self.device_pending || self.device_requested.is_some() {
+            return;
+        }
+        if matches!(request, DeviceRequest::SyncAll) && !self.settings.has_ssh_hosts() {
+            self.status = Some("no SSH devices are enabled".into());
+            self.needs_redraw = true;
+            return;
+        }
+        self.status = Some(match &request {
+            DeviceRequest::SyncAll => "syncing devices…".into(),
+            DeviceRequest::SyncHost(host) => format!("syncing {host}…"),
+            DeviceRequest::ConnectHost(host) => format!("validating {host}…"),
+            DeviceRequest::UpdateHost(host) => format!("updating {host}…"),
+        });
+        self.device_requested = Some(request);
+        self.needs_redraw = true;
+    }
+
+    pub fn update_selected_device(&mut self) {
+        let Some(device) = self.devices.get(self.selected) else {
+            self.status = Some("select an SSH device to update".into());
+            return;
+        };
+        let Some(host) = device.host.clone() else {
+            self.status =
+                Some("the local device uses `readout update` outside the dashboard".into());
+            return;
+        };
+        if !device.discovered {
+            self.status = Some(format!("SSH Host `{host}` is no longer in your config"));
+            return;
+        }
+        self.request_device(DeviceRequest::UpdateHost(host));
+    }
+
+    pub fn disable_selected_device(&mut self) {
+        let Some(host) = self.devices.get(self.selected).and_then(|device| device.host.clone())
+        else {
+            self.status = Some("select an enabled SSH device to disable".into());
+            return;
+        };
+        if !self.settings.ssh_host_enabled(&host) {
+            self.status = Some(format!("{host} is not enabled"));
+            return;
+        }
+        let before = self.settings.clone();
+        self.settings.disable_ssh_host(&host);
+        if let Err(error) = self.settings.save() {
+            self.settings = before;
+            self.status = Some(format!("could not save settings: {error}"));
+            return;
+        }
+        if let Some(device) =
+            self.devices.iter_mut().find(|device| device.host.as_deref() == Some(&host))
+        {
+            device.enabled = false;
+        }
+        self.status = Some(format!("disabled {host}"));
+        self.request_rescan(Rescan::Manual);
+        self.needs_redraw = true;
+    }
+
+    pub fn sync_finished(&mut self, report: &crate::devices::SyncReport) {
+        self.device_pending = false;
+        self.status = Some(match (report.synced.is_empty(), report.failed.is_empty()) {
+            (false, true) => format!("synced {}", report.synced.join(", ")),
+            (false, false) => {
+                format!("synced {} · {} failed", report.synced.join(", "), report.failed.len())
+            }
+            (true, false) => format!(
+                "{} device(s) failed · {}",
+                report.failed.len(),
+                report.failed.first().map_or("unknown error", String::as_str)
+            ),
+            (true, true) => "nothing to sync".into(),
+        });
+        if !report.synced.is_empty() {
+            self.request_rescan(Rescan::Watch);
+        } else {
+            self.needs_redraw = true;
+        }
+    }
+
+    pub fn connect_finished(&mut self, host: &str, updated: bool) {
+        self.device_pending = false;
+        let before = self.settings.clone();
+        if let Err(error) =
+            self.settings.enable_ssh_host(host.to_string()).and_then(|_| self.settings.save())
+        {
+            self.settings = before;
+            self.status =
+                Some(format!("{host} is compatible, but settings could not be saved: {error}"));
+            self.needs_redraw = true;
+            return;
+        }
+        self.status = Some(if updated {
+            format!("updated and connected {host}")
+        } else {
+            format!("connected {host}")
+        });
+        self.request_rescan(Rescan::Watch);
+    }
+
+    pub fn sync_failed(&mut self, error: String) {
+        self.device_pending = false;
+        self.status = Some(format!("device operation failed: {error}"));
         self.needs_redraw = true;
     }
 
@@ -742,6 +1075,7 @@ mod tests {
                 session: "s1".into(),
                 project: "alpha".into(),
                 tokens: Tokens { input: 100, output: 100, ..Default::default() },
+                observed_on: Vec::new(),
                 dedup_key: None,
                 dedup_rank: 0,
             },
@@ -752,6 +1086,7 @@ mod tests {
                 session: "s2".into(),
                 project: "beta".into(),
                 tokens: Tokens { input: 50, output: 50, ..Default::default() },
+                observed_on: Vec::new(),
                 dedup_key: None,
                 dedup_rank: 0,
             },
@@ -982,6 +1317,7 @@ mod tests {
             session: "s3".into(),
             project: "alpha".into(),
             tokens: Tokens { input: 1_000, output: 1_000, ..Default::default() },
+            observed_on: Vec::new(),
             dedup_key: None,
             dedup_rank: 0,
         });
@@ -999,11 +1335,11 @@ mod tests {
     #[test]
     fn page_navigation_wraps_in_both_directions() {
         let mut a = app();
-        a.set_page(Page::Pricing);
+        a.set_page(Page::Settings);
         a.next_page(1);
         assert_eq!(a.page, Page::Overview);
         a.next_page(-1);
-        assert_eq!(a.page, Page::Pricing);
+        assert_eq!(a.page, Page::Settings);
     }
 
     #[test]
@@ -1012,5 +1348,125 @@ mod tests {
         assert_eq!(Range::All.chart_days(0), 30, "no data means a default window");
         let five_years_ago = chrono::Local::now().timestamp() - 5 * 365 * 86_400;
         assert_eq!(Range::All.chart_days(five_years_ago), 365, "capped so bars stay readable");
+    }
+
+    #[test]
+    fn aggregate_setting_changes_default_totals_but_not_the_devices_page_source() {
+        let mut settings = Settings::default();
+        let local = settings.device.id.clone();
+        settings.aggregate_devices = false;
+        let mut a = App::with_settings(
+            Source::ALL.to_vec(),
+            Filter::default(),
+            Pricing::builtin(),
+            settings,
+        );
+        let local_event = UsageEvent {
+            source: Source::Codex,
+            ts: chrono::Local::now().timestamp(),
+            model: "gpt-local".into(),
+            session: "local-session".into(),
+            project: "local-project".into(),
+            tokens: Tokens { output: 10, ..Default::default() },
+            observed_on: vec![local],
+            dedup_key: Some("local-event".into()),
+            dedup_rank: 0,
+        };
+        let mut remote_event = local_event.clone();
+        remote_event.session = "remote-session".into();
+        remote_event.tokens.output = 20;
+        remote_event.observed_on = vec!["dev-remote".into()];
+        remote_event.dedup_key = Some("remote-event".into());
+        a.events = vec![local_event, remote_event];
+        a.recompute(false);
+        assert_eq!(a.summary.total.tokens.output, 10);
+        assert_eq!(a.device_summary.total.tokens.output, 30);
+
+        a.settings.aggregate_devices = true;
+        a.recompute(false);
+        assert_eq!(a.summary.total.tokens.output, 30);
+    }
+
+    #[test]
+    fn discovered_hosts_are_not_enabled_until_the_compatibility_check_finishes() {
+        let mut a = App::new(Source::ALL.to_vec(), Filter::default(), Pricing::builtin());
+        a.apply_discovered_ssh_hosts(vec!["workstation".into()]);
+        a.page = Page::Devices;
+        a.selected = 1;
+        a.activate_selected();
+
+        assert!(!a.settings.ssh_host_enabled("workstation"));
+        assert_eq!(a.device_requested, Some(DeviceRequest::ConnectHost("workstation".into())));
+        assert_eq!(a.status.as_deref(), Some("validating workstation…"));
+    }
+
+    #[test]
+    fn configured_hosts_missing_from_ssh_config_stay_visible_but_cannot_connect() {
+        let mut settings = Settings::default();
+        settings.enable_ssh_host("old-host".into()).unwrap();
+        let mut a = App::with_settings(
+            Source::ALL.to_vec(),
+            Filter::default(),
+            Pricing::builtin(),
+            settings,
+        );
+        a.devices.push(DeviceRecord {
+            id: "dev-old".into(),
+            name: "Old".into(),
+            host: Some("old-host".into()),
+            exporter_version: Some("0.2.3".into()),
+            generated_at: 1,
+            is_local: false,
+            available: true,
+            enabled: true,
+            discovered: true,
+        });
+        a.apply_discovered_ssh_hosts(Vec::new());
+        a.page = Page::Devices;
+        a.selected = 1;
+        a.activate_selected();
+
+        assert!(a.device_requested.is_none());
+        assert!(a.status.as_deref().is_some_and(|status| status.contains("no longer")));
+    }
+
+    #[test]
+    fn remote_only_session_opens_an_explicit_usage_only_state() {
+        let settings = Settings::default();
+        let mut a = App::with_settings(
+            Source::ALL.to_vec(),
+            Filter::default(),
+            Pricing::builtin(),
+            settings,
+        );
+        a.devices.push(DeviceRecord {
+            id: "dev-remote".into(),
+            name: "workstation".into(),
+            host: Some("workstation".into()),
+            exporter_version: Some(env!("CARGO_PKG_VERSION").into()),
+            generated_at: chrono::Utc::now().timestamp(),
+            is_local: false,
+            available: true,
+            enabled: true,
+            discovered: true,
+        });
+        a.events = vec![UsageEvent {
+            source: Source::Codex,
+            ts: chrono::Local::now().timestamp(),
+            model: "gpt-remote".into(),
+            session: "remote-session".into(),
+            project: "remote-project".into(),
+            tokens: Tokens { output: 10, ..Default::default() },
+            observed_on: vec!["dev-remote".into()],
+            dedup_key: Some("remote-event".into()),
+            dedup_rank: 0,
+        }];
+        a.recompute(false);
+        a.open_session(0);
+        assert_eq!(a.page, Page::Replay);
+        assert!(a.replay_requested.is_none());
+        assert!(a.replay.error.as_deref().is_some_and(|error| {
+            error.contains("usage-only") && error.contains("workstation")
+        }));
     }
 }

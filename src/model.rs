@@ -108,6 +108,10 @@ pub struct UsageEvent {
     /// Full working directory used as an unambiguous project identity.
     pub project: String,
     pub tokens: Tokens,
+    /// 观察到该事件的设备 ID。空数组表示尚未进入多设备聚合层的本地扫描结果。
+    /// 同一 transcript 被复制到多台设备时会保留多个观察者，但 usage 仍只计一次。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed_on: Vec<String>,
     /// Stable id used to drop duplicates seen across forked transcripts.
     /// `None` when the format offers nothing to dedup on.
     pub dedup_key: Option<String>,

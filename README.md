@@ -19,18 +19,23 @@ readout summary --json   # …for a script
 
 ## Read-only, by construction
 
-`readout` opens exactly two directories:
+`readout` 的 transcript 扫描范围只有两个目录：
 
 - `~/.claude/projects/**/*.jsonl`
 - `~/.codex/sessions/**/*.jsonl` (active sessions only; `archived_sessions/` is
   intentionally out of scope)
 
+进入 Devices 页面时，它会额外按需读取 `~/.ssh/config` 及其中的 `Include`，只提取
+具体的 `Host` 别名；不会读取或保存密码、私钥、`IdentityFile`、`ProxyCommand` 等连接
+配置，也不会因为发现设备就建立连接。
+
 It never opens `~/.claude/settings.json`, `~/.codex/config.toml`, or
 `~/.codex/auth.json`. Those files hold live API credentials, and nothing here
-needs them — they are not read, not copied, not backed up. It writes to one
-place only, its own cache under `~/.cache/readout/`. Neither tool's
-configuration is modified, so there is no way for this to break a working
-setup.
+needs them — they are not read, not copied, not backed up. Usage cache 和远端
+usage bundle 写入系统 cache 目录下的 `readout/`，持久化设置写入系统 config 目录下的
+`readout/settings.json`（Linux 通常分别是 `~/.cache/readout/` 与
+`~/.config/readout/`）。Neither tool's configuration is modified, so there is
+no way for this to break a working setup.
 
 Session Replay 只在用户打开具体 session 时按需读取消息和工具调用。正文不会写入
 `~/.cache/readout/`；增量缓存仍然只保存 usage 元数据。
@@ -74,6 +79,14 @@ cargo build --release && ./target/release/readout
 
 The repository is `readout-cli`; the crate and the command are both `readout`.
 
+已安装 release 后可原地更新到最新版：
+
+```sh
+readout update
+```
+
+它复用同一套官方安装器和 SHA-256 校验，不在二进制里重复维护下载与解包逻辑。
+
 **Prebuilt binaries** are attached to every [release]: Linux x86-64 and arm64
 (static musl, so the distro doesn't matter), macOS Intel and Apple Silicon, and
 Windows x86-64 — which is what ARM Windows gets too, under emulation, until
@@ -107,6 +120,9 @@ Everything on screen that means something is clickable.
 | A model row | select it; click again to filter the dashboard by it |
 | A project row | open that project's sessions |
 | A session row | open Session Replay |
+| A device row | 首次点击连接并校验；已同步设备则按设备过滤 |
+| Devices card header | sync enabled SSH hosts |
+| A Settings row | toggle or cycle that persisted setting |
 | Replay controls and timeline events | play/pause, change speed, or seek to an event |
 | A day or rate row | select it |
 | A KPI tile | jump to the page that breaks it down |
@@ -120,7 +136,10 @@ Everything on screen that means something is clickable.
 |---|---|
 | `↑` `↓` / `j` `k` | move the selection (the window scrolls to follow) |
 | `PgUp` `PgDn` `Home` `End` | move it faster |
-| `Enter` | filter the selected model, open a project's sessions, or replay a session |
+| `Enter` | filter/open the selected row；Devices 中用于校验并启用 SSH Host |
+| `Delete` / `Backspace` | 在 Devices 中禁用选中的 SSH Host |
+| `u` | 在 Devices 中升级选中的远端 readout，并重新校验兼容性 |
+| `r` | 在 Devices 中异步同步已启用设备；其他页面重新扫描本机 usage |
 | `Esc` | clear that filter |
 | `Tab` / `Shift-Tab`, `←` `→` | change page |
 | `t` / `1` `2` `3` `4` | today / 7d / 30d / 90d / all time |
@@ -139,6 +158,54 @@ session 进入独立的 Replay 页面。Replay 会按时间排列用户消息、
 Replay 默认暂停在首个事件。`Space` 播放或暂停，`1`/`2`/`4` 切换倍速，`[`/`]`
 逐事件移动，`Esc` 返回当前项目的 Sessions。播放位置、列表选中项和时间轴指示器会
 同步更新；进入页面时沿用 dashboard 的缓入动画。
+
+远端 bundle 不包含消息或工具正文。远程 session 仍会显示 usage、模型、项目、时间和
+设备，但 Replay 页面会明确标记为 usage-only；只有当前设备持有 active transcript 时
+才会读取完整 Replay。
+
+## 多设备与 SSH
+
+中心设备默认合并本机 usage 和已经同步的远端 bundle。Bundle 只包含 token、费用所需
+字段、时间、模型、项目和 session ID，不包含 prompt、助手消息、工具参数、工具结果或
+任何认证信息。
+
+设备来源只使用现有的 SSH config，不再维护第二份远端清单。进入 Devices 页面后，
+readout 会从 `~/.ssh/config`（含 `Include` 和通配 include 文件）列出所有具体 `Host` 别名；
+`Host *`、`!negated` 等模式不会成为设备。按 `Enter` 后才执行固定命令
+`ssh <host-alias> readout export`，校验 bundle schema、设备 ID 和输出边界，成功后才把
+这个别名记为启用。SSH 的 User、HostName、端口、密钥和跳板机继续完全交给 OpenSSH。
+
+远端需要先安装 readout，并且 `readout` 必须在非交互 SSH 的 PATH 中。首次 host key
+确认仍应由用户正常执行一次 `ssh <host-alias>`。兼容的旧版本可以继续同步，设备行会
+显示它的版本；需要升级时选中后按 `u`。还没有 `readout update` 的旧版本需要手动跑
+一次最新安装器，之后即可远程升级。
+
+保留的自动化命令只有：
+
+```sh
+readout sync     # 拉取 Devices 中所有已启用设备
+readout update   # 更新本机 readout
+```
+
+同步使用 BatchMode、连接超时、总超时和有界输出，不保存密码或私钥。
+TUI 的 Settings 页面只控制默认是否显示全部设备聚合值；关闭后
+Overview/Models/Projects/Sessions 只看本机。SSH 不做定时同步：在 Devices 页面按 `r`
+或点击卡片标题会启动后台同步，界面不会被 SSH 阻塞。
+
+Devices 页面始终保留全设备状态。若同一个 transcript 出现在多台设备，稳定事件 ID 会
+保证总量只计算一次；由于 Codex 记录不包含真实主机 ID，这部分会进入 `Shared`，不会
+伪装成某台设备的独占 usage。
+
+同一项目在不同系统上的 cwd 不同时，可以映射到统一名称：
+
+```sh
+readout project-alias set readout-cli /mnt/work/readout-cli
+readout project-alias set readout-cli 'C:\work\readout-cli'
+readout project-alias list
+```
+
+所有日期都由中心设备根据 bundle 中的 Unix 时间戳重新分桶，因此 Overview 的
+`Today` 始终使用当前查看设备的时区，不会直接相加各设备含义不同的“今天”。
 
 At least one tool always stays on: switching the last one off would leave a
 dashboard of zeroes rather than an answer.
@@ -189,7 +256,10 @@ readout projects
 readout daily
 readout pricing [--init]
 readout refresh [--clear]
-readout snapshot [--width N] [--height N] [--page overview|daily|models|projects|sessions|pricing]
+readout sync
+readout update
+readout project-alias set|remove|list
+readout snapshot [--width N] [--height N] [--page overview|daily|models|projects|sessions|devices|pricing|settings]
 ```
 
 Filters apply to every subcommand, the dashboard included:
@@ -270,7 +340,8 @@ than the part that changed — fine once per launch, wrong every five seconds
 under `--watch`.
 
 `readout refresh` rebuilds the cache; `readout refresh --clear` deletes it.
-Set `READOUT_STATE_DIR` to move the cache and the price overrides elsewhere.
+Set `READOUT_STATE_DIR` to move the cache, remote usage snapshots, and price
+overrides elsewhere. Set `READOUT_CONFIG_DIR` to move readout's own settings.
 
 ## Accuracy notes
 

@@ -27,7 +27,7 @@ use std::os::unix::fs::OpenOptionsExt;
 
 /// Bumped whenever the parsers or the on-disk shape change meaning. A stale
 /// cache is discarded silently and rebuilt rather than migrated.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// 损坏或被替换的缓存不能迫使进程分配无限内存。
 const MAX_CACHE_BYTES: u64 = 512 * 1024 * 1024;
@@ -192,6 +192,7 @@ pub fn event_text_bytes(events: &[UsageEvent]) -> usize {
             .saturating_add(event.model.len())
             .saturating_add(event.session.len())
             .saturating_add(event.project.len())
+            .saturating_add(event.observed_on.iter().map(String::len).sum::<usize>())
             .saturating_add(event.dedup_key.as_ref().map_or(0, String::len))
     })
 }

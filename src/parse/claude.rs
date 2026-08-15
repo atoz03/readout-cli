@@ -129,6 +129,7 @@ pub fn parse_file(path: &Path, cursor: &ParseCursor, bytes: &[u8]) -> FileParse 
                 .map(crate::paths::project_label_from_cwd)
                 .unwrap_or_else(|| project.clone()),
             tokens: a.tokens,
+            observed_on: Vec::new(),
             dedup_rank: rank(a.has_stop_reason),
             dedup_key: Some(a.message_id),
         })

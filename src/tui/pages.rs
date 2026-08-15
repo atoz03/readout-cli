@@ -32,7 +32,9 @@ enum NavList {
     Days,
     Sessions,
     ReplayEvents,
+    Devices,
     Rates,
+    Settings,
 }
 
 /// Whether this list is the one ↑↓ drives on the current page.
@@ -49,7 +51,9 @@ fn owns_selection(page: Page, list: NavList) -> bool {
         Page::Daily => list == NavList::Days,
         Page::Sessions => list == NavList::Sessions,
         Page::Replay => list == NavList::ReplayEvents,
+        Page::Devices => list == NavList::Devices,
         Page::Pricing => list == NavList::Rates,
+        Page::Settings => list == NavList::Settings,
     }
 }
 
@@ -87,7 +91,9 @@ pub fn draw(app: &mut App, buf: &mut Buffer, area: Rect) {
             Page::Projects => ranked(app, buf, &mut hits, content, RankKind::Project),
             Page::Sessions => sessions(app, buf, &mut hits, content),
             Page::Replay => replay(app, buf, &mut hits, content),
+            Page::Devices => devices(app, buf, &mut hits, content),
             Page::Pricing => pricing(app, buf, &mut hits, content),
+            Page::Settings => settings(app, buf, &mut hits, content),
         }
     }
 
@@ -104,7 +110,9 @@ pub fn draw(app: &mut App, buf: &mut Buffer, area: Rect) {
 fn is_empty(app: &App) -> bool {
     // Mid-scan the answer is not known yet, so the dashboard keeps drawing
     // what it has rather than claiming there is nothing.
-    app.summary.total.events == 0 && !matches!(app.loading, Loading::Scanning(_))
+    app.summary.total.events == 0
+        && !matches!(app.loading, Loading::Scanning(_))
+        && !matches!(app.page, Page::Pricing | Page::Devices | Page::Settings)
 }
 
 fn draw_empty(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
@@ -260,7 +268,26 @@ fn headline(app: &App, width: u16) -> String {
         );
         return fmt::ellipsize(&text, width as usize);
     }
+    if app.page == Page::Settings {
+        return fmt::ellipsize(
+            &format!(
+                "Preferences for {} · {} enabled SSH hosts",
+                app.settings.device.name,
+                app.settings.ssh_hosts.len()
+            ),
+            width as usize,
+        );
+    }
+    if app.page == Page::Devices {
+        return fmt::ellipsize(
+            &format!("{} devices · remote snapshots contain usage only", app.devices.len()),
+            width as usize,
+        );
+    }
     let s = &app.summary;
+    if let Drill::Device(id) = &app.drill {
+        return format!("Filtered to device: {} — press Esc to clear", app.device_name(id));
+    }
     if let Some(drill) = app.drill.label() {
         return format!("Filtered to {drill} — press Esc to clear");
     }
@@ -1022,7 +1049,15 @@ fn session_list(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect, sc
         let label_w = row.width.saturating_sub(time_w + tok_w + 4);
         // A raw session UUID identifies nothing to a reader; the project it
         // ran in and the model it used are what make a row recognizable.
-        let label = format!("{}  {}", b.top_project().unwrap_or("—"), model);
+        let device = match b.devices.len() {
+            0 => None,
+            1 => b.devices.iter().next().map(|id| app.device_name(id)),
+            _ => Some("Shared"),
+        };
+        let label = match device {
+            Some(device) => format!("[{device}]  {}  {}", b.top_project().unwrap_or("—"), model),
+            None => format!("{}  {}", b.top_project().unwrap_or("—"), model),
+        };
         w::text(
             buf,
             row.x + 2,
@@ -1048,6 +1083,190 @@ fn session_list(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect, sc
             Style::default().fg(theme::TEXT_MUTED),
         );
         hits.add_hoverable(row, Action::SessionRow(i), hover_id);
+    }
+}
+
+// ── Devices ────────────────────────────────────────────────────────────────
+
+fn devices(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
+    let discovered =
+        app.devices.iter().filter(|device| !device.is_local && device.discovered).count();
+    let inner = w::card(
+        buf,
+        hits,
+        area,
+        Card {
+            title: "Devices",
+            glyph: "◫",
+            glyph_color: theme::SERIES[1],
+            meta: Some(format!(
+                "{discovered} found · {} enabled · r sync · Enter connect · Del disable · u update",
+                app.settings.ssh_hosts.len()
+            )),
+            action: app.settings.has_ssh_hosts().then_some(Action::SyncDevices),
+        },
+    );
+    let rows = inner.height as usize;
+    if owns_selection(app.page, NavList::Devices) {
+        app.list_rows.set(rows);
+    }
+    for index in (app.scroll..app.device_row_count()).take(rows) {
+        let y = inner.y + (index - app.scroll) as u16;
+        let row = Rect { x: inner.x, y, width: inner.width, height: 1 };
+        let selected = index == app.selected;
+        let record = app.devices.get(index);
+        let id = record.map_or(crate::agg::SHARED_DEVICE_ID, |device| device.id.as_str());
+        let hover_key = record.and_then(|device| device.host.as_deref()).unwrap_or(id);
+        let hover_id = w::hover_id(&format!("device:{hover_key}"));
+        if selected || app.hover == Some(hover_id) {
+            w::fill(
+                buf,
+                row,
+                if selected { theme::SURFACE_SELECTED } else { theme::SURFACE_RAISED },
+            );
+        }
+        let bucket = app.device_summary.by_device.iter().find(|bucket| bucket.label == id);
+        let name = record.map_or("Shared", |device| device.name.as_str());
+        let state = if id == crate::agg::SHARED_DEVICE_ID {
+            "copied history".to_string()
+        } else if record.is_some_and(|device| device.is_local) {
+            "local".to_string()
+        } else if record.is_some_and(|device| !device.discovered) {
+            "missing config".to_string()
+        } else if record.is_some_and(|device| !device.enabled) {
+            "available".to_string()
+        } else if record.is_some_and(|device| !device.available) {
+            "not synced".to_string()
+        } else {
+            record.map_or_else(
+                || "imported".to_string(),
+                |device| {
+                    let version = device.exporter_version.as_deref().unwrap_or("?");
+                    format!("v{version} · {}", fmt::relative(device.generated_at))
+                },
+            )
+        };
+        let mark = if selected { theme::SELECT_MARK } else { theme::DOT };
+        w::text(buf, row.x, y, 1, mark, Style::default().fg(theme::series_for(id)));
+        let value = bucket.map_or_else(
+            || "—".to_string(),
+            |bucket| {
+                format!(
+                    "{}  {}",
+                    fmt::tokens(bucket.tokens.total()),
+                    fmt::money_partial(bucket.priced.cost, bucket.priced.coverage())
+                )
+            },
+        );
+        let value_w = (value.chars().count() as u16).min(row.width / 3);
+        let state_w = 18u16.min(row.width / 4);
+        let label_w = row.width.saturating_sub(value_w + state_w + 4);
+        w::text(
+            buf,
+            row.x + 2,
+            y,
+            label_w,
+            &fmt::ellipsize(name, label_w as usize),
+            Style::default().fg(if selected { theme::TEXT_PRIMARY } else { theme::TEXT_SECONDARY }),
+        );
+        w::text_right(
+            buf,
+            row.right().saturating_sub(value_w + state_w + 1),
+            y,
+            value_w,
+            &value,
+            Style::default().fg(theme::TEXT_SECONDARY),
+        );
+        w::text_right(
+            buf,
+            row.right().saturating_sub(state_w),
+            y,
+            state_w,
+            &state,
+            Style::default().fg(theme::TEXT_MUTED),
+        );
+        hits.add_hoverable(row, Action::Row(index), hover_id);
+    }
+}
+
+// ── Settings ───────────────────────────────────────────────────────────────
+
+fn settings(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
+    let inner = w::card(
+        buf,
+        hits,
+        area,
+        Card {
+            title: "Settings",
+            glyph: "⚙",
+            glyph_color: theme::SERIES[0],
+            meta: Some(format!("device {}", app.settings.device.name)),
+            action: None,
+        },
+    );
+    let rows = [(
+        "Aggregate devices",
+        if app.settings.aggregate_devices { "On" } else { "Off" },
+        "Include remote usage in the default totals",
+    )];
+    app.list_rows.set(rows.len().min(inner.height as usize));
+    for (index, (label, value, help)) in rows.iter().enumerate().take(inner.height as usize) {
+        let y = inner.y + index as u16;
+        let row = Rect { x: inner.x, y, width: inner.width, height: 1 };
+        let selected = index == app.selected;
+        let hover_id = w::hover_id(&format!("setting:{index}"));
+        if selected || app.hover == Some(hover_id) {
+            w::fill(
+                buf,
+                row,
+                if selected { theme::SURFACE_SELECTED } else { theme::SURFACE_RAISED },
+            );
+        }
+        let actual = (*value).to_string();
+        let value_w = 8u16.min(row.width);
+        let label_w = 22u16.min(row.width.saturating_sub(value_w + 2));
+        let mark = if selected { theme::SELECT_MARK } else { " " };
+        w::text(buf, row.x, y, 1, mark, Style::default().fg(theme::SERIES[0]));
+        w::text(
+            buf,
+            row.x + 2,
+            y,
+            label_w,
+            label,
+            Style::default()
+                .fg(if selected { theme::TEXT_PRIMARY } else { theme::TEXT_SECONDARY })
+                .add_modifier(if selected { Modifier::BOLD } else { Modifier::empty() }),
+        );
+        let help_x = row.x + label_w + 2;
+        let help_w = row.width.saturating_sub(label_w + value_w + 3);
+        w::text(buf, help_x, y, help_w, help, Style::default().fg(theme::TEXT_MUTED));
+        w::text_right(
+            buf,
+            row.right().saturating_sub(value_w),
+            y,
+            value_w,
+            &actual,
+            Style::default().fg(if actual == "On" { theme::SERIES[2] } else { theme::TEXT_MUTED }),
+        );
+        hits.add_hoverable(row, Action::Setting(index), hover_id);
+    }
+
+    if inner.height > rows.len() as u16 + 1 {
+        let y = inner.y + rows.len() as u16 + 1;
+        let remotes = format!(
+            "{} enabled SSH hosts · {} project aliases · config {}",
+            app.settings.ssh_hosts.len(),
+            app.settings.project_aliases.len(),
+            app.settings_path
+        );
+        w::text(
+            buf,
+            inner.x,
+            y,
+            inner.width,
+            &fmt::ellipsize(&remotes, inner.width as usize),
+            Style::default().fg(theme::TEXT_MUTED),
+        );
     }
 }
 
@@ -1664,6 +1883,7 @@ mod tests {
             session: "s1".into(),
             project: "alpha".into(),
             tokens: Tokens { input: 1_000, output: 1_000, ..Default::default() },
+            observed_on: Vec::new(),
             dedup_key: None,
             dedup_rank: 0,
         }];

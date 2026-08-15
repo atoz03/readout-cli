@@ -56,6 +56,9 @@ pub struct CodexState {
     /// Keyed by `rate_limits.limit_id`; `None` is a valid key (no lane id).
     pub last_signature_by_source: Vec<(Option<String>, Signature)>,
     pub previous_signature: Option<Signature>,
+    /// 已发出 usage 事件的稳定序号；增量续扫必须从原序号继续。
+    #[serde(default)]
+    pub usage_sequence: u64,
 }
 
 impl CodexState {
@@ -145,9 +148,9 @@ pub fn parse_file(path: &Path, cursor: &ParseCursor, bytes: &[u8]) -> FileParse 
                     && (by_source.get(&source) == Some(&signature)
                         || st.previous_signature.as_ref() == Some(&signature));
                 if total.is_some() {
-                    by_source.insert(source, signature.clone());
+                    by_source.insert(source.clone(), signature.clone());
                 }
-                st.previous_signature = Some(signature);
+                st.previous_signature = Some(signature.clone());
 
                 let delta = if duplicate {
                     Counters::default()
@@ -184,22 +187,32 @@ pub fn parse_file(path: &Path, cursor: &ParseCursor, bytes: &[u8]) -> FileParse 
                     continue;
                 }
 
+                let timestamp = v.get("timestamp").and_then(Value::as_str).unwrap_or("");
+                let session = st.thread_id.clone().unwrap_or_else(|| file_stem(path));
+                let model = st.model.clone().unwrap_or_else(|| "unknown".into());
+                let dedup_key = codex_usage_key(
+                    &session,
+                    timestamp,
+                    source.as_deref(),
+                    &signature,
+                    &model,
+                    st.usage_sequence,
+                );
+                st.usage_sequence = st.usage_sequence.saturating_add(1);
+
                 events.push(UsageEvent {
                     source: Source::Codex,
-                    ts: v
-                        .get("timestamp")
-                        .and_then(Value::as_str)
-                        .and_then(super::parse_ts)
-                        .unwrap_or(0),
-                    model: st.model.clone().unwrap_or_else(|| "unknown".into()),
-                    session: st.thread_id.clone().unwrap_or_else(|| file_stem(path)),
+                    ts: super::parse_ts(timestamp).unwrap_or(0),
+                    model,
+                    session,
                     project: st
                         .cwd
                         .as_deref()
                         .map(crate::paths::project_label_from_cwd)
                         .unwrap_or_else(|| "unknown".into()),
                     tokens,
-                    dedup_key: None,
+                    observed_on: Vec::new(),
+                    dedup_key: Some(dedup_key),
                     dedup_rank: 0,
                 });
             }
@@ -216,6 +229,46 @@ pub fn parse_file(path: &Path, cursor: &ParseCursor, bytes: &[u8]) -> FileParse 
         cursor: ParseCursor { codex: Some(st), ..ParseCursor::default() },
         skipped_synthetic: 0,
     }
+}
+
+/// Codex 没有为 token_count 提供事件 ID，因此对不含正文的稳定字段做内容寻址。
+/// 设备 ID 和 cwd 有意不参与：同一 session 复制到另一设备或另一项目路径后仍应去重。
+fn codex_usage_key(
+    session: &str,
+    timestamp: &str,
+    lane: Option<&str>,
+    signature: &Signature,
+    model: &str,
+    sequence: u64,
+) -> String {
+    fn part(hasher: &mut blake3::Hasher, value: &[u8]) {
+        hasher.update(&(value.len() as u64).to_le_bytes());
+        hasher.update(value);
+    }
+    fn optional_counters(hasher: &mut blake3::Hasher, value: Option<Counters>) {
+        match value {
+            Some(value) => {
+                hasher.update(&[1]);
+                hasher.update(&value.input.to_le_bytes());
+                hasher.update(&value.cached_input.to_le_bytes());
+                hasher.update(&value.output.to_le_bytes());
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    part(&mut hasher, b"readout:codex-usage:v1");
+    part(&mut hasher, session.as_bytes());
+    part(&mut hasher, timestamp.as_bytes());
+    part(&mut hasher, lane.unwrap_or("").as_bytes());
+    optional_counters(&mut hasher, signature.total);
+    optional_counters(&mut hasher, signature.last);
+    part(&mut hasher, model.as_bytes());
+    hasher.update(&sequence.to_le_bytes());
+    format!("codex:v1:{}", hasher.finalize().to_hex())
 }
 
 fn delta_from_high_water(prev: &Option<Counters>, current: &Counters) -> Counters {
@@ -354,6 +407,20 @@ mod tests {
     }
 
     #[test]
+    fn copied_usage_records_receive_the_same_stable_id() {
+        let event = token_event((1000, 0, 100), Some((1000, 0, 100)), "codex");
+        let text = format!("{META}\n{CTX}\n{event}\n");
+        let first = parse(&text);
+        let copied = parse(&text);
+        let key = first.events[0].dedup_key.as_deref().unwrap();
+        assert!(key.starts_with("codex:v1:"));
+        assert_eq!(first.events[0].dedup_key, copied.events[0].dedup_key);
+
+        let later = text.replace("13:04:18.366Z", "13:04:18.367Z");
+        assert_ne!(first.events[0].dedup_key, parse(&later).events[0].dedup_key);
+    }
+
+    #[test]
     fn repeats_are_suppressed_per_rate_limit_lane() {
         // Two lanes interleave; each lane repeating its own last snapshot is a
         // refresh even though the immediately preceding line differed.
@@ -414,6 +481,22 @@ mod tests {
         );
         assert!(rest.events.is_empty(), "the repeat must still be recognized across the resume");
         assert_eq!(parse(&whole).events.len(), 1);
+    }
+
+    #[test]
+    fn incremental_resume_preserves_stable_id_sequence() {
+        let a = token_event((1000, 0, 100), Some((1000, 0, 100)), "codex");
+        let b = token_event((2000, 0, 200), Some((1000, 0, 100)), "codex")
+            .replace("13:04:18.366Z", "13:04:19.366Z");
+        let whole = parse(&format!("{META}\n{CTX}\n{a}\n{b}\n"));
+        let first = parse(&format!("{META}\n{CTX}\n{a}\n"));
+        let second = parse_file(
+            Path::new("/tmp/rollout-x.jsonl"),
+            &first.cursor,
+            format!("{b}\n").as_bytes(),
+        );
+        assert_eq!(whole.events[0].dedup_key, first.events[0].dedup_key);
+        assert_eq!(whole.events[1].dedup_key, second.events[0].dedup_key);
     }
 
     #[test]

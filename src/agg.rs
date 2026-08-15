@@ -9,6 +9,8 @@ use crate::pricing::{Priced, Pricing, price};
 use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Timelike};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+pub const SHARED_DEVICE_ID: &str = "@shared";
+
 /// One row of any breakdown: a label plus its totals.
 #[derive(Debug, Clone, Default)]
 pub struct Bucket {
@@ -16,7 +18,10 @@ pub struct Bucket {
     pub tokens: Tokens,
     pub priced: Priced,
     pub events: u64,
-    pub sessions: HashSet<String>,
+    pub sessions: HashSet<(Source, String)>,
+    /// 观察到该桶事件的设备；用于 session/device 状态，不参与 usage 求和。
+    pub devices: HashSet<String>,
+    pub sources: HashSet<Source>,
     /// Most recent activity in the bucket, unix seconds.
     pub last_ts: i64,
     /// Models that contributed, keyed to their token volume.
@@ -35,8 +40,10 @@ impl Bucket {
         self.priced.add(&price(pricing, &e.model, &e.tokens));
         self.events = self.events.saturating_add(1);
         if !e.session.is_empty() {
-            self.sessions.insert(e.session.clone());
+            self.sessions.insert((e.source, e.session.clone()));
         }
+        self.devices.extend(e.observed_on.iter().cloned());
+        self.sources.insert(e.source);
         self.last_ts = self.last_ts.max(e.ts);
         let model_tokens = self.models.entry(e.model.clone()).or_default();
         *model_tokens = model_tokens.saturating_add(e.tokens.total());
@@ -74,6 +81,8 @@ pub struct Summary {
     pub by_model: Vec<Bucket>,
     pub by_project: Vec<Bucket>,
     pub by_session: Vec<Bucket>,
+    /// 独占事件按设备分桶；被多台设备观察到的复制事件只进入一个 Shared 桶。
+    pub by_device: Vec<Bucket>,
     pub daily: Vec<DayBucket>,
     /// 24 slots, local hour 0..=23, by total tokens.
     pub by_hour: [Bucket; 24],
@@ -96,6 +105,8 @@ pub struct Filter {
     pub project: Option<String>,
     pub model: Option<String>,
     pub session: Option<String>,
+    /// 只显示该设备观察到的事件；共享事件仍会出现，但只计一次。
+    pub device: Option<String>,
 }
 
 impl Default for Filter {
@@ -107,6 +118,7 @@ impl Default for Filter {
             project: None,
             model: None,
             session: None,
+            device: None,
         }
     }
 }
@@ -160,6 +172,16 @@ impl Filter {
         {
             return false;
         }
+        if let Some(device) = &self.device {
+            let admitted = if device == SHARED_DEVICE_ID {
+                e.observed_on.len() > 1
+            } else {
+                e.observed_on.iter().any(|id| id == device)
+            };
+            if !admitted {
+                return false;
+            }
+        }
         true
     }
 }
@@ -174,7 +196,8 @@ pub fn summarize(events: &[UsageEvent], filter: &Filter, pricing: &Pricing) -> S
     let mut by_source: BTreeMap<Source, Bucket> = BTreeMap::new();
     let mut by_model: HashMap<String, Bucket> = HashMap::new();
     let mut by_project: HashMap<String, Bucket> = HashMap::new();
-    let mut by_session: HashMap<String, Bucket> = HashMap::new();
+    let mut by_session: HashMap<(Source, String), Bucket> = HashMap::new();
+    let mut by_device: HashMap<String, Bucket> = HashMap::new();
     let mut daily: BTreeMap<NaiveDate, Bucket> = BTreeMap::new();
     let mut hours: Vec<Bucket> = (0..24).map(|h| Bucket::new(format!("{h:02}"))).collect();
     let mut observed: HashSet<&str> = HashSet::new();
@@ -194,9 +217,19 @@ pub fn summarize(events: &[UsageEvent], filter: &Filter, pricing: &Pricing) -> S
             .or_insert_with(|| Bucket::new(&e.project))
             .absorb(e, pricing);
         by_session
-            .entry(e.session.clone())
+            .entry((e.source, e.session.clone()))
             .or_insert_with(|| Bucket::new(&e.session))
             .absorb(e, pricing);
+        if let Some(device) = match e.observed_on.as_slice() {
+            [] => None,
+            [device] => Some(device.as_str()),
+            _ => Some(SHARED_DEVICE_ID),
+        } {
+            by_device
+                .entry(device.to_string())
+                .or_insert_with(|| Bucket::new(device))
+                .absorb(e, pricing);
+        }
 
         if e.ts > 0 {
             first_ts = first_ts.min(e.ts);
@@ -221,6 +254,7 @@ pub fn summarize(events: &[UsageEvent], filter: &Filter, pricing: &Pricing) -> S
         v.sort_by(|a, b| b.last_ts.cmp(&a.last_ts).then(b.tokens.total().cmp(&a.tokens.total())));
         v
     };
+    s.by_device = sorted_by_tokens(by_device);
     s.daily = daily.into_iter().map(|(date, bucket)| DayBucket { date, bucket }).collect();
     s.by_hour = hours.try_into().expect("24 hour buckets");
     s.unpriced_models = pricing.unpriced_among(observed);
@@ -325,6 +359,7 @@ mod tests {
             project: project.into(),
             session: session.into(),
             tokens: Tokens { input: 10, output: out, ..Default::default() },
+            observed_on: Vec::new(),
             dedup_key: None,
             dedup_rank: 0,
         }
@@ -533,5 +568,41 @@ mod tests {
         ];
         let s = summarize(&events, &Filter::default(), &p);
         assert_eq!(s.total.session_count(), 2);
+    }
+
+    #[test]
+    fn copied_events_enter_one_shared_device_bucket() {
+        let mut copied = ev(Source::Codex, "gpt", "p", "s", Local::now().timestamp(), 10);
+        copied.observed_on = vec!["dev-a".into(), "dev-b".into()];
+        let summary = summarize(&[copied], &Filter::default(), &Pricing::builtin());
+        assert_eq!(summary.total.tokens.output, 10);
+        assert_eq!(summary.by_device.len(), 1);
+        assert_eq!(summary.by_device[0].label, SHARED_DEVICE_ID);
+        assert_eq!(summary.by_device[0].tokens.output, 10);
+    }
+
+    #[test]
+    fn shared_device_filter_selects_only_events_seen_on_multiple_devices() {
+        let now = Local::now().timestamp();
+        let mut copied = ev(Source::Codex, "gpt", "p", "shared", now, 10);
+        copied.observed_on = vec!["dev-a".into(), "dev-b".into()];
+        let mut local = ev(Source::Codex, "gpt", "p", "local", now, 20);
+        local.observed_on = vec!["dev-a".into()];
+        let filter = Filter { device: Some(SHARED_DEVICE_ID.into()), ..Filter::default() };
+        let summary = summarize(&[copied, local], &filter, &Pricing::builtin());
+        assert_eq!(summary.total.tokens.output, 10);
+        assert_eq!(summary.total.events, 1);
+    }
+
+    #[test]
+    fn identical_session_ids_from_different_tools_remain_distinct() {
+        let now = Local::now().timestamp();
+        let events = [
+            ev(Source::Claude, "claude", "p", "same", now, 10),
+            ev(Source::Codex, "gpt", "p", "same", now, 20),
+        ];
+        let summary = summarize(&events, &Filter::default(), &Pricing::builtin());
+        assert_eq!(summary.by_session.len(), 2);
+        assert_eq!(summary.total.session_count(), 2);
     }
 }
