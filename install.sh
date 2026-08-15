@@ -37,6 +37,12 @@ arch="$(uname -m)"
 case "$os" in
   Linux)  os_part="unknown-linux-musl" ;;
   Darwin) os_part="apple-darwin" ;;
+  # Git Bash, MSYS and Cygwin can run this script but not the binary it would
+  # fetch; there is a native installer for that, and it is worth naming rather
+  # than leaving as "unsupported OS: MINGW64_NT-10.0".
+  MINGW*|MSYS*|CYGWIN*)
+    die "this is the Unix installer. On Windows run:
+  powershell -c \"irm https://raw.githubusercontent.com/${REPO}/main/install.ps1 | iex\"" ;;
   *) die "unsupported OS: $os. Windows binaries are on the releases page; or build with 'cargo install readout'." ;;
 esac
 case "$arch" in

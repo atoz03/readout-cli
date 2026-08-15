@@ -36,13 +36,24 @@ out of scope. This tool answers "what did I spend", and nothing else.
 
 ## Install
 
+Linux and macOS:
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/atoz03/readout-cli/main/install.sh | sh
 ```
 
-Downloads the binary for your platform into `~/.local/bin`, checks it against
-the SHA-256 published with the release, and touches nothing else. Set
-`READOUT_INSTALL_DIR` to put it elsewhere or `READOUT_VERSION` to pin a version.
+Windows:
+
+```powershell
+powershell -c "irm https://raw.githubusercontent.com/atoz03/readout-cli/main/install.ps1 | iex"
+```
+
+Either one downloads the binary for your platform — into `~/.local/bin`, or
+`%LOCALAPPDATA%\Programs\readout` — checks it against the SHA-256 published with
+the release, and touches nothing else. Neither edits your PATH; if the install
+directory isn't on it, they print the line that adds it. Set
+`READOUT_INSTALL_DIR` to put the binary elsewhere or `READOUT_VERSION` to pin a
+version.
 
 From the registry, if you have Rust:
 
@@ -61,9 +72,10 @@ The repository is `readout-cli`; the crate and the command are both `readout`.
 
 **Prebuilt binaries** are attached to every [release]: Linux x86-64 and arm64
 (static musl, so the distro doesn't matter), macOS Intel and Apple Silicon, and
-Windows x86-64. On Windows, download the `.zip` and put `readout.exe` on your
-PATH. Building from source needs a recent stable Rust — the crate is on the
-2024 edition and uses let-chains.
+Windows x86-64 — which is what ARM Windows gets too, under emulation, until
+there is an arm64 build. To skip the installers, download the archive and put
+the binary on your PATH yourself. Building from source needs a recent stable
+Rust — the crate is on the 2024 edition and uses let-chains.
 
 [release]: https://github.com/atoz03/readout-cli/releases/latest
 
