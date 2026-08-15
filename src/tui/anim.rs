@@ -9,9 +9,20 @@
 
 use std::time::{Duration, Instant};
 
-/// Frame interval. ~16 fps is enough for bar growth and cheap on a remote
-/// terminal, where every frame is bytes over the wire.
-pub const TICK: Duration = Duration::from_millis(60);
+/// Frame interval. 60 fps: motion at 16 fps reads as a slideshow, and the loop
+/// only draws when something is actually moving, so an idle dashboard costs
+/// nothing regardless of how often it wakes to check for input.
+pub const TICK: Duration = Duration::from_millis(16);
+
+/// Fraction of the remaining distance covered per tick.
+///
+/// This is per *tick*, not per second, so it has to move with [`TICK`]: at the
+/// old 60 ms frame, 0.28 settled in about half a second. Holding that duration
+/// at 16 ms means 1 - (1 - 0.28)^(16/60).
+const RATE: f64 = 0.085;
+
+/// The faster rate, for bars growing in behind a settling number.
+pub const RATE_FAST: f64 = 0.065;
 
 /// A value that eases toward a target.
 #[derive(Debug, Clone, Copy)]
@@ -25,12 +36,12 @@ pub struct Eased {
 impl Eased {
     #[cfg(test)]
     pub fn new(value: f64) -> Self {
-        Eased { current: value, target: value, rate: 0.28 }
+        Eased { current: value, target: value, rate: RATE }
     }
 
     /// Start at zero so the first render grows into place.
     pub fn from_zero(target: f64) -> Self {
-        Eased { current: 0.0, target, rate: 0.28 }
+        Eased { current: 0.0, target, rate: RATE }
     }
 
     pub fn with_rate(mut self, rate: f64) -> Self {
@@ -130,7 +141,11 @@ mod tests {
         while e.tick() {
             ticks += 1;
         }
-        assert!(ticks < 60, "scale-relative epsilon keeps large values from creeping: {ticks}");
+        // The bound that matters is wall-clock, not ticks: RATE is per frame,
+        // so a change to TICK moves the count without changing how long the
+        // user waits. Two seconds is the limit for a number counting up.
+        let settle = TICK * ticks;
+        assert!(settle < Duration::from_millis(2000), "count-up takes {settle:?} ({ticks} ticks)");
         assert_eq!(e.value(), 12_000_000_000.0);
     }
 

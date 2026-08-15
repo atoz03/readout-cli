@@ -631,7 +631,10 @@ fn model_card(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
             action: Some(Action::Page(Page::Models)),
         },
     );
-    bar_list(app, buf, hits, inner, RankKind::Model, false);
+    // Interactive on Overview too. `owns_selection` gives this list the arrow
+    // keys on this page, so drawing it inert meant ↑↓ moved a selection with
+    // nothing on screen to show for it — the keys looked broken.
+    bar_list(app, buf, hits, inner, RankKind::Model, true);
 }
 
 fn recent_card(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
@@ -857,11 +860,10 @@ fn bar_list(
             },
         );
         if interactive {
-            let action = match kind {
-                RankKind::Model => Action::DrillModel(b.label.clone()),
-                RankKind::Project => Action::DrillProject(b.label.clone()),
-            };
-            hits.add_hoverable(row, action, i as u64);
+            // Row, not a drill action: one click selects and a second opens,
+            // the same contract every other list here honours. Drilling on the
+            // first click made a passing click rewrite the whole dashboard.
+            hits.add_hoverable(row, Action::Row(i), i as u64);
         }
     }
 }
@@ -910,10 +912,17 @@ fn session_list(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect, sc
         let row = Rect { x: area.x, y, width: area.width, height: 1 };
         let selected = app.page == Page::Sessions && i == app.selected;
         if selected || app.hover == Some(i as u64) {
-            w::fill(buf, row, if selected { theme::SURFACE_ACTIVE } else { theme::SURFACE_RAISED });
+            w::fill(
+                buf,
+                row,
+                if selected { theme::SURFACE_SELECTED } else { theme::SURFACE_RAISED },
+            );
         }
         let model = b.top_model().unwrap_or("—");
-        w::text(buf, row.x, y, 1, theme::DOT, Style::default().fg(theme::series_for(model)));
+        // The dot becomes the selection marker on the selected row: same
+        // column, same hue, unmistakably a different shape.
+        let mark = if selected { theme::SELECT_MARK } else { theme::DOT };
+        w::text(buf, row.x, y, 1, mark, Style::default().fg(theme::series_for(model)));
         let label_w = row.width.saturating_sub(time_w + tok_w + 4);
         // A raw session UUID identifies nothing to a reader; the project it
         // ran in and the model it used are what make a row recognizable.
@@ -973,7 +982,11 @@ fn pricing(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
         // Columns are dropped from the right rather than clipped: the cache
         // rates are derived from input, so they are the ones a narrow terminal
         // can lose, and a rate cut mid-number ("10.00    5") is not a number.
-        let iw = inner.width as usize;
+        // Two columns reserved on the left for the selection marker, as in
+        // every other list, so the table does not shift when it moves.
+        let tx = inner.x + 2;
+        let tw = inner.width.saturating_sub(2);
+        let iw = tw as usize;
         let (name_w, show_output, show_cache) = if iw >= 67 {
             (26, true, true)
         } else if iw >= 44 {
@@ -988,7 +1001,7 @@ fn pricing(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
         if show_cache {
             head.push_str(&format!("{:>11}{:>12}", "cache read", "cache write"));
         }
-        w::text(buf, inner.x, inner.y, inner.width, &head, Style::default().fg(theme::TEXT_MUTED));
+        w::text(buf, tx, inner.y, tw, &head, Style::default().fg(theme::TEXT_MUTED));
         let known = app.pricing.known_models();
         // The rate table is the only list on this page, so it is what ↑↓ and
         // the wheel move. Before this it ignored `scroll` while `row_count`
@@ -1007,7 +1020,17 @@ fn pricing(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
                 w::fill(
                     buf,
                     row,
-                    if selected { theme::SURFACE_ACTIVE } else { theme::SURFACE_RAISED },
+                    if selected { theme::SURFACE_SELECTED } else { theme::SURFACE_RAISED },
+                );
+            }
+            if selected {
+                w::text(
+                    buf,
+                    row.x,
+                    y,
+                    1,
+                    theme::SELECT_MARK,
+                    Style::default().fg(theme::series_for(model)),
                 );
             }
             let mut line =
@@ -1023,7 +1046,7 @@ fn pricing(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
                 ));
             }
             let fg = if selected { theme::TEXT_PRIMARY } else { theme::TEXT_SECONDARY };
-            w::text(buf, inner.x, y, inner.width, &line, Style::default().fg(fg));
+            w::text(buf, tx, y, tw, &line, Style::default().fg(fg));
             hits.add_hoverable(row, Action::Row(i), i as u64);
         }
         if overflow {

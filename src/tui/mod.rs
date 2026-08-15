@@ -337,21 +337,6 @@ fn apply(app: &mut App, action: Action) {
                 app.selected = i;
             }
         }
-        Action::DrillModel(m) => {
-            let next =
-                if app.drill == Drill::Model(m.clone()) { Drill::None } else { Drill::Model(m) };
-            app.set_drill(next);
-            app.set_page(Page::Models);
-        }
-        Action::DrillProject(p) => {
-            let next = if app.drill == Drill::Project(p.clone()) {
-                Drill::None
-            } else {
-                Drill::Project(p)
-            };
-            app.set_drill(next);
-            app.set_page(Page::Projects);
-        }
         Action::ClearFilter => app.set_drill(Drill::None),
         Action::Refresh => app.rescan_requested = true,
         Action::Quit => app.should_quit = true,
@@ -448,14 +433,21 @@ mod tests {
 
     #[test]
     fn clicking_a_model_row_toggles_the_drill_down() {
+        // Rows go through the one Row action everywhere, so the sequence a
+        // mouse produces is click-to-select, click-to-open, click-to-release.
         let mut a = app_with_data();
-        let model = a.summary.by_model[0].label.clone();
-        apply(&mut a, Action::DrillModel(model.clone()));
-        assert_eq!(a.drill, Drill::Model(model.clone()));
-        assert_eq!(a.page, Page::Models);
-        // Clicking the same row again releases the filter.
-        apply(&mut a, Action::DrillModel(model));
-        assert_eq!(a.drill, Drill::None);
+        a.set_page(Page::Models);
+        let model = a.summary.by_model[1].label.clone();
+        apply(&mut a, Action::Row(1));
+        assert_eq!(a.drill, Drill::None, "the first click only selects");
+
+        apply(&mut a, Action::Row(1));
+        assert_eq!(a.drill, Drill::Model(model));
+        // The filter leaves one model standing and the selection lands on it,
+        // so the next click activates straight away — and activating the row
+        // that *is* the current filter releases it.
+        apply(&mut a, Action::Row(0));
+        assert_eq!(a.drill, Drill::None, "activating the current filter releases it");
     }
 
     #[test]
@@ -639,6 +631,58 @@ mod tests {
             buffer_text(&buf).contains(&oldest.format("%b %-d").to_string()),
             "the oldest day must be on screen once the selection reaches it"
         );
+    }
+
+    #[test]
+    fn a_frame_costs_far_less_than_the_frame_budget() {
+        // The dashboard animates at `anim::TICK`, so a frame that took anywhere
+        // near a tick to build would cap the frame rate no matter what the tick
+        // is set to. Measured at ~250µs for the heaviest page on a big
+        // terminal; the bound is loose enough for a shared CI runner and still
+        // an order of magnitude under the budget.
+        let mut a = app_with_many_rows();
+        let area = ratatui::layout::Rect { x: 0, y: 0, width: 160, height: 48 };
+        for page in Page::ORDER {
+            a.set_page(page);
+            let mut warm = ratatui::buffer::Buffer::empty(area);
+            pages::draw(&mut a, &mut warm, area);
+
+            let started = std::time::Instant::now();
+            const FRAMES: u32 = 50;
+            for _ in 0..FRAMES {
+                let mut buf = ratatui::buffer::Buffer::empty(area);
+                pages::draw(&mut a, &mut buf, area);
+            }
+            let per_frame = started.elapsed() / FRAMES;
+            assert!(
+                per_frame < Duration::from_millis(5),
+                "{page:?} takes {per_frame:?} to draw, against a {:?} frame",
+                anim::TICK
+            );
+        }
+    }
+
+    #[test]
+    fn every_page_the_arrows_work_on_shows_where_the_selection_is() {
+        // The bug this pins: Overview drew its model list inert while still
+        // owning the arrow keys, so ↑↓ moved a selection with nothing on
+        // screen to show for it and the keys read as broken. A page that
+        // counts rows must also mark the row it is on.
+        for page in Page::ORDER {
+            let mut a = app_with_many_rows();
+            a.set_page(page);
+            if a.row_count() == 0 {
+                continue;
+            }
+            render(&mut a, 110, 24);
+            press(&mut a, KeyCode::Down);
+            press(&mut a, KeyCode::Down);
+            let buf = render(&mut a, 110, 24);
+            assert!(
+                buffer_text(&buf).contains(crate::tui::theme::SELECT_MARK),
+                "{page:?}: the arrows move a selection that is never drawn"
+            );
+        }
     }
 
     #[test]

@@ -18,6 +18,18 @@ pub const SURFACE: Color = Color::Rgb(0x1a, 0x1a, 0x19);
 pub const SURFACE_RAISED: Color = Color::Rgb(0x21, 0x21, 0x20);
 /// Two steps up, for the active sidebar pill and hovered rows.
 pub const SURFACE_ACTIVE: Color = Color::Rgb(0x2e, 0x2e, 0x2c);
+/// The selected row. Deliberately a bigger step than the hover surface: a
+/// selection has to be findable at a glance across a full screen of rows, and
+/// on a terminal that flattens near-black greys the fill alone is not enough —
+/// which is why it always ships with the marker glyph below.
+pub const SURFACE_SELECTED: Color = Color::Rgb(0x44, 0x44, 0x40);
+/// Drawn in the row's own hue at the left edge of the selected row.
+///
+/// Deliberately not an eighth-block: `▌` is what a half-width bar draws, so a
+/// marker made of one would be indistinguishable from data — and would let a
+/// test for "the selection is visible" pass on a bar that happens to be half
+/// full.
+pub const SELECT_MARK: &str = "┃";
 
 pub const TEXT_PRIMARY: Color = Color::Rgb(0xff, 0xff, 0xff);
 pub const TEXT_SECONDARY: Color = Color::Rgb(0xc3, 0xc2, 0xb7);

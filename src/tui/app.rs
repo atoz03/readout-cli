@@ -248,7 +248,7 @@ impl App {
             }
         }
         if animate {
-            self.grow = Eased::from_zero(1.0).with_rate(0.22);
+            self.grow = Eased::from_zero(1.0).with_rate(crate::tui::anim::RATE_FAST);
         } else {
             self.grow.snap_to(1.0);
         }
@@ -283,7 +283,7 @@ impl App {
             self.page = page;
             self.selected = 0;
             self.scroll = 0;
-            self.grow = Eased::from_zero(1.0).with_rate(0.22);
+            self.grow = Eased::from_zero(1.0).with_rate(crate::tui::anim::RATE_FAST);
             self.needs_redraw = true;
         }
     }
@@ -358,22 +358,21 @@ impl App {
         }
     }
 
-    /// Open whatever the selected row points at.
+    /// Open whatever the selected row points at, or release it if it is
+    /// already the filter — so the same gesture that applied a drill takes it
+    /// back, and Esc is a shortcut rather than the only way out.
     pub fn activate_selected(&mut self) {
-        match self.page {
+        let next = match self.page {
             Page::Models | Page::Overview => {
-                if let Some(b) = self.summary.by_model.get(self.selected) {
-                    let label = b.label.clone();
-                    self.set_drill(Drill::Model(label));
-                }
+                self.summary.by_model.get(self.selected).map(|b| Drill::Model(b.label.clone()))
             }
             Page::Projects => {
-                if let Some(b) = self.summary.by_project.get(self.selected) {
-                    let label = b.label.clone();
-                    self.set_drill(Drill::Project(label));
-                }
+                self.summary.by_project.get(self.selected).map(|b| Drill::Project(b.label.clone()))
             }
-            _ => {}
+            _ => None,
+        };
+        if let Some(next) = next {
+            self.set_drill(if self.drill == next { Drill::None } else { next });
         }
     }
 

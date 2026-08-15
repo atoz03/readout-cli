@@ -22,9 +22,6 @@ pub enum Action {
     ToggleSource(crate::model::Source),
     /// Select row `usize` of the focused list.
     Row(usize),
-    /// Drill into a model / project / session by name.
-    DrillModel(String),
-    DrillProject(String),
     /// Clear any drill-down filter.
     ClearFilter,
     /// Re-run the scan.

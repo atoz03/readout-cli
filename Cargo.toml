@@ -1,6 +1,6 @@
 [package]
 name = "readout"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Read-only usage statistics for Claude Code and Codex, with a clickable TUI"
 license = "MIT"

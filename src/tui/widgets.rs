@@ -180,21 +180,29 @@ pub fn bar_row(buf: &mut Buffer, area: Rect, label_w: u16, value_w: u16, row: Ba
     // Degrade rather than disappear: when the row cannot hold label, bar and
     // value, the bar is the part that goes. Dropping the whole row instead
     // would leave a card that renders as empty rather than as cramped.
-    let label_w = label_w.min(area.width.saturating_sub(value_w + 2));
     let y = area.y;
     if row.selected || row.hovered {
-        fill(buf, area, if row.selected { theme::SURFACE_ACTIVE } else { theme::SURFACE_RAISED });
+        fill(buf, area, if row.selected { theme::SURFACE_SELECTED } else { theme::SURFACE_RAISED });
     }
+    // The marker column is reserved on every row, selected or not, so the
+    // labels do not jump sideways as the selection moves.
+    const MARK_W: u16 = 2;
+    if row.selected {
+        text(buf, area.x, y, 1, theme::SELECT_MARK, Style::default().fg(row.color));
+    }
+    let x = area.x + MARK_W;
+    let width = area.width.saturating_sub(MARK_W);
+    let label_w = label_w.min(width.saturating_sub(value_w + 2));
 
     let label_style = if row.selected {
         Style::default().fg(theme::TEXT_PRIMARY).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(theme::TEXT_SECONDARY)
     };
-    text(buf, area.x, y, label_w, &fmt::ellipsize(row.label, label_w as usize), label_style);
+    text(buf, x, y, label_w, &fmt::ellipsize(row.label, label_w as usize), label_style);
 
-    let track_x = area.x + label_w + 1;
-    let track_w = area.width.saturating_sub(label_w + value_w + 2);
+    let track_x = x + label_w + 1;
+    let track_w = width.saturating_sub(label_w + value_w + 2);
     hbar(buf, track_x, y, track_w, row.fraction, row.color);
 
     text_right(
