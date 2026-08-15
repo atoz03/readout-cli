@@ -1,0 +1,5 @@
+/target
+
+# Screenshots pasted into the terminal during development — not part of the
+# project, and `git add .` should not sweep them in.
+/.netcatty-paste-images/

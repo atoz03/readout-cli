@@ -1,0 +1,5 @@
+# A terminal dashboard is written in wide, table-shaped expressions — layout
+# constraints, format strings, rate tables. Default heuristics explode those
+# into one argument per line, which reads worse than the thing it describes.
+max_width = 100
+use_small_heuristics = "Max"
