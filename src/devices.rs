@@ -71,12 +71,17 @@ pub struct DeviceRecord {
     pub available: bool,
     pub enabled: bool,
     pub discovered: bool,
+    /// 这台设备的快照读不出来时的原因。快照是缓存，一份坏掉的缓存只能让这一行
+    /// 变灰，不能让本机数据也跟着消失。
+    pub problem: Option<String>,
 }
 
 #[derive(Debug)]
 pub struct LoadedUsage {
     pub scan: ScanResult,
     pub devices: Vec<DeviceRecord>,
+    /// 被跳过的设备快照，逐条说明原因；调用方负责展示，不影响本机结果。
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -369,12 +374,7 @@ pub fn load_usage(
     on_progress: Option<&(dyn Fn(Progress) + Sync)>,
 ) -> Result<LoadedUsage> {
     let mut scan = scan::scan_with_cache(sources, use_cache, on_progress)?;
-    let mut merger = UsageMerger::default();
-    let mut local_events = std::mem::take(&mut scan.events);
-    apply_project_aliases(&mut local_events, settings);
-    merger.add_batch(settings.device.clone(), local_events)?;
-
-    let mut devices = vec![DeviceRecord {
+    let local = DeviceRecord {
         id: settings.device.id.clone(),
         name: settings.device.name.clone(),
         host: None,
@@ -384,55 +384,116 @@ pub fn load_usage(
         available: true,
         enabled: true,
         discovered: true,
-    }];
+        problem: None,
+    };
+
+    // 没有启用任何 remote 时跨设备索引没有对手可比：scan 已经按 dedup_key 折叠过，
+    // 再为整个语料建一次 HashMap 只是在每次 --watch 重扫里白白分配。
+    if settings.ssh_hosts.is_empty() {
+        apply_project_aliases(&mut scan.events, settings);
+        observe_locally(&settings.device, &mut scan.events);
+        return Ok(LoadedUsage { scan, devices: vec![local], warnings: Vec::new() });
+    }
+
+    let mut merger = UsageMerger::default();
+    let mut local_events = std::mem::take(&mut scan.events);
+    apply_project_aliases(&mut local_events, settings);
+    merger.add_batch(settings.device.clone(), local_events)?;
+
+    let mut devices = vec![local];
+    let mut warnings = Vec::new();
     for host in &settings.ssh_hosts {
-        let path = snapshot_path(host)?;
-        if !path.exists() {
-            devices.push(DeviceRecord {
-                id: format!("ssh:{host}"),
-                name: host.clone(),
-                host: Some(host.clone()),
-                exporter_version: None,
-                generated_at: 0,
-                is_local: false,
-                available: false,
-                enabled: true,
-                discovered: false,
-            });
-            continue;
+        // 一台设备的快照读不出来只让这一行不可用。快照是 cache 的一部分，和陈旧
+        // scan-cache 一样应该被丢掉重建，而不是让整个 readout 无法启动。
+        match load_snapshot(host, sources, settings, &mut merger) {
+            Ok(Some(device)) => devices.push(device),
+            Ok(None) => devices.push(unavailable_device(host, None)),
+            Err(error) => {
+                let problem = crate::fmt::terminal_text(&format!("{error:#}"));
+                warnings.push(format!("{host}: {problem}"));
+                devices.push(unavailable_device(host, Some(problem)));
+            }
         }
-        let bundle = UsageBundle::read(&path)
-            .with_context(|| format!("loading snapshot for SSH Host `{host}`"))?;
-        anyhow::ensure!(
-            bundle.device.id != settings.device.id,
-            "SSH Host `{host}` reports the local device id"
-        );
-        let mut remote_events: Vec<_> = bundle
-            .events
-            .into_iter()
-            .filter(|event| sources.contains(&event.source))
-            .map(bundle_event)
-            .collect();
-        apply_project_aliases(&mut remote_events, settings);
-        devices.push(DeviceRecord {
-            id: bundle.device.id.clone(),
-            name: bundle.device.name.clone(),
-            host: Some(host.clone()),
-            exporter_version: Some(bundle.exporter_version.clone()),
-            generated_at: bundle.generated_at,
-            is_local: false,
-            available: true,
-            enabled: true,
-            discovered: false,
-        });
-        merger.add_batch(bundle.device, remote_events)?;
     }
 
     scan.events = merger.finish();
     // ScanStats 描述本机 transcript 扫描（文件、字节和耗时）。跨设备总量与去重结果
     // 由 Summary 表达；混在这里会让 events 与本机文件统计失去一致语义。
     devices.sort_by(|a, b| b.is_local.cmp(&a.is_local).then_with(|| a.name.cmp(&b.name)));
-    Ok(LoadedUsage { scan, devices })
+    Ok(LoadedUsage { scan, devices, warnings })
+}
+
+/// 还没同步过，或者快照用不了。两种都不参与 usage，但 Devices 页要能区分开。
+fn unavailable_device(host: &str, problem: Option<String>) -> DeviceRecord {
+    DeviceRecord {
+        id: format!("ssh:{host}"),
+        name: host.to_string(),
+        host: Some(host.to_string()),
+        exporter_version: None,
+        generated_at: 0,
+        is_local: false,
+        available: false,
+        enabled: true,
+        discovered: false,
+        problem,
+    }
+}
+
+/// `Ok(None)` 表示这台设备还没同步过，`Err` 表示快照存在但用不了。
+fn load_snapshot(
+    host: &str,
+    sources: &[Source],
+    settings: &Settings,
+    merger: &mut UsageMerger,
+) -> Result<Option<DeviceRecord>> {
+    read_snapshot(host, &snapshot_path(host)?, sources, settings, merger)
+}
+
+fn read_snapshot(
+    host: &str,
+    path: &Path,
+    sources: &[Source],
+    settings: &Settings,
+    merger: &mut UsageMerger,
+) -> Result<Option<DeviceRecord>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bundle = UsageBundle::read(path)
+        .with_context(|| format!("re-sync to rebuild {}", path.display()))?;
+    anyhow::ensure!(
+        bundle.device.id != settings.device.id,
+        "this snapshot carries the local device id; the two machines share a settings.json"
+    );
+    let mut events: Vec<_> = bundle
+        .events
+        .into_iter()
+        .filter(|event| sources.contains(&event.source))
+        .map(bundle_event)
+        .collect();
+    apply_project_aliases(&mut events, settings);
+    let record = DeviceRecord {
+        id: bundle.device.id.clone(),
+        name: bundle.device.name.clone(),
+        host: Some(host.to_string()),
+        exporter_version: Some(bundle.exporter_version.clone()),
+        generated_at: bundle.generated_at,
+        is_local: false,
+        available: true,
+        enabled: true,
+        discovered: false,
+        problem: None,
+    };
+    merger.add_batch(bundle.device, events)?;
+    Ok(Some(record))
+}
+
+/// 只有本机时的观察者标记。合并层的其余工作（内容寻址 ID、跨设备索引）在这里
+/// 都没有意义，但 `observed_on` 仍要填上，Devices 页和设备过滤才有东西可依据。
+fn observe_locally(device: &DeviceSettings, events: &mut [UsageEvent]) {
+    for event in events {
+        event.observed_on = vec![device.id.clone()];
+    }
 }
 
 fn bundle_event(event: BundleEvent) -> UsageEvent {
@@ -466,7 +527,22 @@ struct UsageMerger {
 }
 
 impl UsageMerger {
+    /// 要么整批合入，要么一条都不合入。半批设备数据比没有这台设备更糟：总量会
+    /// 少掉说不清楚的一截，而界面照旧把它显示成一台正常设备。
     fn add_batch(&mut self, device: DeviceSettings, events: Vec<UsageEvent>) -> Result<()> {
+        // 上限按最坏情况（整批都是新事件）预估。去重只会让实际占用更小，所以
+        // 通过这道检查之后循环里不会再失败。
+        let incoming_text: usize =
+            events.iter().map(event_text_bytes).fold(0, usize::saturating_add);
+        anyhow::ensure!(
+            self.events.len().saturating_add(events.len()) <= MAX_MERGED_EVENTS,
+            "merged device usage would exceed the event limit"
+        );
+        anyhow::ensure!(
+            self.text_bytes.saturating_add(incoming_text) <= MAX_MERGED_EVENT_TEXT_BYTES,
+            "merged device usage would exceed the text limit"
+        );
+
         let mut fallback_counts = HashMap::new();
         for mut event in events {
             let key = canonical_event_id(&event, &mut fallback_counts);
@@ -492,18 +568,10 @@ impl UsageMerger {
                     .saturating_sub(before)
                     .saturating_add(event_text_bytes(&self.events[slot]));
             } else {
-                anyhow::ensure!(
-                    self.events.len() < MAX_MERGED_EVENTS,
-                    "merged device usage exceeds the event limit"
-                );
                 self.text_bytes = self.text_bytes.saturating_add(event_text_bytes(&event));
                 self.index.insert(key, self.events.len());
                 self.events.push(event);
             }
-            anyhow::ensure!(
-                self.text_bytes <= MAX_MERGED_EVENT_TEXT_BYTES,
-                "merged device usage exceeds the text limit"
-            );
         }
         Ok(())
     }
@@ -564,13 +632,14 @@ fn canonical_event_id(event: &UsageEvent, fallback_counts: &mut HashMap<String, 
     id
 }
 
+/// 导出的是原始 cwd，不是本机的项目别名。别名要在中心设备上统一决定：远端先
+/// 改过名字，中心就再也没有原始路径可以匹配，两台机器的同一个项目会永远分开。
 pub fn export_local(
     sources: &[Source],
     use_cache: bool,
     settings: &Settings,
 ) -> Result<UsageBundle> {
-    let mut result = scan::scan_with_cache(sources, use_cache, None)?;
-    apply_project_aliases(&mut result.events, settings);
+    let result = scan::scan_with_cache(sources, use_cache, None)?;
     Ok(UsageBundle::from_events(settings.device.clone(), &result.events))
 }
 
@@ -794,6 +863,76 @@ mod tests {
 
     fn device(id: &str, name: &str) -> DeviceSettings {
         DeviceSettings { id: id.into(), name: name.into() }
+    }
+
+    #[test]
+    fn an_unusable_snapshot_costs_that_device_and_nothing_else() {
+        // 快照是 cache。一份读不出来的 cache 只能让它自己那一行失效，绝不能把
+        // 已经合进来的本机事件也带走——否则用户会以为 readout 整个坏了。
+        let root = std::env::temp_dir().join(format!(
+            "readout-bad-snapshot-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("workstation.json");
+        std::fs::write(&path, b"{ not a bundle").unwrap();
+
+        let settings = Settings::default();
+        let mut merger = UsageMerger::default();
+        merger.add_batch(settings.device.clone(), vec![event("codex:v1:local", 10)]).unwrap();
+
+        let error = read_snapshot("workstation", &path, &Source::ALL, &settings, &mut merger)
+            .expect_err("a corrupt snapshot must be reported");
+        assert!(
+            format!("{error:#}").contains("re-sync"),
+            "the error has to name the way out, got {error:#}"
+        );
+
+        let events = merger.finish();
+        assert_eq!(events.len(), 1, "local usage survives a broken remote snapshot");
+        assert_eq!(events[0].tokens.output, 10);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_snapshot_claiming_the_local_device_id_is_refused_without_killing_the_scan() {
+        // 两台机器共用一份 settings.json 时会走到这里：拒绝这台设备，但本机照常。
+        let root = std::env::temp_dir().join(format!(
+            "readout-clone-snapshot-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("workstation.json");
+
+        let settings = Settings::default();
+        let bundle =
+            UsageBundle::from_events(settings.device.clone(), &[event("codex:v1:remote", 5)]);
+        bundle.save(&path).unwrap();
+
+        let mut merger = UsageMerger::default();
+        let error = read_snapshot("workstation", &path, &Source::ALL, &settings, &mut merger)
+            .expect_err("a snapshot cannot claim to be this machine");
+        assert!(format!("{error:#}").contains("settings.json"));
+        assert!(merger.finish().is_empty(), "the refused batch merges nothing");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_local_only_path_still_records_its_observer() {
+        // 没有 remote 时 load_usage 跳过整个合并层。`observed_on` 仍然要填上，
+        // 否则关掉 aggregate 后设备过滤会把本机事件也一起滤掉。
+        let settings = Settings::default();
+        let mut events = vec![event("codex:v1:a", 10)];
+        observe_locally(&settings.device, &mut events);
+        assert_eq!(events[0].observed_on, vec![settings.device.id.clone()]);
+
+        let filter = crate::agg::Filter {
+            device: Some(settings.device.id.clone()),
+            ..crate::agg::Filter::default()
+        };
+        assert!(filter.admits(&events[0]));
     }
 
     #[test]

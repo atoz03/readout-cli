@@ -1131,6 +1131,9 @@ fn devices(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
             "copied history".to_string()
         } else if record.is_some_and(|device| device.is_local) {
             "local".to_string()
+        // 快照坏掉排在"没同步过"前面：两者都是不可用，但只有这一种需要用户动手。
+        } else if record.is_some_and(|device| device.problem.is_some()) {
+            "unreadable".to_string()
         } else if record.is_some_and(|device| !device.discovered) {
             "missing config".to_string()
         } else if record.is_some_and(|device| !device.enabled) {
@@ -1409,6 +1412,10 @@ fn replay_timeline(
     for column in 0..=visible_track {
         // 同一终端列里的事件只画一个代表点。通过有序时间戳二分列边界，
         // 单帧成本只随屏幕宽度增长，不再随最多 20,000 条事件增长。
+        //
+        // 二分成立的前提是 `offset_ms` 单调不减，这由 `replay::build` 保证：有时间
+        // 戳的事件按时间排在前面，无时间戳的排在后面并从当前最大偏移继续递增。
+        // 那个排序若被改动，时间轴不会报错，只会把点画到错的列上。
         let end = events.partition_point(|event| {
             replay_timeline_column(event.offset_ms, duration, visible_track) <= column
         });

@@ -40,21 +40,25 @@ which is the only way an agent can — render one settled frame as text:
 
 ```sh
 cargo run -- snapshot --width 120 --height 40 --page overview
-# pages: overview | daily | models | projects | sessions | pricing
+# pages: overview | daily | models | projects | sessions | devices | pricing | settings
 ```
 
 `snapshot` and `summary --json` are also CI's cross-platform smoke tests.
 
 ### Testing against fixtures, not your real data
 
-Three env vars redirect everything the binary touches, so parser and cache work
-can run against fixture transcripts and an isolated cache:
+These env vars redirect everything the binary touches, so parser and cache work
+can run against fixture transcripts and an isolated cache. All of them, not a
+subset: every subcommand loads settings, so leaving `READOUT_CONFIG_DIR` unset
+writes a real `~/.config/readout/settings.json` on the machine running the test.
 
 | Var | Redirects |
 |---|---|
 | `READOUT_CLAUDE_DIR` | the `~/.claude/projects` tree |
 | `READOUT_CODEX_DIR` | the `~/.codex/sessions` tree |
-| `READOUT_STATE_DIR` | the cache and `pricing.json` (default `~/.cache/readout/`) |
+| `READOUT_STATE_DIR` | the cache, remote snapshots and `pricing.json` (default `~/.cache/readout/`) |
+| `READOUT_CONFIG_DIR` | `settings.json` (default `~/.config/readout/`) |
+| `READOUT_SSH_CONFIG` | the `~/.ssh/config` the Devices page reads Host aliases from |
 
 ## Architecture
 
@@ -70,6 +74,8 @@ UsageEvent    model.rs         flat stream, one per billed request
    ↓
 dedup         scan.rs          collapse responses duplicated across forked transcripts
    ↓
+merge         devices.rs       fold in synced remote bundles, tag `observed_on`
+   ↓
 summarize()   agg.rs           pure fn of (events, Filter, Pricing) → Summary
    ↓
 render        report.rs (text/JSON/CSV)  |  tui/ (dashboard)
@@ -78,6 +84,19 @@ render        report.rs (text/JSON/CSV)  |  tui/ (dashboard)
 Because `summarize` is a pure function re-run on every filter change, the pages
 cannot disagree with each other. Add a view by deriving it in `agg.rs`, not by
 accumulating state alongside an existing one.
+
+**Multi-device merge** (`devices.rs`). `load_usage` is the only entry point the
+CLI and the TUI both scan through. With no SSH host enabled it skips the merge
+entirely and just tags `observed_on` — the cross-device index would allocate a
+key per event on every 5s watch tick to compare against nothing. With hosts
+enabled it folds each `~/.cache/readout/remotes/*.json` snapshot in by content
+addressed id, so a transcript present on two machines is billed once and lands
+in the `@shared` bucket rather than being attributed to either.
+
+Those snapshots are cache, and fail like cache: one that will not parse, or that
+claims the local device id, takes its own row out (`DeviceRecord::problem`) and
+is reported through `LoadedUsage::warnings`. It must never take the local numbers
+with it — `load_usage` returning `Err` means every subcommand stops working.
 
 **Incremental cache** (`cache.rs`). Each file carries a watermark: identity
 (dev+inode; creation time on Windows), size, mtime, the byte offset parsed so
@@ -118,17 +137,24 @@ display values only — the underlying numbers are always real.
 
 ## Invariants
 
-**Read-only, by construction.** Only `~/.claude/projects/**` and active
-`~/.codex/sessions/**` are opened; `archived_sessions/` is intentionally out of
-scope;
-`~/.claude/settings.json`, `~/.codex/config.toml` and `~/.codex/auth.json` hold
-live credentials and are never touched. The only write target is the state dir.
-Widening read scope breaks the product's central promise — `paths.rs` is the
-chokepoint where that is enforced.
+**Read-only, by construction.** Transcripts: only `~/.claude/projects/**` and
+active `~/.codex/sessions/**` are opened; `archived_sessions/` is intentionally
+out of scope. `~/.claude/settings.json`, `~/.codex/config.toml` and
+`~/.codex/auth.json` hold live credentials and are never touched. Opening the
+Devices page additionally reads `~/.ssh/config` and its `Include` files, and
+takes nothing from them but concrete `Host` aliases — no `HostName`, no
+`IdentityFile`, no `ProxyCommand`, and nothing is written back. Writes go to two
+dirs of readout's own: the state dir (cache, remote snapshots, price overrides)
+and the config dir (`settings.json`). Widening read scope breaks the product's
+central promise — `paths.rs` is the chokepoint where that is enforced, and any
+new path belongs there and in the table above, not inlined at a call site.
 
 **Bump `cache::SCHEMA_VERSION`** whenever `UsageEvent`, `ParseCursor`, or parser
 semantics change meaning. Stale caches are discarded and rebuilt, never
-migrated — forgetting the bump means users silently keep wrong events.
+migrated — forgetting the bump means users silently keep wrong events. The same
+rule covers `devices::BUNDLE_SCHEMA_VERSION`: bump it when the bundle changes
+meaning, and rely on unreadable snapshots degrading per device, because they are
+never migrated either.
 
 **Unpriced is not free.** A model with no rate has its tokens counted and its
 cost excluded, and every figure containing it is marked (`$x+`, `—`, `<1% of

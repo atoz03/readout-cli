@@ -233,6 +233,10 @@ pub fn parse_file(path: &Path, cursor: &ParseCursor, bytes: &[u8]) -> FileParse 
 
 /// Codex 没有为 token_count 提供事件 ID，因此对不含正文的稳定字段做内容寻址。
 /// 设备 ID 和 cwd 有意不参与：同一 session 复制到另一设备或另一项目路径后仍应去重。
+///
+/// `sequence` 是同一 session 内已发出事件的序号，用来区分时间戳与快照都相同的
+/// 相邻请求。代价是它依赖记录的完整性：某份副本若缺了中间几条 token_count，其后
+/// 所有 key 都会错位，那些请求会被当成新事件而重复计入，而不是被折叠掉。
 fn codex_usage_key(
     session: &str,
     timestamp: &str,

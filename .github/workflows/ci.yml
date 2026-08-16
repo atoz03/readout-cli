@@ -40,6 +40,18 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # The only job that runs the binary, so the only one that can touch a home
+    # directory. Point every redirect at the runner's temp dir — all of them,
+    # not a subset: every subcommand loads settings, so an unset
+    # READOUT_CONFIG_DIR writes a real ~/.config/readout/settings.json. The
+    # transcript dirs stay deliberately absent, which is the empty state the
+    # smoke tests are here to exercise.
+    env:
+      READOUT_CLAUDE_DIR: ${{ runner.temp }}/readout-ci/claude
+      READOUT_CODEX_DIR: ${{ runner.temp }}/readout-ci/codex
+      READOUT_STATE_DIR: ${{ runner.temp }}/readout-ci/state
+      READOUT_CONFIG_DIR: ${{ runner.temp }}/readout-ci/config
+      READOUT_SSH_CONFIG: ${{ runner.temp }}/readout-ci/ssh_config
     strategy:
       fail-fast: false
       matrix:

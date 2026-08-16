@@ -175,7 +175,14 @@ pub fn timing(stats: &ScanStats) -> String {
     o
 }
 
-pub fn json(s: &Summary, stats: &ScanStats, days: Option<i64>) -> String {
+/// `devices` 是本次汇总覆盖的设备。总量里合进了远端 usage 却不在输出里留下痕迹，
+/// 会让脚本看到一个说不出理由的跳变，所以设备清单和分设备明细一起给出来。
+pub fn json(
+    s: &Summary,
+    stats: &ScanStats,
+    devices: &[crate::devices::DeviceRecord],
+    days: Option<i64>,
+) -> String {
     let bucket = |b: &crate::agg::Bucket| {
         json!({
             "label": b.label,
@@ -210,6 +217,23 @@ pub fn json(s: &Summary, stats: &ScanStats, days: Option<i64>) -> String {
         }).collect::<Vec<_>>(),
         "by_model": s.by_model.iter().map(bucket).collect::<Vec<_>>(),
         "by_project": s.by_project.iter().map(bucket).collect::<Vec<_>>(),
+        // 一个事件若被多台设备观察到，它只落在 `@shared` 这一桶里，不会重复计入
+        // 任何一台设备——分设备之和等于总量。
+        "by_device": s.by_device.iter().map(|b| {
+            let mut o = bucket(b);
+            o["device"] = json!(device_name(devices, &b.label));
+            o
+        }).collect::<Vec<_>>(),
+        "devices": devices.iter().map(|d| json!({
+            "id": d.id,
+            "name": d.name,
+            "ssh_host": d.host,
+            "local": d.is_local,
+            "available": d.available,
+            "exporter_version": d.exporter_version,
+            "synced_ts": (d.generated_at > 0).then_some(d.generated_at),
+            "problem": d.problem,
+        })).collect::<Vec<_>>(),
         "daily": s.daily.iter().map(|d| {
             let mut o = bucket(&d.bucket);
             o["date"] = json!(d.date.to_string());
@@ -234,6 +258,13 @@ pub fn json(s: &Summary, stats: &ScanStats, days: Option<i64>) -> String {
         },
     });
     serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".into())
+}
+
+fn device_name<'a>(devices: &'a [crate::devices::DeviceRecord], id: &'a str) -> &'a str {
+    if id == crate::agg::SHARED_DEVICE_ID {
+        return "Shared";
+    }
+    devices.iter().find(|device| device.id == id).map_or(id, |device| device.name.as_str())
 }
 
 /// Daily CSV — the shape most useful to pipe into a spreadsheet.
@@ -338,7 +369,7 @@ mod tests {
     fn json_output_is_parseable_and_carries_coverage() {
         let p = Pricing::builtin();
         let s = summarize(&sample(), &Filter::default(), &p);
-        let out = json(&s, &ScanStats::default(), Some(30));
+        let out = json(&s, &ScanStats::default(), &[], Some(30));
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["total"]["tokens"]["total"], 400);
         assert_eq!(v["unpriced_models"][0], "codex-auto-review");
@@ -354,6 +385,43 @@ mod tests {
         assert!(out.starts_with("date,tokens,cost_usd,cost_coverage,requests\n"));
         let today: Vec<_> = out.lines().last().unwrap().split(',').collect();
         assert!(today[3].parse::<f64>().unwrap() < 1.0, "partial cost must be explicit in CSV");
+    }
+
+    #[test]
+    fn json_says_which_devices_the_totals_came_from() {
+        // 默认聚合会把远端 usage 合进总量。脚本必须能从输出本身看出这一点，
+        // 否则同一条命令在启用一台设备前后会给出无法解释的跳变。
+        let p = Pricing::builtin();
+        let mut events = sample();
+        events[0].observed_on = vec!["dev-local".into()];
+        events[1].observed_on = vec!["dev-local".into(), "dev-remote".into()];
+        let s = summarize(&events, &Filter::default(), &p);
+        let devices = [crate::devices::DeviceRecord {
+            id: "dev-local".into(),
+            name: "laptop".into(),
+            host: None,
+            exporter_version: Some("0.2.3".into()),
+            generated_at: 0,
+            is_local: true,
+            available: true,
+            enabled: true,
+            discovered: true,
+            problem: None,
+        }];
+        let v: serde_json::Value =
+            serde_json::from_str(&json(&s, &ScanStats::default(), &devices, None)).unwrap();
+
+        let by_device = v["by_device"].as_array().unwrap();
+        assert_eq!(by_device.len(), 2, "one exclusive bucket plus the shared one");
+        let names: Vec<_> = by_device.iter().map(|d| d["device"].as_str().unwrap()).collect();
+        assert!(names.contains(&"laptop"), "ids resolve to the names on screen: {names:?}");
+        assert!(names.contains(&"Shared"));
+        // 复制的事件只进 @shared，所以分设备之和正好等于总量，不会重复计数。
+        let summed: u64 =
+            by_device.iter().map(|d| d["tokens"]["total"].as_u64().unwrap()).sum::<u64>();
+        assert_eq!(summed, v["total"]["tokens"]["total"].as_u64().unwrap());
+        assert_eq!(v["devices"][0]["name"], "laptop");
+        assert_eq!(v["devices"][0]["local"], true);
     }
 
     #[test]
@@ -389,7 +457,7 @@ mod tests {
 
         let s = summarize(&sample(), &Filter::default(), &p);
         let v: serde_json::Value =
-            serde_json::from_str(&json(&s, &ScanStats::default(), None)).unwrap();
+            serde_json::from_str(&json(&s, &ScanStats::default(), &[], None)).unwrap();
         assert_eq!(v["today"]["tokens"]["total"], 400);
 
         // Nothing billed today: the key stays, the value says so.
@@ -402,7 +470,7 @@ mod tests {
             .collect();
         let s = summarize(&old, &Filter::default(), &p);
         let v: serde_json::Value =
-            serde_json::from_str(&json(&s, &ScanStats::default(), None)).unwrap();
+            serde_json::from_str(&json(&s, &ScanStats::default(), &[], None)).unwrap();
         assert!(v["today"].is_null());
     }
 }

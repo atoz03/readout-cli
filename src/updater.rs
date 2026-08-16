@@ -1,7 +1,9 @@
 //! 轻量自更新入口。
 //!
 //! 下载、平台识别与 SHA-256 校验继续由 release 随附的安装器负责，避免在二进制里
-//! 再维护一套 HTTP、归档和校验实现。安装目录固定为当前可执行文件所在目录。
+//! 再维护一套 HTTP、归档和校验实现。安装目录固定为当前可执行文件所在目录，所以在
+//! 开发检出里跑 `cargo run -- update` 会把 release 二进制装进 `target/debug/`——这是
+//! 「更新我正在运行的这一个」的直接后果，不是要修的 bug。
 
 use anyhow::{Context, Result};
 use std::process::{Command, Stdio};

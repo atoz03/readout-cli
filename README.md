@@ -138,7 +138,7 @@ Everything on screen that means something is clickable.
 | `PgUp` `PgDn` `Home` `End` | move it faster |
 | `Enter` | filter/open the selected row；Devices 中用于校验并启用 SSH Host |
 | `Delete` / `Backspace` | 在 Devices 中禁用选中的 SSH Host |
-| `u` | 在 Devices 中升级选中的远端 readout，并重新校验兼容性 |
+| `u` | 在 Devices 中升级选中的远端 readout；按两次确认，`Esc` 取消 |
 | `r` | 在 Devices 中异步同步已启用设备；其他页面重新扫描本机 usage |
 | `Esc` | clear that filter |
 | `Tab` / `Shift-Tab`, `←` `→` | change page |
@@ -177,8 +177,13 @@ readout 会从 `~/.ssh/config`（含 `Include` 和通配 include 文件）列出
 
 远端需要先安装 readout，并且 `readout` 必须在非交互 SSH 的 PATH 中。首次 host key
 确认仍应由用户正常执行一次 `ssh <host-alias>`。兼容的旧版本可以继续同步，设备行会
-显示它的版本；需要升级时选中后按 `u`。还没有 `readout update` 的旧版本需要手动跑
-一次最新安装器，之后即可远程升级。
+显示它的版本；需要升级时选中后按 `u`。第一次按只是确认对象，第二次才真的在那台机器上
+下载并执行官方安装器；选中行一变或按 `Esc` 就取消。还没有 `readout update` 的旧版本需要
+手动跑一次最新安装器，之后即可远程升级。
+
+某台设备的快照读不出来（文件损坏，或者两台机器共用了同一份 settings.json 因而报告了
+相同的设备 ID）时，只有那一行会显示为 `unreadable`，本机数字照常显示，原因写在状态栏，
+`readout summary` 则打到 stderr。选中那一行按 `Enter` 重新同步即可重建它。
 
 保留的自动化命令只有：
 
@@ -196,13 +201,17 @@ Devices 页面始终保留全设备状态。若同一个 transcript 出现在多
 保证总量只计算一次；由于 Codex 记录不包含真实主机 ID，这部分会进入 `Shared`，不会
 伪装成某台设备的独占 usage。
 
-同一项目在不同系统上的 cwd 不同时，可以映射到统一名称：
+同一项目在不同系统上的 cwd 不同时，可以映射到统一名称。别名只在中心设备上设置，
+每台设备的路径各写一条：
 
 ```sh
 readout project-alias set readout-cli /mnt/work/readout-cli
 readout project-alias set readout-cli 'C:\work\readout-cli'
 readout project-alias list
 ```
+
+`readout export` 导出的始终是原始 cwd，不是远端自己的别名。远端若先改过名字，中心
+就再也没有原始路径可以匹配，同一个项目会被永远拆成两行。
 
 所有日期都由中心设备根据 bundle 中的 Unix 时间戳重新分桶，因此 Overview 的
 `Today` 始终使用当前查看设备的时区，不会直接相加各设备含义不同的“今天”。
@@ -276,6 +285,11 @@ Filters apply to every subcommand, the dashboard included:
 setup and no input — useful in a bug report, a diff, or a layout check.
 Daily CSV includes `cost_coverage`, so a partial estimate cannot be mistaken
 for a complete cost.
+
+`--json` 输出里的 `devices` 和 `by_device` 说明这份总量覆盖了哪些设备：默认聚合会把
+已同步的远端 usage 合进 `total`，脚本必须能看出这一点，才不会把启用一台设备造成的
+跳变当成用量本身变了。被多台设备观察到的事件只落在 `@shared` 一桶里，所以
+`by_device` 各项之和正好等于 `total`。
 
 ## Cost, and what `+` means
 
@@ -360,3 +374,7 @@ numbers here are the result of reconciling them:
   columns.
 - Sub-agent and Workflow transcripts are included. Skipping them would make
   every token spent inside a `Task` or a `Workflow` disappear from the totals.
+- **Codex 记录现在也有稳定事件 ID**，由 session、时间戳、usage 快照和 session 内序号
+  内容寻址得到，因此同一份 rollout 被复制或恢复出两份时只计一次。这是多设备聚合的
+  前提，也意味着升级到这个版本后 Codex 的历史总量可能比之前略低——降低的那部分正是
+  以前重复计算的副本。缓存会自动重建，不需要手动清。

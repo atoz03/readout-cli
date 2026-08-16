@@ -197,9 +197,9 @@ fn run() -> Result<()> {
             tui::run(sources, filter, !cli.common.no_cache, watch, settings)
         }
         Some(Command::Summary { json, csv, timing }) => {
-            let (s, stats, _) = load(&cli.common, &sources, &settings)?;
+            let Loaded { summary: s, stats, devices, .. } = load(&cli.common, &sources, &settings)?;
             if json {
-                println!("{}", report::json(&s, &stats, cli.common.days));
+                println!("{}", report::json(&s, &stats, &devices, cli.common.days));
             } else if csv {
                 print!("{}", report::csv(&s, cli.common.days.unwrap_or(30) as usize));
             } else {
@@ -214,27 +214,27 @@ fn run() -> Result<()> {
             Ok(())
         }
         Some(Command::Models { json }) => {
-            let (s, stats, _) = load(&cli.common, &sources, &settings)?;
+            let Loaded { summary: s, stats, devices, .. } = load(&cli.common, &sources, &settings)?;
             if json {
-                println!("{}", report::json(&s, &stats, cli.common.days));
+                println!("{}", report::json(&s, &stats, &devices, cli.common.days));
             } else {
                 print_buckets(&s.by_model, "model", s.total.tokens.total());
             }
             Ok(())
         }
         Some(Command::Projects { json }) => {
-            let (s, stats, _) = load(&cli.common, &sources, &settings)?;
+            let Loaded { summary: s, stats, devices, .. } = load(&cli.common, &sources, &settings)?;
             if json {
-                println!("{}", report::json(&s, &stats, cli.common.days));
+                println!("{}", report::json(&s, &stats, &devices, cli.common.days));
             } else {
                 print_buckets(&s.by_project, "project", s.total.tokens.total());
             }
             Ok(())
         }
         Some(Command::Daily { json, csv }) => {
-            let (s, stats, _) = load(&cli.common, &sources, &settings)?;
+            let Loaded { summary: s, stats, devices, .. } = load(&cli.common, &sources, &settings)?;
             if json {
-                println!("{}", report::json(&s, &stats, cli.common.days));
+                println!("{}", report::json(&s, &stats, &devices, cli.common.days));
             } else if csv {
                 print!("{}", report::csv(&s, cli.common.days.unwrap_or(30) as usize));
             } else {
@@ -253,7 +253,7 @@ fn run() -> Result<()> {
         }
         Some(Command::Pricing { init }) => {
             let pricing = Pricing::load(paths::pricing_override_file().ok().as_deref())?;
-            let (s, _, _) = load(&cli.common, &sources, &settings)?;
+            let s = load(&cli.common, &sources, &settings)?.summary;
             let observed: Vec<String> = s.by_model.iter().map(|b| b.label.clone()).collect();
             if init {
                 let path = paths::pricing_override_file()?;
@@ -380,14 +380,22 @@ fn run() -> Result<()> {
     }
 }
 
-type Loaded = (agg::Summary, scan::ScanStats, Pricing);
+struct Loaded {
+    summary: agg::Summary,
+    stats: scan::ScanStats,
+    devices: Vec<devices::DeviceRecord>,
+}
 
 fn load(common: &Common, sources: &[Source], settings: &settings::Settings) -> Result<Loaded> {
     let pricing = Pricing::load(paths::pricing_override_file().ok().as_deref())?;
-    let result = devices::load_usage(sources, !common.no_cache, settings, None)?.scan;
+    let loaded = devices::load_usage(sources, !common.no_cache, settings, None)?;
+    // 一台设备的快照坏掉不会拦住本机结果，但沉默会让总量凭空少一截。
+    for warning in &loaded.warnings {
+        eprintln!("readout: skipped {}", fmt::terminal_text(warning));
+    }
     let filter = build_filter(common, sources, settings);
-    let summary = summarize(&result.events, &filter, &pricing);
-    Ok((summary, result.stats, pricing))
+    let summary = summarize(&loaded.scan.events, &filter, &pricing);
+    Ok(Loaded { summary, stats: loaded.scan.stats, devices: loaded.devices })
 }
 
 fn build_filter(common: &Common, sources: &[Source], settings: &settings::Settings) -> Filter {

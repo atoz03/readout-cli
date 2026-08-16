@@ -64,6 +64,9 @@ impl Default for Settings {
 
 impl Settings {
     /// 首次运行时创建配置，之后严格读取；损坏配置不会被静默覆盖。
+    ///
+    /// 覆盖会悄悄丢掉设备身份和已启用的 SSH Host，所以这里选择报错——但错误必须
+    /// 说清是哪个文件，否则用户只会看到 `readout summary` 从此打不开。
     pub fn load_or_create() -> Result<Self> {
         let path = crate::paths::settings_file()?;
         if !path.exists() {
@@ -71,7 +74,9 @@ impl Settings {
             settings.save_to(&path)?;
             return Ok(settings);
         }
-        Self::load_from(&path)
+        Self::load_from(&path).with_context(|| {
+            format!("move or delete {} to start again from defaults", path.display())
+        })
     }
 
     pub fn load_from(path: &Path) -> Result<Self> {

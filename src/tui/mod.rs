@@ -105,6 +105,9 @@ pub fn snapshot(
     app.events = result.scan.events;
     app.stats = result.scan.stats;
     app.devices = result.devices;
+    if let Some(first) = result.warnings.first() {
+        app.status = Some(format!("skipped {first}"));
+    }
     app.loading = Loading::Done;
     app.set_page(page);
     // Snapshots show the settled state; animating into a still image would
@@ -388,6 +391,14 @@ fn drain_scan(app: &mut App, rx: &Receiver<ScanMsg>, kind: Rescan) {
                     app.refresh_ssh_hosts();
                 }
                 app.apply_scan(result.scan.events, result.scan.stats, kind);
+                // 本机数字照常显示，但坏掉的快照必须说出来——否则总量少了一台
+                // 设备，界面上却看不出任何异常。
+                if let Some(first) = result.warnings.first() {
+                    app.status = Some(match result.warnings.len() {
+                        1 => format!("skipped {first}"),
+                        n => format!("skipped {first} · {} more device(s)", n - 1),
+                    });
+                }
             }
             Ok(ScanMsg::Failed(e)) => {
                 app.scan_pending = false;
@@ -452,6 +463,12 @@ fn on_key(app: &mut App, k: KeyEvent) {
             }
             KeyCode::Char('u') => {
                 app.update_selected_device();
+                return;
+            }
+            // Esc 先撤销待确认的远端升级，之后才轮到它平时的清除筛选。
+            KeyCode::Esc if app.update_armed.is_some() => {
+                app.disarm_update();
+                app.status = Some("update cancelled".into());
                 return;
             }
             _ => {}
@@ -545,6 +562,7 @@ fn apply(app: &mut App, action: Action) {
                 app.activate_selected();
             } else {
                 app.selected = i;
+                app.disarm_update();
             }
         }
         Action::ProjectRow(i) => app.open_project(i),

@@ -262,6 +262,12 @@ pub struct App {
     pub settings_path: String,
     /// SSH config 按需读取一次，不进入主页面首帧的热路径。
     pub ssh_hosts_loaded: bool,
+    /// 打开 Devices 页时是否真的去读 `~/.ssh/config`。测试关掉它，断言才不会
+    /// 取决于跑测试的机器上恰好配了哪些 Host——但两边走的是同一条代码路径。
+    pub discover_ssh_hosts: bool,
+    /// 已经按过一次 `u`、正在等待确认的远端 host。远端升级会下载并执行安装器，
+    /// 一次误触不该就把另一台机器上的二进制换掉。
+    pub update_armed: Option<String>,
     pub pricing: Pricing,
     pub summary: Summary,
     pub stats: ScanStats,
@@ -312,7 +318,9 @@ pub struct App {
 impl App {
     #[cfg(test)]
     pub fn new(sources: Vec<Source>, base: Filter, pricing: Pricing) -> Self {
-        Self::with_settings(sources, base, pricing, Settings::default())
+        let mut app = Self::with_settings(sources, base, pricing, Settings::default());
+        app.discover_ssh_hosts = false;
+        app
     }
 
     pub fn with_settings(
@@ -349,11 +357,14 @@ impl App {
                 available: true,
                 enabled: true,
                 discovered: true,
+                problem: None,
             }],
             device_summary: Summary::default(),
             settings,
             settings_path,
             ssh_hosts_loaded: false,
+            discover_ssh_hosts: true,
+            update_armed: None,
             pricing,
             summary: Summary::default(),
             stats: ScanStats::default(),
@@ -557,6 +568,7 @@ impl App {
                 available: false,
                 enabled: self.settings.ssh_host_enabled(&host),
                 discovered: true,
+                problem: None,
             });
         }
         self.devices.sort_by(|a, b| {
@@ -598,12 +610,11 @@ impl App {
             self.page = page;
             self.selected = 0;
             self.scroll = 0;
+            self.disarm_update();
             self.grow = Eased::from_zero(1.0).with_rate(crate::tui::anim::RATE_FAST);
             self.needs_redraw = true;
         }
-        // 单元测试不应依赖运行测试的机器恰好有哪些 SSH Host；解析器本身有独立测试。
-        #[cfg(not(test))]
-        if page == Page::Devices && !self.ssh_hosts_loaded {
+        if page == Page::Devices && self.discover_ssh_hosts && !self.ssh_hosts_loaded {
             self.refresh_ssh_hosts();
         }
     }
@@ -652,6 +663,7 @@ impl App {
         let i = (self.selected as isize + delta).clamp(0, n as isize - 1) as usize;
         if i != self.selected {
             self.selected = i;
+            self.disarm_update();
             if self.page == Page::Replay
                 && let Some(event) =
                     self.replay.data.as_ref().and_then(|replay| replay.events.get(i))
@@ -721,6 +733,8 @@ impl App {
                     self.status = Some(format!("SSH Host `{host}` is no longer in your config"));
                 } else if !record.enabled {
                     self.request_device(DeviceRequest::ConnectHost(host));
+                // 快照坏掉的设备 available 为 false，所以 Enter 落在这里重新同步 ——
+                // 重建那份快照正是唯一的修法。
                 } else if !record.available {
                     self.request_device(DeviceRequest::SyncHost(host));
                 } else {
@@ -883,6 +897,8 @@ impl App {
         self.needs_redraw = true;
     }
 
+    /// 第一次按 `u` 只是把这台设备装上膛，第二次才真的执行。远端升级会下载并运行
+    /// 官方安装器，替换掉另一台机器上的二进制——这类动作值得一次明确确认。
     pub fn update_selected_device(&mut self) {
         let Some(device) = self.devices.get(self.selected) else {
             self.status = Some("select an SSH device to update".into());
@@ -897,7 +913,23 @@ impl App {
             self.status = Some(format!("SSH Host `{host}` is no longer in your config"));
             return;
         }
+        if self.update_armed.as_deref() != Some(host.as_str()) {
+            self.update_armed = Some(host.clone());
+            self.status =
+                Some(format!("press u again to run the installer on {host}, or Esc to cancel"));
+            self.needs_redraw = true;
+            return;
+        }
+        self.update_armed = None;
         self.request_device(DeviceRequest::UpdateHost(host));
+    }
+
+    /// 选中行一变，上膛就失效：确认必须落在用户看着的那台设备上。
+    pub fn disarm_update(&mut self) {
+        if self.update_armed.is_some() {
+            self.update_armed = None;
+            self.needs_redraw = true;
+        }
     }
 
     pub fn disable_selected_device(&mut self) {
@@ -1420,6 +1452,7 @@ mod tests {
             available: true,
             enabled: true,
             discovered: true,
+            problem: None,
         });
         a.apply_discovered_ssh_hosts(Vec::new());
         a.page = Page::Devices;
@@ -1428,6 +1461,51 @@ mod tests {
 
         assert!(a.device_requested.is_none());
         assert!(a.status.as_deref().is_some_and(|status| status.contains("no longer")));
+    }
+
+    #[test]
+    fn upgrading_a_remote_takes_two_presses_and_a_moved_selection_cancels_it() {
+        // 远端升级会在另一台机器上下载并执行安装器。一次误触不该做到这件事，
+        // 而确认必须落在用户当时选中的那一行上。
+        let mut a = App::new(Source::ALL.to_vec(), Filter::default(), Pricing::builtin());
+        a.apply_discovered_ssh_hosts(vec!["gpu-01".into(), "workstation".into()]);
+        a.page = Page::Devices;
+        a.selected = 1;
+
+        a.update_selected_device();
+        assert!(a.device_requested.is_none(), "the first press only arms it");
+        assert_eq!(a.update_armed.as_deref(), Some("gpu-01"));
+        assert!(a.status.as_deref().is_some_and(|status| status.contains("press u again")));
+
+        a.move_selection(1);
+        a.update_selected_device();
+        assert!(a.device_requested.is_none(), "a different row starts its own confirmation");
+        assert_eq!(a.update_armed.as_deref(), Some("workstation"));
+
+        a.update_selected_device();
+        assert_eq!(a.device_requested, Some(DeviceRequest::UpdateHost("workstation".into())));
+        assert!(a.update_armed.is_none());
+    }
+
+    #[test]
+    fn opening_devices_reads_the_ssh_config_on_one_code_path() {
+        // 发现动作由运行期开关控制而不是 cfg(test)：生产和测试跑的是同一段代码，
+        // 只是测试不去碰跑测试的机器上的 ~/.ssh/config。
+        let mut a = App::new(Source::ALL.to_vec(), Filter::default(), Pricing::builtin());
+        assert!(!a.discover_ssh_hosts);
+        a.set_page(Page::Devices);
+        assert!(!a.ssh_hosts_loaded, "discovery stays off for tests");
+
+        a.discover_ssh_hosts = true;
+        a.set_page(Page::Overview);
+        a.set_page(Page::Devices);
+        // 跑测试的机器上有没有 ~/.ssh/config 都不该影响结论：要么读到了，要么
+        // 说清读不到的原因。断言的是这条路径真的跑了，不是它读到了什么。
+        assert!(
+            a.ssh_hosts_loaded
+                || a.status.as_deref().is_some_and(|status| status.contains("SSH config")),
+            "opening the page either loads the config or reports why it could not"
+        );
     }
 
     #[test]
@@ -1449,6 +1527,7 @@ mod tests {
             available: true,
             enabled: true,
             discovered: true,
+            problem: None,
         });
         a.events = vec![UsageEvent {
             source: Source::Codex,
