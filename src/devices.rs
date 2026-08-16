@@ -530,24 +530,81 @@ impl UsageMerger {
     /// 要么整批合入，要么一条都不合入。半批设备数据比没有这台设备更糟：总量会
     /// 少掉说不清楚的一截，而界面照旧把它显示成一台正常设备。
     fn add_batch(&mut self, device: DeviceSettings, events: Vec<UsageEvent>) -> Result<()> {
-        // 上限按最坏情况（整批都是新事件）预估。去重只会让实际占用更小，所以
-        // 通过这道检查之后循环里不会再失败。
-        let incoming_text: usize =
-            events.iter().map(event_text_bytes).fold(0, usize::saturating_add);
-        anyhow::ensure!(
-            self.events.len().saturating_add(events.len()) <= MAX_MERGED_EVENTS,
-            "merged device usage would exceed the event limit"
-        );
-        anyhow::ensure!(
-            self.text_bytes.saturating_add(incoming_text) <= MAX_MERGED_EVENT_TEXT_BYTES,
-            "merged device usage would exceed the text limit"
-        );
+        self.add_batch_with_limits(device, events, MAX_MERGED_EVENTS, MAX_MERGED_EVENT_TEXT_BYTES)
+    }
 
+    fn add_batch_with_limits(
+        &mut self,
+        device: DeviceSettings,
+        events: Vec<UsageEvent>,
+        max_events: usize,
+        max_text_bytes: usize,
+    ) -> Result<()> {
+        // 先在批次内部完成规范化和去重，不碰已经合好的结果。这样上限检查看到的
+        // 是真正会落盘的事件数，也包含随后写入的规范 ID 和设备 ID；检查失败时
+        // self 仍保持原样。
         let mut fallback_counts = HashMap::new();
+        let mut prepared: Vec<UsageEvent> = Vec::with_capacity(events.len());
+        let mut prepared_index: HashMap<String, usize> = HashMap::with_capacity(events.len());
         for mut event in events {
             let key = canonical_event_id(&event, &mut fallback_counts);
             event.dedup_key = Some(key.clone());
             event.observed_on = vec![device.id.clone()];
+            if let Some(&slot) = prepared_index.get(&key) {
+                let previous = &mut prepared[slot];
+                if (event.dedup_rank, event.tokens.output)
+                    > (previous.dedup_rank, previous.tokens.output)
+                {
+                    *previous = event;
+                }
+            } else {
+                prepared_index.insert(key, prepared.len());
+                prepared.push(event);
+            }
+        }
+        drop(prepared_index);
+
+        let mut projected_events = self.events.len();
+        let mut projected_text = self.text_bytes;
+        for event in &prepared {
+            let key = event.dedup_key.as_deref().expect("prepared events always have an id");
+            if let Some(&slot) = self.index.get(key) {
+                let previous = &self.events[slot];
+                let before = event_text_bytes(previous);
+                let added_observer =
+                    if previous.observed_on.contains(&device.id) { 0 } else { device.id.len() };
+                let observer_bytes = previous
+                    .observed_on
+                    .iter()
+                    .map(String::len)
+                    .sum::<usize>()
+                    .saturating_add(added_observer);
+                let after = if (event.dedup_rank, event.tokens.output)
+                    > (previous.dedup_rank, previous.tokens.output)
+                {
+                    event_text_bytes(event)
+                        .saturating_sub(device.id.len())
+                        .saturating_add(observer_bytes)
+                } else {
+                    before.saturating_add(added_observer)
+                };
+                projected_text = projected_text.saturating_sub(before).saturating_add(after);
+            } else {
+                projected_events = projected_events.saturating_add(1);
+                projected_text = projected_text.saturating_add(event_text_bytes(event));
+            }
+        }
+        anyhow::ensure!(
+            projected_events <= max_events,
+            "merged device usage would exceed the event limit"
+        );
+        anyhow::ensure!(
+            projected_text <= max_text_bytes,
+            "merged device usage would exceed the text limit"
+        );
+
+        for mut event in prepared {
+            let key = event.dedup_key.clone().expect("prepared events always have an id");
             if let Some(&slot) = self.index.get(&key) {
                 let before = event_text_bytes(&self.events[slot]);
                 {
@@ -944,6 +1001,53 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].tokens.output, 10);
         assert_eq!(events[0].observed_on, vec!["dev-a", "dev-b"]);
+    }
+
+    #[test]
+    fn merge_event_limit_counts_the_deduplicated_result() {
+        // 第二台设备带来的是同一个事件，合并后仍只有一条。上限检查必须看最终
+        // 结果，不能因为输入批次有一条就把它误算成第二条并拒绝整台设备。
+        let mut merger = UsageMerger::default();
+        merger
+            .add_batch_with_limits(
+                device("dev-a", "A"),
+                vec![event("codex:v1:same", 10)],
+                1,
+                usize::MAX,
+            )
+            .unwrap();
+        merger
+            .add_batch_with_limits(
+                device("dev-b", "B"),
+                vec![event("codex:v1:same", 10)],
+                1,
+                usize::MAX,
+            )
+            .unwrap();
+
+        let events = merger.finish();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].observed_on, vec!["dev-a", "dev-b"]);
+    }
+
+    #[test]
+    fn merge_text_limit_includes_the_device_id_before_mutating() {
+        // 输入事件还没有 observed_on；真正合入时会写设备 ID。若上限只够原始
+        // 事件，整批应在修改 merger 之前失败。
+        let candidate = event("codex:v1:new", 10);
+        let limit_without_device = event_text_bytes(&candidate);
+        let mut merger = UsageMerger::default();
+        let error = merger
+            .add_batch_with_limits(
+                device("dev-a", "A"),
+                vec![candidate],
+                usize::MAX,
+                limit_without_device,
+            )
+            .expect_err("the observer id must count toward the text limit");
+
+        assert!(error.to_string().contains("text limit"));
+        assert!(merger.finish().is_empty(), "a rejected batch changes nothing");
     }
 
     #[test]
