@@ -44,6 +44,21 @@ struct SshExitError {
     detail: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum RemoteReadoutAction {
+    Export,
+    Update,
+}
+
+impl RemoteReadoutAction {
+    const fn argument(self) -> &'static str {
+        match self {
+            Self::Export => "export",
+            Self::Update => "update",
+        }
+    }
+}
+
 impl std::fmt::Display for SshExitError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.detail.is_empty() {
@@ -776,7 +791,12 @@ fn fetch_and_save(settings: &Settings, host: &str) -> Result<()> {
 /// 远端升级是用户在 Devices 页明确选择的操作；升级后调用方会再次执行协议握手。
 pub fn update_remote(host: &str) -> Result<()> {
     crate::settings::validate_ssh_alias(host)?;
-    match run_ssh(host, "readout update", MAX_SSH_ERROR_BYTES, SSH_UPDATE_TIMEOUT) {
+    match run_remote_readout(
+        host,
+        RemoteReadoutAction::Update,
+        MAX_SSH_ERROR_BYTES,
+        SSH_UPDATE_TIMEOUT,
+    ) {
         Ok(_) => Ok(()),
         Err(direct_error) if ssh_failure_allows_bootstrap(&direct_error) => {
             // 0.2.4 是第一个带 update/export 的版本。远端缺少 readout 或仍是
@@ -815,6 +835,83 @@ pub fn update_remote(host: &str) -> Result<()> {
 /// 连接已经建立，可以安全地换一条安装命令重试。
 fn ssh_failure_allows_bootstrap(error: &anyhow::Error) -> bool {
     error.downcast_ref::<SshExitError>().is_some_and(|failure| failure.code != Some(255))
+}
+
+/// 非交互 SSH 不保证读取用户的 profile。官方安装器默认写入用户目录，因此先使用
+/// PATH，找不到时再探测各平台的默认安装位置；固定路径探测失败不应遮住最初那条清楚的
+/// `readout: command not found`。
+fn run_remote_readout(
+    host: &str,
+    action: RemoteReadoutAction,
+    output_limit: usize,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    run_remote_readout_with(action, |command| run_ssh(host, command, output_limit, timeout))
+}
+
+fn run_remote_readout_with(
+    action: RemoteReadoutAction,
+    mut run: impl FnMut(&str) -> Result<Vec<u8>>,
+) -> Result<Vec<u8>> {
+    let direct = format!("readout {}", action.argument());
+    let direct_error = match run(&direct) {
+        Ok(output) => return Ok(output),
+        Err(error) if ssh_command_is_missing(&error) => error,
+        Err(error) => return Err(error),
+    };
+
+    let unix = remote_unix_readout_command(action);
+    let windows = remote_windows_readout_command(action);
+    let windows_first = ssh_error_looks_windows(&direct_error);
+    let fallbacks = if windows_first { [&windows, &unix] } else { [&unix, &windows] };
+    for command in fallbacks {
+        match run(command) {
+            Ok(output) => return Ok(output),
+            Err(error) if ssh_command_is_missing(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(direct_error)
+        .context("remote readout is not on PATH or in the default per-user installation directory")
+}
+
+fn ssh_command_is_missing(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<SshExitError>().is_some_and(|failure| {
+        let detail = failure.detail.to_ascii_lowercase();
+        failure.code == Some(127)
+            || detail.contains("command not found")
+            || detail.contains("is not recognized as an internal or external command")
+            || detail.contains("the term 'readout' is not recognized")
+    })
+}
+
+fn ssh_error_looks_windows(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<SshExitError>().is_some_and(|failure| {
+        let detail = failure.detail.to_ascii_lowercase();
+        detail.contains("is not recognized as an internal or external command")
+            || detail.contains("the term 'readout' is not recognized")
+    })
+}
+
+fn remote_unix_readout_command(action: RemoteReadoutAction) -> String {
+    let argument = action.argument();
+    format!(
+        "if [ -x \"$HOME/.local/bin/readout\" ]; \
+         then exec \"$HOME/.local/bin/readout\" {argument}; \
+         else echo 'readout is not installed at $HOME/.local/bin/readout' >&2; exit 127; fi"
+    )
+}
+
+fn remote_windows_readout_command(action: RemoteReadoutAction) -> String {
+    let argument = action.argument();
+    format!(
+        "powershell.exe -NoProfile -NonInteractive -Command \
+         \"$path=Join-Path $env:LOCALAPPDATA 'Programs\\readout\\readout.exe'; \
+         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {{ \
+         Write-Error 'readout is not installed in the default user directory'; exit 127 }}; \
+         & $path {argument}; exit $LASTEXITCODE\""
+    )
 }
 
 fn remote_bootstrap_command() -> String {
@@ -856,12 +953,17 @@ fn snapshot_path(host: &str) -> Result<PathBuf> {
 
 fn fetch_remote(host: &str) -> Result<UsageBundle> {
     crate::settings::validate_ssh_alias(host)?;
-    let stdout = run_ssh(host, "readout export", MAX_BUNDLE_BYTES as usize, SSH_TIMEOUT)
-        .with_context(|| {
-            format!(
-                "remote readout on `{host}` is missing or incompatible; install/update it from the Devices page or run the current installer there"
-            )
-        })?;
+    let stdout = run_remote_readout(
+        host,
+        RemoteReadoutAction::Export,
+        MAX_BUNDLE_BYTES as usize,
+        SSH_TIMEOUT,
+    )
+    .with_context(|| {
+        format!(
+            "remote readout on `{host}` is missing or incompatible; install/update it from the Devices page or run the current installer there"
+        )
+    })?;
     UsageBundle::from_slice(&stdout).with_context(|| {
         format!("`{host}` returned an incompatible usage bundle; update readout on that device")
     })
@@ -1242,5 +1344,65 @@ mod tests {
         assert!(ssh_failure_allows_bootstrap(&remote_command));
         assert!(!ssh_failure_allows_bootstrap(&transport));
         assert!(!ssh_failure_allows_bootstrap(&anyhow::anyhow!("ssh command timed out")));
+    }
+
+    fn ssh_exit(code: i32, detail: &str) -> anyhow::Error {
+        anyhow::Error::new(SshExitError {
+            code: Some(code),
+            status: format!("exit status: {code}"),
+            detail: detail.into(),
+        })
+    }
+
+    #[test]
+    fn remote_readout_falls_back_to_the_unix_user_install_directory() {
+        let mut commands = Vec::new();
+        let output = run_remote_readout_with(RemoteReadoutAction::Export, |command| {
+            commands.push(command.to_string());
+            if commands.len() == 1 {
+                Err(ssh_exit(127, "bash: readout: command not found"))
+            } else {
+                Ok(b"bundle".to_vec())
+            }
+        })
+        .unwrap();
+
+        assert_eq!(output, b"bundle");
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0], "readout export");
+        assert!(commands[1].contains("$HOME/.local/bin/readout"));
+        assert!(commands[1].contains(" export"));
+    }
+
+    #[test]
+    fn remote_readout_prefers_the_windows_user_install_directory_for_cmd_errors() {
+        let mut commands = Vec::new();
+        run_remote_readout_with(RemoteReadoutAction::Update, |command| {
+            commands.push(command.to_string());
+            if commands.len() == 1 {
+                Err(ssh_exit(1, "'readout' is not recognized as an internal or external command"))
+            } else {
+                Ok(Vec::new())
+            }
+        })
+        .unwrap();
+
+        assert_eq!(commands.len(), 2);
+        assert!(commands[1].contains("$env:LOCALAPPDATA"));
+        assert!(commands[1].contains(" update"));
+    }
+
+    #[test]
+    fn remote_readout_does_not_retry_transport_or_application_failures() {
+        for (code, detail) in [(255, "Connection refused"), (1, "export failed")] {
+            let mut attempts = 0;
+            let error = run_remote_readout_with(RemoteReadoutAction::Export, |_| {
+                attempts += 1;
+                Err(ssh_exit(code, detail))
+            })
+            .unwrap_err();
+            assert_eq!(attempts, 1);
+            assert!(error.to_string().contains(detail));
+        }
     }
 }

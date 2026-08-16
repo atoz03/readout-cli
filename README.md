@@ -190,6 +190,9 @@ OpenSSH；设置 `READOUT_SSH_CONFIG` 时，同一路径也会通过 `ssh -F` �
 添加器内使用 `Ctrl-U`。第一次按只是确认对象，第二次才会在远端执行操作。readout 先尝试
 `readout update`，远端尚未安装或版本早于 0.2.4 时，自动回退到 GitHub Release 随附的
 Linux/macOS 或 Windows 官方安装器；选中行一变或按 `Esc` 就取消。
+非交互 SSH 不一定读取远端的 shell profile；因此即使 `~/.local/bin`（Windows 为
+`%LOCALAPPDATA%\Programs\readout`）不在远端 PATH，readout 也会自动尝试官方安装器的
+默认用户目录，不需要为了同步去修改系统级 PATH。
 若失败来自 DNS、认证、host key 或超时，readout 会直接显示该连接根因，不会继续尝试其他
 安装器；只有 SSH 已连接而远端命令返回非零状态时，才会进入安装器回退。
 

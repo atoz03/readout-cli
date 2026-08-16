@@ -115,6 +115,12 @@ transport failures: return their root cause immediately instead of reconnecting
 with more installer commands. TUI status lines use the root-first error chain so
 DNS and authentication details survive the one-line width limit.
 
+Remote commands must not assume that non-interactive SSH reads a shell profile.
+Try `readout` from PATH first, then the official installers' per-user defaults
+(`$HOME/.local/bin/readout` on Unix and `%LOCALAPPDATA%\Programs\readout` on
+Windows). Only a command-not-found result may probe another fixed path; transport
+and application failures return immediately.
+
 Those snapshots are cache, and fail like cache: one that will not parse, or that
 claims the local device id, takes its own row out (`DeviceRecord::problem`) and
 is reported through `LoadedUsage::warnings`. It must never take the local numbers
