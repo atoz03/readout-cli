@@ -120,9 +120,9 @@ Everything on screen that means something is clickable.
 | A model row | select it; click again to filter the dashboard by it |
 | A project row | open that project's sessions |
 | A session row | open Session Replay |
-| A device row | 首次点击连接并校验；已同步设备则按设备过滤 |
+| A device row | 已同步设备按设备过滤；`Add SSH device…` 打开可搜索添加器 |
 | Devices card header | sync enabled SSH hosts |
-| A Settings row | toggle or cycle that persisted setting |
+| A Settings row | toggle the value, edit the local name, or open its management page |
 | Replay controls and timeline events | play/pause, change speed, or seek to an event |
 | A day or rate row | select it |
 | A KPI tile | jump to the page that breaks it down |
@@ -136,9 +136,12 @@ Everything on screen that means something is clickable.
 |---|---|
 | `↑` `↓` / `j` `k` | move the selection (the window scrolls to follow) |
 | `PgUp` `PgDn` `Home` `End` | move it faster |
-| `Enter` | filter/open the selected row；Devices 中用于校验并启用 SSH Host |
+| `Enter` | filter/open the selected row；Devices 中添加/连接 Host；Settings 中编辑或打开管理页 |
 | `Delete` / `Backspace` | 在 Devices 中禁用选中的 SSH Host |
 | `u` | 在 Devices 中升级选中的远端 readout；按两次确认，`Esc` 取消 |
+| Type / `Backspace` | 在 Add SSH device 中过滤 SSH config，或直接输入主机名 |
+| Type / `Backspace` | 在本机名称编辑器中修改显示名 |
+| `Ctrl-U` | 在添加器中安装/升级当前候选（按两次确认），或清空名称编辑器 |
 | `r` | 在 Devices 中异步同步已启用设备；其他页面重新扫描本机 usage |
 | `Esc` | clear that filter |
 | `Tab` / `Shift-Tab`, `←` `→` | change page |
@@ -169,33 +172,47 @@ Replay 默认暂停在首个事件。`Space` 播放或暂停，`1`/`2`/`4` 切�
 字段、时间、模型、项目和 session ID，不包含 prompt、助手消息、工具参数、工具结果或
 任何认证信息。
 
-设备来源只使用现有的 SSH config，不再维护第二份远端清单。进入 Devices 页面后，
-readout 会从 `~/.ssh/config`（含 `Include` 和通配 include 文件）列出所有具体 `Host` 别名；
-`Host *`、`!negated` 等模式不会成为设备。按 `Enter` 后才执行固定命令
-`ssh <host-alias> readout export`，校验 bundle schema、设备 ID 和输出边界，成功后才把
-这个别名记为启用。SSH 的 User、HostName、端口、密钥和跳板机继续完全交给 OpenSSH。
+本机身份由“稳定 device ID + 可修改显示名”组成。首次运行时，显示名通过操作系统原生
+hostname API 取得；只有原生读取不可用时才回退到 `COMPUTERNAME`/`HOSTNAME`，不会把
+SSH config 里的某个 Host 猜成本机。旧版本生成的 `this-device` 会在首次读取时迁移为
+系统 hostname，但 device ID 保持不变。机器名不符合用户习惯时，可在 Settings 选中
+`Local device` 按 `Enter` 直接编辑，也可运行 `readout device rename NAME`；改名只影响
+显示和后续导出，不会制造一台“新设备”。
 
-远端需要先安装 readout，并且 `readout` 必须在非交互 SSH 的 PATH 中。首次 host key
-确认仍应由用户正常执行一次 `ssh <host-alias>`。兼容的旧版本可以继续同步，设备行会
-显示它的版本；需要升级时选中后按 `u`。第一次按只是确认对象，第二次才真的在那台机器上
-下载并执行官方安装器；选中行一变或按 `Esc` 就取消。还没有 `readout update` 的旧版本需要
-手动跑一次最新安装器，之后即可远程升级。
+Devices 默认只显示本机和用户已经添加的远端，不会把大型 SSH config 全部铺到主列表。
+选择 `Add SSH device…` 后，readout 才从 `~/.ssh/config`（含 `Include` 和通配 include
+文件）提供可搜索的具体 `Host` 别名；也可以直接输入一个安全的主机名或别名。按 `Enter`
+后执行固定命令 `ssh <host> readout export`，校验 bundle schema、设备 ID 和输出边界，
+成功后才保存到 `settings.json`。SSH 的 User、HostName、端口、密钥和跳板机继续完全交给
+OpenSSH；设置 `READOUT_SSH_CONFIG` 时，同一路径也会通过 `ssh -F` 用于实际连接。
+
+首次 host key 确认仍应由用户正常执行一次 `ssh <host>`。需要安装或升级时选中后按 `u`；
+添加器内使用 `Ctrl-U`。第一次按只是确认对象，第二次才会在远端执行操作。readout 先尝试
+`readout update`，远端尚未安装或版本早于 0.2.4 时，自动回退到 GitHub Release 随附的
+Linux/macOS 或 Windows 官方安装器；选中行一变或按 `Esc` 就取消。
+若失败来自 DNS、认证、host key 或超时，readout 会直接显示该连接根因，不会继续尝试其他
+安装器；只有 SSH 已连接而远端命令返回非零状态时，才会进入安装器回退。
 
 某台设备的快照读不出来（文件损坏，或者两台机器共用了同一份 settings.json 因而报告了
 相同的设备 ID）时，只有那一行会显示为 `unreadable`，本机数字照常显示，原因写在状态栏，
 `readout summary` 则打到 stderr。选中那一行按 `Enter` 重新同步即可重建它。
 
-保留的自动化命令只有：
+设备也可以完全从命令行管理：
 
 ```sh
 readout sync     # 拉取 Devices 中所有已启用设备
 readout update   # 更新本机 readout
+readout device list
+readout device add HOST
+readout device remove HOST
+readout device rename NAME
 ```
 
-同步使用 BatchMode、连接超时、总超时和有界输出，不保存密码或私钥。
-TUI 的 Settings 页面只控制默认是否显示全部设备聚合值；关闭后
-Overview/Models/Projects/Sessions 只看本机。SSH 不做定时同步：在 Devices 页面按 `r`
-或点击卡片标题会启动后台同步，界面不会被 SSH 阻塞。
+同步使用 BatchMode、连接超时、总超时和有界输出，不保存密码或私钥。Settings 页面可
+直接修改本机显示名；选中 `SSH devices` 会进入同一个 Devices 管理流程，同时展示项目
+别名、配置文件位置和稳定 device ID。聚合开关关闭后 Overview/Models/Projects/Sessions
+只看本机。SSH 不做定时同步：在 Devices 页面按 `r` 或点击卡片标题会启动后台同步，
+界面不会被 SSH 阻塞。
 
 Devices 页面始终保留全设备状态。若同一个 transcript 出现在多台设备，稳定事件 ID 会
 保证总量只计算一次；由于 Codex 记录不包含真实主机 ID，这部分会进入 `Shared`，不会
@@ -267,6 +284,7 @@ readout pricing [--init]
 readout refresh [--clear]
 readout sync
 readout update
+readout device list|add|remove|rename
 readout project-alias set|remove|list
 readout snapshot [--width N] [--height N] [--page overview|daily|models|projects|sessions|devices|pricing|settings]
 ```

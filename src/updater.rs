@@ -8,11 +8,9 @@
 use anyhow::{Context, Result};
 use std::process::{Command, Stdio};
 
-#[cfg(any(unix, test))]
-const UNIX_INSTALLER: &str =
+pub(crate) const UNIX_INSTALLER_URL: &str =
     "https://github.com/atoz03/readout-cli/releases/latest/download/install.sh";
-#[cfg(any(windows, test))]
-const WINDOWS_INSTALLER: &str =
+pub(crate) const WINDOWS_INSTALLER_URL: &str =
     "https://github.com/atoz03/readout-cli/releases/latest/download/install.ps1";
 
 pub fn update() -> Result<()> {
@@ -27,9 +25,9 @@ fn update_in(install_dir: &std::path::Path) -> Result<()> {
     let script = format!(
         "tmp=$(mktemp \"${{TMPDIR:-/tmp}}/readout-update.XXXXXX\") || exit 1; \
          trap 'rm -f \"$tmp\"' EXIT HUP INT TERM; \
-         if command -v curl >/dev/null 2>&1 && curl -fsSL '{UNIX_INSTALLER}' -o \"$tmp\"; \
+         if command -v curl >/dev/null 2>&1 && curl -fsSL '{UNIX_INSTALLER_URL}' -o \"$tmp\"; \
          then :; \
-         elif command -v wget >/dev/null 2>&1 && wget -qO \"$tmp\" '{UNIX_INSTALLER}'; \
+         elif command -v wget >/dev/null 2>&1 && wget -qO \"$tmp\" '{UNIX_INSTALLER_URL}'; \
          then :; \
          else echo 'readout update: could not download the installer with curl or wget' >&2; \
          exit 1; fi; \
@@ -56,7 +54,7 @@ fn update_in(install_dir: &std::path::Path) -> Result<()> {
            [Net.ServicePointManager]::SecurityProtocol -bor \
            [Net.SecurityProtocolType]::Tls12; \
          Wait-Process -Id {pid} -ErrorAction SilentlyContinue; \
-         Invoke-RestMethod '{WINDOWS_INSTALLER}' -UseBasicParsing | Invoke-Expression"
+         Invoke-RestMethod '{WINDOWS_INSTALLER_URL}' -UseBasicParsing | Invoke-Expression"
     );
     Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
@@ -79,9 +77,9 @@ mod tests {
 
     #[test]
     fn updater_urls_are_fixed_official_release_assets() {
-        assert!(UNIX_INSTALLER.starts_with("https://github.com/atoz03/readout-cli/"));
-        assert!(WINDOWS_INSTALLER.starts_with("https://github.com/atoz03/readout-cli/"));
-        assert!(!UNIX_INSTALLER.contains(char::is_whitespace));
-        assert!(!WINDOWS_INSTALLER.contains(char::is_whitespace));
+        assert!(UNIX_INSTALLER_URL.starts_with("https://github.com/atoz03/readout-cli/"));
+        assert!(WINDOWS_INSTALLER_URL.starts_with("https://github.com/atoz03/readout-cli/"));
+        assert!(!UNIX_INSTALLER_URL.contains(char::is_whitespace));
+        assert!(!WINDOWS_INSTALLER_URL.contains(char::is_whitespace));
     }
 }

@@ -15,7 +15,8 @@ use std::os::unix::fs::OpenOptionsExt;
 
 const SCHEMA_VERSION: u32 = 1;
 const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
-const MAX_SSH_HOSTS: usize = 64;
+// SSH 同步会另外限制并发数；配置容量不该把多机器用户卡在很小的固定上限。
+const MAX_SSH_HOSTS: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceSettings {
@@ -38,7 +39,7 @@ pub struct Settings {
     /// 默认页面是否合并已导入的其他设备；关闭后只显示本机观察到的事件。
     #[serde(default = "yes")]
     pub aggregate_devices: bool,
-    /// 用户从 SSH config 发现列表中启用的具体 Host 别名。
+    /// 用户明确添加的 SSH config 别名或可直接解析的主机名。
     #[serde(default)]
     pub ssh_hosts: Vec<String>,
     #[serde(default)]
@@ -74,9 +75,16 @@ impl Settings {
             settings.save_to(&path)?;
             return Ok(settings);
         }
-        Self::load_from(&path).with_context(|| {
+        let mut settings = Self::load_from(&path).with_context(|| {
             format!("move or delete {} to start again from defaults", path.display())
-        })
+        })?;
+        // 0.2.4 以前只看环境变量；从 GUI、systemd 或某些终端启动时变量可能不存在，
+        // 本机名就会永久落成这个占位符。只迁移旧占位符，保留稳定 device ID，也不
+        // 覆盖用户已经明确写入的名称。
+        if settings.migrate_legacy_device_name() {
+            settings.save_to(&path)?;
+        }
+        Ok(settings)
     }
 
     pub fn load_from(path: &Path) -> Result<Self> {
@@ -169,6 +177,24 @@ impl Settings {
         !self.ssh_hosts.is_empty()
     }
 
+    pub fn set_device_name(&mut self, name: String) -> Result<()> {
+        validate_label(&name, "device name")?;
+        self.device.name = name;
+        Ok(())
+    }
+
+    fn migrate_legacy_device_name(&mut self) -> bool {
+        if self.device.name != "this-device" {
+            return false;
+        }
+        let Some(name) = system_device_name() else { return false };
+        if name == self.device.name {
+            return false;
+        }
+        self.device.name = name;
+        true
+    }
+
     pub fn set_project_alias(&mut self, path: String, name: String) -> Result<()> {
         validate_project_path(&path)?;
         validate_label(&name, "project alias")?;
@@ -233,11 +259,19 @@ fn validate_project_path(value: &str) -> Result<()> {
 }
 
 fn default_device_name() -> String {
-    ["COMPUTERNAME", "HOSTNAME"]
-        .into_iter()
-        .filter_map(|key| std::env::var(key).ok())
-        .find(|value| validate_label(value, "device name").is_ok())
+    system_device_name()
+        .or_else(|| {
+            ["COMPUTERNAME", "HOSTNAME"]
+                .into_iter()
+                .filter_map(|key| std::env::var(key).ok())
+                .find(|value| validate_label(value, "device name").is_ok())
+        })
         .unwrap_or_else(|| "this-device".into())
+}
+
+fn system_device_name() -> Option<String> {
+    let name = gethostname::gethostname().to_string_lossy().trim().to_string();
+    validate_label(&name, "device name").is_ok().then_some(name)
 }
 
 fn new_device_id(name: &str) -> String {
@@ -294,5 +328,38 @@ mod tests {
         assert!(settings.ssh_host_enabled("workstation"));
         assert!(settings.disable_ssh_host("workstation"));
         assert!(!settings.ssh_host_enabled("workstation"));
+    }
+
+    #[test]
+    fn large_fleets_are_not_limited_to_the_old_sixty_four_host_cap() {
+        let mut settings = Settings::default();
+        for index in 0..128 {
+            assert!(settings.enable_ssh_host(format!("host-{index:03}")).unwrap());
+        }
+        settings.validate().unwrap();
+        assert_eq!(settings.ssh_hosts.len(), 128);
+    }
+
+    #[test]
+    fn renaming_a_device_preserves_its_stable_id() {
+        let mut settings = Settings::default();
+        let id = settings.device.id.clone();
+        settings.set_device_name("workstation".into()).unwrap();
+        assert_eq!(settings.device.id, id);
+        assert_eq!(settings.device.name, "workstation");
+        assert!(settings.set_device_name("unsafe\nname".into()).is_err());
+    }
+
+    #[test]
+    fn the_legacy_placeholder_migrates_without_changing_the_device_id() {
+        let mut settings = Settings::default();
+        settings.device.name = "this-device".into();
+        let id = settings.device.id.clone();
+        if let Some(hostname) = system_device_name().filter(|name| name != "this-device") {
+            assert!(settings.migrate_legacy_device_name());
+            assert_eq!(settings.device.name, hostname);
+            assert_eq!(settings.device.id, id);
+            assert!(!settings.migrate_legacy_device_name(), "migration is one-shot");
+        }
     }
 }

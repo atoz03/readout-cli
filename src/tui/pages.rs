@@ -1089,8 +1089,11 @@ fn session_list(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect, sc
 // ── Devices ────────────────────────────────────────────────────────────────
 
 fn devices(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
-    let discovered =
-        app.devices.iter().filter(|device| !device.is_local && device.discovered).count();
+    if app.device_picker {
+        device_picker(app, buf, hits, area);
+        return;
+    }
+    let configured = app.devices.iter().filter(|device| !device.is_local).count();
     let inner = w::card(
         buf,
         hits,
@@ -1100,8 +1103,8 @@ fn devices(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
             glyph: "◫",
             glyph_color: theme::SERIES[1],
             meta: Some(format!(
-                "{discovered} found · {} enabled · r sync · Enter connect · Del disable · u update",
-                app.settings.ssh_hosts.len()
+                "{configured} added · {} available · Enter open/add · Del remove · u update · r sync",
+                app.available_ssh_hosts.len()
             )),
             action: app.settings.has_ssh_hosts().then_some(Action::SyncDevices),
         },
@@ -1114,6 +1117,33 @@ fn devices(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
         let y = inner.y + (index - app.scroll) as u16;
         let row = Rect { x: inner.x, y, width: inner.width, height: 1 };
         let selected = index == app.selected;
+        let add_index = app.devices.len() + usize::from(app.has_shared_device());
+        if index == add_index {
+            let hover_id = w::hover_id("device:add");
+            if selected || app.hover == Some(hover_id) {
+                w::fill(
+                    buf,
+                    row,
+                    if selected { theme::SURFACE_SELECTED } else { theme::SURFACE_RAISED },
+                );
+            }
+            let mark = if selected { theme::SELECT_MARK } else { "+" };
+            w::text(buf, row.x, y, 1, mark, Style::default().fg(theme::SERIES[1]));
+            w::text(
+                buf,
+                row.x + 2,
+                y,
+                row.width.saturating_sub(2),
+                "Add SSH device…",
+                Style::default().fg(if selected {
+                    theme::TEXT_PRIMARY
+                } else {
+                    theme::TEXT_SECONDARY
+                }),
+            );
+            hits.add_hoverable(row, Action::Row(index), hover_id);
+            continue;
+        }
         let record = app.devices.get(index);
         let id = record.map_or(crate::agg::SHARED_DEVICE_ID, |device| device.id.as_str());
         let hover_key = record.and_then(|device| device.host.as_deref()).unwrap_or(id);
@@ -1134,12 +1164,14 @@ fn devices(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
         // 快照坏掉排在"没同步过"前面：两者都是不可用，但只有这一种需要用户动手。
         } else if record.is_some_and(|device| device.problem.is_some()) {
             "unreadable".to_string()
-        } else if record.is_some_and(|device| !device.discovered) {
-            "missing config".to_string()
         } else if record.is_some_and(|device| !device.enabled) {
             "available".to_string()
         } else if record.is_some_and(|device| !device.available) {
-            "not synced".to_string()
+            if record.is_some_and(|device| !device.discovered) {
+                "direct host".to_string()
+            } else {
+                "not synced".to_string()
+            }
         } else {
             record.map_or_else(
                 || "imported".to_string(),
@@ -1192,9 +1224,86 @@ fn devices(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
     }
 }
 
+fn device_picker(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
+    let hosts = app.device_candidates();
+    let query = if app.device_query.is_empty() {
+        "type to filter".to_string()
+    } else {
+        format!("filter: {}", app.device_query)
+    };
+    let inner = w::card(
+        buf,
+        hits,
+        area,
+        Card {
+            title: "Add SSH device",
+            glyph: "+",
+            glyph_color: theme::SERIES[1],
+            meta: Some(format!(
+                "{query} · {} match(es) · Enter connect · Ctrl+u install · Esc back",
+                hosts.len()
+            )),
+            action: None,
+        },
+    );
+    let rows = inner.height as usize;
+    app.list_rows.set(rows);
+    if hosts.is_empty() {
+        w::text(
+            buf,
+            inner.x,
+            inner.y,
+            inner.width,
+            if app.available_ssh_hosts.is_empty() {
+                "Type a hostname or alias to add it directly."
+            } else {
+                "No SSH Host aliases match this filter."
+            },
+            Style::default().fg(theme::TEXT_MUTED),
+        );
+        return;
+    }
+    for (index, host) in hosts.iter().enumerate().skip(app.scroll).take(rows) {
+        let y = inner.y + (index - app.scroll) as u16;
+        let row = Rect { x: inner.x, y, width: inner.width, height: 1 };
+        let selected = index == app.selected;
+        let hover_id = w::hover_id(&format!("device-candidate:{host}"));
+        if selected || app.hover == Some(hover_id) {
+            w::fill(
+                buf,
+                row,
+                if selected { theme::SURFACE_SELECTED } else { theme::SURFACE_RAISED },
+            );
+        }
+        let mark = if selected { theme::SELECT_MARK } else { theme::DOT };
+        w::text(buf, row.x, y, 1, mark, Style::default().fg(theme::SERIES[1]));
+        w::text(
+            buf,
+            row.x + 2,
+            y,
+            row.width.saturating_sub(14),
+            &fmt::ellipsize(host, row.width.saturating_sub(14) as usize),
+            Style::default().fg(if selected { theme::TEXT_PRIMARY } else { theme::TEXT_SECONDARY }),
+        );
+        w::text_right(
+            buf,
+            row.right().saturating_sub(11),
+            y,
+            11,
+            "available",
+            Style::default().fg(theme::TEXT_MUTED),
+        );
+        hits.add_hoverable(row, Action::Row(index), hover_id);
+    }
+}
+
 // ── Settings ───────────────────────────────────────────────────────────────
 
 fn settings(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
+    if app.device_name_editor {
+        device_name_editor(app, buf, hits, area);
+        return;
+    }
     let inner = w::card(
         buf,
         hits,
@@ -1203,15 +1312,25 @@ fn settings(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
             title: "Settings",
             glyph: "⚙",
             glyph_color: theme::SERIES[0],
-            meta: Some(format!("device {}", app.settings.device.name)),
+            meta: Some(format!("device {} · Enter edit/open", app.settings.device.name)),
             action: None,
         },
     );
-    let rows = [(
-        "Aggregate devices",
-        if app.settings.aggregate_devices { "On" } else { "Off" },
-        "Include remote usage in the default totals",
-    )];
+    let rows = [
+        (
+            "Aggregate devices",
+            if app.settings.aggregate_devices { "On".to_string() } else { "Off".to_string() },
+            "Include remote usage in the default totals".to_string(),
+        ),
+        ("Local device", app.settings.device.name.clone(), "Enter to rename".to_string()),
+        ("SSH devices", app.settings.ssh_hosts.len().to_string(), "Enter to manage".to_string()),
+        (
+            "Project aliases",
+            app.settings.project_aliases.len().to_string(),
+            "readout project-alias set|remove|list".to_string(),
+        ),
+        ("Settings file", "JSON".to_string(), app.settings_path.clone()),
+    ];
     app.list_rows.set(rows.len().min(inner.height as usize));
     for (index, (label, value, help)) in rows.iter().enumerate().take(inner.height as usize) {
         let y = inner.y + index as u16;
@@ -1225,8 +1344,8 @@ fn settings(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
                 if selected { theme::SURFACE_SELECTED } else { theme::SURFACE_RAISED },
             );
         }
-        let actual = (*value).to_string();
-        let value_w = 8u16.min(row.width);
+        let actual = value.to_string();
+        let value_w = 20u16.min(row.width / 3).max(8u16.min(row.width));
         let label_w = 22u16.min(row.width.saturating_sub(value_w + 2));
         let mark = if selected { theme::SELECT_MARK } else { " " };
         w::text(buf, row.x, y, 1, mark, Style::default().fg(theme::SERIES[0]));
@@ -1242,7 +1361,14 @@ fn settings(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
         );
         let help_x = row.x + label_w + 2;
         let help_w = row.width.saturating_sub(label_w + value_w + 3);
-        w::text(buf, help_x, y, help_w, help, Style::default().fg(theme::TEXT_MUTED));
+        w::text(
+            buf,
+            help_x,
+            y,
+            help_w,
+            &fmt::ellipsize(help, help_w as usize),
+            Style::default().fg(theme::TEXT_MUTED),
+        );
         w::text_right(
             buf,
             row.right().saturating_sub(value_w),
@@ -1256,18 +1382,59 @@ fn settings(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
 
     if inner.height > rows.len() as u16 + 1 {
         let y = inner.y + rows.len() as u16 + 1;
-        let remotes = format!(
-            "{} enabled SSH hosts · {} project aliases · config {}",
-            app.settings.ssh_hosts.len(),
-            app.settings.project_aliases.len(),
-            app.settings_path
-        );
+        let remotes =
+            format!("stable device ID {} · settings {}", app.settings.device.id, app.settings_path);
         w::text(
             buf,
             inner.x,
             y,
             inner.width,
             &fmt::ellipsize(&remotes, inner.width as usize),
+            Style::default().fg(theme::TEXT_MUTED),
+        );
+    }
+}
+
+fn device_name_editor(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
+    let inner = w::card(
+        buf,
+        hits,
+        area,
+        Card {
+            title: "Rename local device",
+            glyph: "✎",
+            glyph_color: theme::SERIES[0],
+            meta: Some("type a display name · Ctrl+u clear · Enter save · Esc cancel".into()),
+            action: None,
+        },
+    );
+    app.list_rows.set(0);
+    if inner.height == 0 {
+        return;
+    }
+    let row = Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 };
+    w::fill(buf, row, theme::SURFACE_SELECTED);
+    let shown = if app.device_name_input.is_empty() {
+        "_".to_string()
+    } else {
+        format!("{}_", app.device_name_input)
+    };
+    w::text(
+        buf,
+        row.x + 1,
+        row.y,
+        row.width.saturating_sub(2),
+        &fmt::ellipsize(&shown, row.width.saturating_sub(2) as usize),
+        Style::default().fg(theme::TEXT_PRIMARY).add_modifier(Modifier::BOLD),
+    );
+    if inner.height > 2 {
+        let detail = format!("display name only · stable ID remains {}", app.settings.device.id);
+        w::text(
+            buf,
+            inner.x,
+            inner.y + 2,
+            inner.width,
+            &fmt::ellipsize(&detail, inner.width as usize),
             Style::default().fg(theme::TEXT_MUTED),
         );
     }

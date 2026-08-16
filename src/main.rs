@@ -152,11 +152,28 @@ enum Command {
     Sync,
     /// 从官方 release 安全更新 readout
     Update,
+    /// 管理本机身份和 SSH 设备
+    Device {
+        #[command(subcommand)]
+        action: DeviceCommand,
+    },
     /// 把不同设备的 cwd 映射成统一项目名
     ProjectAlias {
         #[command(subcommand)]
         action: ProjectAliasCommand,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum DeviceCommand {
+    /// 列出本机和已经添加的 SSH 设备
+    List,
+    /// 添加一个 SSH config 别名或可直接解析的主机名
+    Add { host: String },
+    /// 删除一个已经添加的 SSH Host
+    Remove { host: String },
+    /// 修改本机显示名称，不改变稳定 device ID
+    Rename { name: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -346,6 +363,51 @@ fn run() -> Result<()> {
             Ok(())
         }
         Some(Command::Update) => unreachable!("handled before loading settings"),
+        Some(Command::Device { action }) => {
+            match action {
+                DeviceCommand::List => {
+                    println!(
+                        "Local  {}  {}",
+                        fmt::terminal_text(&settings.device.name),
+                        settings.device.id
+                    );
+                    let discovered: std::collections::HashSet<_> =
+                        devices::discover_ssh_hosts()?.into_iter().collect();
+                    for host in &settings.ssh_hosts {
+                        let state =
+                            if discovered.contains(host) { "ssh config" } else { "direct host" };
+                        println!("SSH    {host}  {state}");
+                    }
+                    if settings.ssh_hosts.is_empty() {
+                        println!("No SSH devices added.");
+                    }
+                    println!("Config {}", paths::settings_file()?.display());
+                }
+                DeviceCommand::Add { host } => {
+                    settings::validate_ssh_alias(&host)?;
+                    if settings.enable_ssh_host(host.clone())? {
+                        settings.save()?;
+                        println!("Added SSH device {host}. Run `readout sync` to fetch usage.");
+                    } else {
+                        println!("SSH device {host} is already added.");
+                    }
+                }
+                DeviceCommand::Remove { host } => {
+                    anyhow::ensure!(
+                        settings.disable_ssh_host(&host),
+                        "unknown SSH device `{host}`"
+                    );
+                    settings.save()?;
+                    println!("Removed SSH device {host}.");
+                }
+                DeviceCommand::Rename { name } => {
+                    settings.set_device_name(name.clone())?;
+                    settings.save()?;
+                    println!("Renamed the local device to {}.", fmt::terminal_text(&name));
+                }
+            }
+            Ok(())
+        }
         Some(Command::ProjectAlias { action }) => {
             match action {
                 ProjectAliasCommand::Set { name, path } => {
@@ -457,5 +519,23 @@ mod tests {
         assert!(parse_days("-7").is_err());
         assert!(parse_days("36501").is_err());
         assert!(parse_days("nope").is_err());
+    }
+
+    #[test]
+    fn device_management_commands_are_exposed_by_the_cli() {
+        assert!(matches!(
+            Cli::try_parse_from(["readout", "device", "add", "workstation"])
+                .unwrap()
+                .command,
+            Some(Command::Device { action: DeviceCommand::Add { host } })
+                if host == "workstation"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["readout", "device", "rename", "laptop"])
+                .unwrap()
+                .command,
+            Some(Command::Device { action: DeviceCommand::Rename { name } })
+                if name == "laptop"
+        ));
     }
 }

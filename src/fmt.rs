@@ -129,6 +129,12 @@ pub fn terminal_text(s: &str) -> String {
     s.chars().map(|c| if c.is_control() || is_bidi_control(c) { '�' } else { c }).collect()
 }
 
+/// 状态栏只有一行，先放根因才能避免外层上下文把真正的 SSH/DNS/权限错误截掉。
+pub fn error_chain(error: &anyhow::Error) -> String {
+    let parts: Vec<_> = error.chain().rev().map(|part| terminal_text(&part.to_string())).collect();
+    parts.join(" · ")
+}
+
 pub fn terminal_ellipsize(s: &str, max: usize) -> String {
     ellipsize(&terminal_text(s), max)
 }
@@ -229,6 +235,17 @@ mod tests {
         assert!(!safe.chars().any(char::is_control));
         assert!(!safe.contains('\u{202e}'));
         assert_eq!(safe, "ok��]8;;https://evil�x�txt");
+    }
+
+    #[test]
+    fn error_chains_put_the_actionable_root_cause_first() {
+        use anyhow::Context as _;
+
+        let error = Err::<(), _>(anyhow::anyhow!("DNS lookup failed"))
+            .context("syncing host")
+            .context("validating device")
+            .unwrap_err();
+        assert_eq!(error_chain(&error), "DNS lookup failed · syncing host · validating device");
     }
 
     #[test]

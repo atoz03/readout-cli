@@ -15,7 +15,7 @@ every test is a `#[cfg(test)] mod tests` next to the code it covers.
 ```sh
 cargo build
 cargo run -- summary --json               # scriptable output
-cargo test --all-targets                  # ~140 tests, about a second
+cargo test --all-targets                  # ~210 tests, about a second
 cargo test dedup                          # one test / substring
 cargo test --release                      # see below — not redundant
 cargo fmt --all --check
@@ -58,7 +58,7 @@ writes a real `~/.config/readout/settings.json` on the machine running the test.
 | `READOUT_CODEX_DIR` | the `~/.codex/sessions` tree |
 | `READOUT_STATE_DIR` | the cache, remote snapshots and `pricing.json` (default `~/.cache/readout/`) |
 | `READOUT_CONFIG_DIR` | `settings.json` (default `~/.config/readout/`) |
-| `READOUT_SSH_CONFIG` | the `~/.ssh/config` the Devices page reads Host aliases from |
+| `READOUT_SSH_CONFIG` | SSH config used for Host discovery and passed to OpenSSH with `-F` |
 
 ## Architecture
 
@@ -92,6 +92,28 @@ key per event on every 5s watch tick to compare against nothing. With hosts
 enabled it folds each `~/.cache/readout/remotes/*.json` snapshot in by content
 addressed id, so a transcript present on two machines is billed once and lands
 in the `@shared` bucket rather than being attributed to either.
+
+Device identity has two deliberately separate fields. The ID is generated once
+and never changes; the display name defaults from the operating system hostname
+and can be edited in Settings or with `readout device rename`. Never infer the
+local device from an SSH Host alias: aliases are user connection labels and may
+point back to the current machine. The legacy `this-device` placeholder may be
+migrated to the native hostname, but that migration must preserve the ID and
+must not overwrite an explicit user name.
+
+Devices lists only the local record and hosts explicitly persisted in
+`settings.json`. SSH config discovery belongs behind `Add SSH device…`, where it
+is searchable; a large config must not become a large default dashboard. A
+direct hostname is also valid even when absent from SSH config. When
+`READOUT_SSH_CONFIG` is set, pass it to OpenSSH with `-F` as well as using it for
+discovery, otherwise tests and real connections observe different configs.
+
+Remote update first runs `readout update`. A nonzero remote-command exit may
+fall back to the official Unix and Windows installers because pre-0.2.4 hosts do
+not have that subcommand. OpenSSH exit 255, spawn failures and timeouts are
+transport failures: return their root cause immediately instead of reconnecting
+with more installer commands. TUI status lines use the root-first error chain so
+DNS and authentication details survive the one-line width limit.
 
 Those snapshots are cache, and fail like cache: one that will not parse, or that
 claims the local device id, takes its own row out (`DeviceRecord::problem`) and

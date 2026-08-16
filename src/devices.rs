@@ -37,6 +37,25 @@ const MAX_SSH_CONFIG_FILES: usize = 64;
 const MAX_SSH_CONFIG_DEPTH: usize = 8;
 const MAX_SSH_WORKERS: usize = 8;
 
+#[derive(Debug)]
+struct SshExitError {
+    code: Option<i32>,
+    status: String,
+    detail: String,
+}
+
+impl std::fmt::Display for SshExitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.detail.is_empty() {
+            write!(formatter, "ssh exited with {}", self.status)
+        } else {
+            write!(formatter, "ssh exited with {}: {}", self.status, self.detail)
+        }
+    }
+}
+
+impl std::error::Error for SshExitError {}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BundleEvent {
     pub id: String,
@@ -63,7 +82,7 @@ pub struct UsageBundle {
 pub struct DeviceRecord {
     pub id: String,
     pub name: String,
-    /// `~/.ssh/config` 中用于连接此设备的 Host 别名；本机为 None。
+    /// 用于连接此设备的 SSH config Host 别名或直接主机名；本机为 None。
     pub host: Option<String>,
     pub exporter_version: Option<String>,
     pub generated_at: i64,
@@ -93,13 +112,7 @@ pub struct SyncReport {
 /// 懒加载用户 SSH config，只返回可以直接传给 `ssh` 的具体 Host 别名。
 /// HostName、User、IdentityFile、ProxyCommand 等连接细节从不进入 readout 配置。
 pub fn discover_ssh_hosts() -> Result<Vec<String>> {
-    let path = match std::env::var("READOUT_SSH_CONFIG") {
-        Ok(path) => PathBuf::from(path),
-        Err(_) => {
-            let Some(home) = dirs::home_dir() else { return Ok(Vec::new()) };
-            home.join(".ssh").join("config")
-        }
-    };
+    let Some(path) = ssh_config_path() else { return Ok(Vec::new()) };
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -109,6 +122,13 @@ pub fn discover_ssh_hosts() -> Result<Vec<String>> {
     let mut hosts: Vec<_> = state.hosts.into_iter().collect();
     hosts.sort();
     Ok(hosts)
+}
+
+fn ssh_config_path() -> Option<PathBuf> {
+    std::env::var("READOUT_SSH_CONFIG")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".ssh").join("config")))
 }
 
 #[derive(Default)]
@@ -409,7 +429,7 @@ pub fn load_usage(
             Ok(Some(device)) => devices.push(device),
             Ok(None) => devices.push(unavailable_device(host, None)),
             Err(error) => {
-                let problem = crate::fmt::terminal_text(&format!("{error:#}"));
+                let problem = crate::fmt::error_chain(&error);
                 warnings.push(format!("{host}: {problem}"));
                 devices.push(unavailable_device(host, Some(problem)));
             }
@@ -710,28 +730,16 @@ pub fn sync_all(settings: &Settings, only: Option<&str>) -> Result<SyncReport> {
         .filter(|host| only.is_none_or(|name| host.as_str() == name))
         .collect();
     anyhow::ensure!(!hosts.is_empty(), "no SSH devices are enabled");
-    let discovered: HashSet<_> = discover_ssh_hosts()?.into_iter().collect();
-
     let results: Vec<_> = ssh_pool().install(|| {
-        hosts
-            .par_iter()
-            .map(|host| {
-                let result = if discovered.contains(host.as_str()) {
-                    fetch_and_save(settings, host)
-                } else {
-                    Err(anyhow::anyhow!("SSH Host is no longer present in ~/.ssh/config"))
-                };
-                ((*host).clone(), result)
-            })
-            .collect()
+        hosts.par_iter().map(|host| ((*host).clone(), fetch_and_save(settings, host))).collect()
     });
     let mut report = SyncReport::default();
     for (host, result) in results {
         match result {
             Ok(()) => report.synced.push(host),
-            Err(error) => report
-                .failed
-                .push(format!("{host}: {}", crate::fmt::terminal_text(&format!("{error:#}")))),
+            Err(error) => {
+                report.failed.push(format!("{host}: {}", crate::fmt::error_chain(&error)))
+            }
         }
     }
     Ok(report)
@@ -751,7 +759,6 @@ fn ssh_pool() -> &'static rayon::ThreadPool {
 /// 首次连接只在远端成功导出兼容 bundle 后保存快照；是否启用由调用方随后持久化。
 pub fn sync_host(settings: &Settings, host: &str) -> Result<SyncReport> {
     crate::settings::validate_ssh_alias(host)?;
-    ensure_ssh_host_discovered(host)?;
     fetch_and_save(settings, host).with_context(|| format!("validating SSH Host `{host}`"))?;
     Ok(SyncReport { synced: vec![host.to_string()], failed: Vec::new() })
 }
@@ -769,22 +776,76 @@ fn fetch_and_save(settings: &Settings, host: &str) -> Result<()> {
 /// 远端升级是用户在 Devices 页明确选择的操作；升级后调用方会再次执行协议握手。
 pub fn update_remote(host: &str) -> Result<()> {
     crate::settings::validate_ssh_alias(host)?;
-    ensure_ssh_host_discovered(host)?;
-    run_ssh(host, "readout update", MAX_SSH_ERROR_BYTES, SSH_UPDATE_TIMEOUT)
-        .with_context(|| {
-            format!(
-                "updating `{host}`; older releases without `readout update` need one manual installer run"
-            )
-        })?;
-    Ok(())
+    match run_ssh(host, "readout update", MAX_SSH_ERROR_BYTES, SSH_UPDATE_TIMEOUT) {
+        Ok(_) => Ok(()),
+        Err(direct_error) if ssh_failure_allows_bootstrap(&direct_error) => {
+            // 0.2.4 是第一个带 update/export 的版本。远端缺少 readout 或仍是
+            // 0.2.3 时，先调用 update 必然失败；用户已经在 TUI 中按两次 u 明确
+            // 确认，所以这里可以用同一官方安装器完成一次 bootstrap。
+            let bootstrap = remote_bootstrap_command();
+            match run_ssh(host, &bootstrap, MAX_SSH_ERROR_BYTES, SSH_UPDATE_TIMEOUT) {
+                Ok(_) => Ok(()),
+                Err(unix_error) if ssh_failure_allows_bootstrap(&unix_error) => {
+                    let windows_bootstrap = remote_windows_bootstrap_command();
+                    run_ssh(host, &windows_bootstrap, MAX_SSH_ERROR_BYTES, SSH_UPDATE_TIMEOUT)
+                        .with_context(|| {
+                            let direct = crate::fmt::error_chain(&direct_error);
+                            let unix = crate::fmt::error_chain(&unix_error);
+                            format!(
+                                "updating `{host}`; `readout update` failed ({direct}); \
+                             Unix installer failed ({unix}); Windows installer also failed"
+                            )
+                        })?;
+                    Ok(())
+                }
+                Err(unix_error) => Err(unix_error).with_context(|| {
+                    let direct = crate::fmt::error_chain(&direct_error);
+                    format!(
+                        "updating `{host}`; `readout update` failed ({direct}); \
+                         the Unix installer connection also failed"
+                    )
+                }),
+            }
+        }
+        Err(error) => Err(error).with_context(|| format!("updating `{host}`")),
+    }
 }
 
-fn ensure_ssh_host_discovered(host: &str) -> Result<()> {
-    anyhow::ensure!(
-        discover_ssh_hosts()?.iter().any(|item| item == host),
-        "SSH Host `{host}` is not present in ~/.ssh/config"
-    );
-    Ok(())
+/// OpenSSH 用 255 表示连接、认证或协议错误；只有远端命令自己的非零退出码才说明
+/// 连接已经建立，可以安全地换一条安装命令重试。
+fn ssh_failure_allows_bootstrap(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<SshExitError>().is_some_and(|failure| failure.code != Some(255))
+}
+
+fn remote_bootstrap_command() -> String {
+    let url = crate::updater::UNIX_INSTALLER_URL;
+    format!(
+        "readout_path=$(command -v readout 2>/dev/null || true); \
+         install_dir=; \
+         if [ -n \"$readout_path\" ]; then install_dir=$(dirname \"$readout_path\"); fi; \
+         tmp=$(mktemp \"${{TMPDIR:-/tmp}}/readout-bootstrap.XXXXXX\") || exit 1; \
+         trap 'rm -f \"$tmp\"' EXIT HUP INT TERM; \
+         if command -v curl >/dev/null 2>&1 && curl -fsSL '{url}' -o \"$tmp\"; \
+         then :; \
+         elif command -v wget >/dev/null 2>&1 && wget -qO \"$tmp\" '{url}'; \
+         then :; \
+         else echo 'readout bootstrap: could not download the installer with curl or wget' >&2; \
+         exit 1; fi; \
+         if [ -n \"$install_dir\" ]; \
+         then READOUT_INSTALL_DIR=\"$install_dir\" sh \"$tmp\"; \
+         else sh \"$tmp\"; fi"
+    )
+}
+
+fn remote_windows_bootstrap_command() -> String {
+    let url = crate::updater::WINDOWS_INSTALLER_URL;
+    format!(
+        "powershell.exe -NoProfile -NonInteractive -Command \
+         \"$ErrorActionPreference='Stop'; \
+         $readout=Get-Command readout -ErrorAction SilentlyContinue; \
+         if ($null -ne $readout) {{ $env:READOUT_INSTALL_DIR=Split-Path $readout.Source }}; \
+         Invoke-RestMethod '{url}' -UseBasicParsing | Invoke-Expression\""
+    )
 }
 
 fn snapshot_path(host: &str) -> Result<PathBuf> {
@@ -798,7 +859,7 @@ fn fetch_remote(host: &str) -> Result<UsageBundle> {
     let stdout = run_ssh(host, "readout export", MAX_BUNDLE_BYTES as usize, SSH_TIMEOUT)
         .with_context(|| {
             format!(
-                "remote readout on `{host}` is missing or incompatible; install the current release once, or run `readout update` there"
+                "remote readout on `{host}` is missing or incompatible; install/update it from the Devices page or run the current installer there"
             )
         })?;
     UsageBundle::from_slice(&stdout).with_context(|| {
@@ -813,7 +874,9 @@ fn run_ssh(
     output_limit: usize,
     timeout: Duration,
 ) -> Result<Vec<u8>> {
-    let mut child = Command::new("ssh")
+    let config_override = std::env::var("READOUT_SSH_CONFIG").ok().map(PathBuf::from);
+    let mut command = ssh_command(config_override.as_deref());
+    let mut child = command
         .args([
             "-T",
             "-o",
@@ -866,12 +929,17 @@ fn run_ssh(
     let stderr = err_thread.join().map_err(|_| anyhow::anyhow!("ssh stderr reader stopped"))??;
     if !status.success() {
         let detail = crate::fmt::terminal_text(String::from_utf8_lossy(&stderr).trim());
-        if detail.is_empty() {
-            anyhow::bail!("ssh exited with {status}");
-        }
-        anyhow::bail!("ssh exited with {status}: {detail}");
+        return Err(SshExitError { code: status.code(), status: status.to_string(), detail }.into());
     }
     Ok(stdout)
+}
+
+fn ssh_command(config_override: Option<&Path>) -> Command {
+    let mut command = Command::new("ssh");
+    if let Some(path) = config_override {
+        command.arg("-F").arg(path);
+    }
+    command
 }
 
 /// 持续排空管道但只保留有限字节，避免远端输出控制内存或堵住子进程。
@@ -1135,5 +1203,44 @@ mod tests {
             ssh_directive(&ssh_config_words("Include=conf.d/*.conf")).unwrap(),
             ("Include", vec!["conf.d/*.conf"])
         );
+    }
+
+    #[test]
+    fn a_custom_ssh_config_is_passed_to_openssh() {
+        let command = ssh_command(Some(Path::new("/tmp/readout test/config")));
+        let args: Vec<_> = command.get_args().map(|arg| arg.to_string_lossy()).collect();
+        assert_eq!(args, vec!["-F", "/tmp/readout test/config"]);
+    }
+
+    #[test]
+    fn remote_bootstrap_uses_the_official_installer_and_preserves_the_install_dir() {
+        let command = remote_bootstrap_command();
+        assert!(command.contains(crate::updater::UNIX_INSTALLER_URL));
+        assert!(command.contains("command -v readout"));
+        assert!(command.contains("READOUT_INSTALL_DIR"));
+        assert!(command.contains("curl"));
+        assert!(command.contains("wget"));
+
+        let windows = remote_windows_bootstrap_command();
+        assert!(windows.contains(crate::updater::WINDOWS_INSTALLER_URL));
+        assert!(windows.contains("powershell.exe"));
+        assert!(windows.contains("READOUT_INSTALL_DIR"));
+    }
+
+    #[test]
+    fn bootstrap_retries_only_remote_command_failures_not_ssh_transport_failures() {
+        let remote_command = anyhow::Error::new(SshExitError {
+            code: Some(127),
+            status: "exit status: 127".into(),
+            detail: "readout: command not found".into(),
+        });
+        let transport = anyhow::Error::new(SshExitError {
+            code: Some(255),
+            status: "exit status: 255".into(),
+            detail: "Could not resolve hostname".into(),
+        });
+        assert!(ssh_failure_allows_bootstrap(&remote_command));
+        assert!(!ssh_failure_allows_bootstrap(&transport));
+        assert!(!ssh_failure_allows_bootstrap(&anyhow::anyhow!("ssh command timed out")));
     }
 }

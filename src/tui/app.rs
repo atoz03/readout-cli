@@ -260,6 +260,15 @@ pub struct App {
     pub device_summary: Summary,
     pub settings: Settings,
     pub settings_path: String,
+    settings_file: Option<std::path::PathBuf>,
+    /// Settings 内的本机名称编辑器。名称是用户可改的显示信息，稳定 device ID 不变。
+    pub device_name_editor: bool,
+    pub device_name_input: String,
+    /// SSH config 中发现但尚未添加的 Host。默认 Devices 列表不展示它们；只有用户
+    /// 进入 Add SSH device 后才作为可搜索候选出现。
+    pub available_ssh_hosts: Vec<String>,
+    pub device_picker: bool,
+    pub device_query: String,
     /// SSH config 按需读取一次，不进入主页面首帧的热路径。
     pub ssh_hosts_loaded: bool,
     /// 打开 Devices 页时是否真的去读 `~/.ssh/config`。测试关掉它，断言才不会
@@ -320,6 +329,9 @@ impl App {
     pub fn new(sources: Vec<Source>, base: Filter, pricing: Pricing) -> Self {
         let mut app = Self::with_settings(sources, base, pricing, Settings::default());
         app.discover_ssh_hosts = false;
+        // 单元测试不应因为一次设置交互写入开发者的真实配置；需要验证持久化的测试
+        // 会显式提供自己的临时路径。
+        app.settings_file = None;
         app
     }
 
@@ -333,9 +345,11 @@ impl App {
         // the header said otherwise. Land on the chip that matches.
         let today = chrono::Local::now().date_naive();
         let range = Range::for_days(base.since.map(|s| (today - s).num_days() + 1));
-        let settings_path = crate::paths::settings_file()
+        let settings_file = crate::paths::settings_file().ok();
+        let settings_path = settings_file
+            .as_ref()
             .map(|path| path.display().to_string())
-            .unwrap_or_else(|_| "unavailable".into());
+            .unwrap_or_else(|| "unavailable".into());
         App {
             page: Page::Overview,
             range,
@@ -362,6 +376,12 @@ impl App {
             device_summary: Summary::default(),
             settings,
             settings_path,
+            settings_file,
+            device_name_editor: false,
+            device_name_input: String::new(),
+            available_ssh_hosts: Vec::new(),
+            device_picker: false,
+            device_query: String::new(),
             ssh_hosts_loaded: false,
             discover_ssh_hosts: true,
             update_armed: None,
@@ -554,23 +574,8 @@ impl App {
             device.discovered = host.is_some_and(|host| hosts.iter().any(|item| item == host));
             device.enabled = host.is_some_and(|host| self.settings.ssh_host_enabled(host));
         }
-        for host in hosts {
-            if self.devices.iter().any(|device| device.host.as_deref() == Some(&host)) {
-                continue;
-            }
-            self.devices.push(DeviceRecord {
-                id: format!("ssh:{host}"),
-                name: host.clone(),
-                host: Some(host.clone()),
-                exporter_version: None,
-                generated_at: 0,
-                is_local: false,
-                available: false,
-                enabled: self.settings.ssh_host_enabled(&host),
-                discovered: true,
-                problem: None,
-            });
-        }
+        self.available_ssh_hosts =
+            hosts.into_iter().filter(|host| !self.settings.ssh_host_enabled(host)).collect();
         self.devices.sort_by(|a, b| {
             b.is_local.cmp(&a.is_local).then_with(|| {
                 a.host.as_deref().unwrap_or(&a.name).cmp(b.host.as_deref().unwrap_or(&b.name))
@@ -591,7 +596,7 @@ impl App {
             Page::Replay => self.replay.data.as_ref().map_or(0, |replay| replay.events.len()),
             Page::Devices => self.device_row_count(),
             Page::Pricing => self.pricing.known_models().len(),
-            Page::Settings => 1,
+            Page::Settings => usize::from(!self.device_name_editor) * 5,
         }
     }
 
@@ -606,6 +611,12 @@ impl App {
     }
 
     pub fn set_page(&mut self, page: Page) {
+        if self.page == Page::Devices && page != Page::Devices {
+            self.cancel_device_picker();
+        }
+        if self.page == Page::Settings && page != Page::Settings {
+            self.cancel_device_name_editor();
+        }
         if self.page != page {
             self.page = page;
             self.selected = 0;
@@ -714,11 +725,22 @@ impl App {
             Page::Sessions => self.open_session(self.selected),
             Page::Replay => self.seek_replay(self.selected),
             Page::Devices => {
+                if self.device_picker {
+                    let host = self.selected_ssh_host();
+                    if let Some(host) = host {
+                        self.request_device(DeviceRequest::ConnectHost(host));
+                    }
+                    return;
+                }
                 let Some(record) = self.devices.get(self.selected).cloned() else {
-                    if self.selected == self.devices.len() && self.has_shared_device() {
+                    let shared_index = self.devices.len();
+                    let add_index = shared_index + usize::from(self.has_shared_device());
+                    if self.selected == shared_index && self.has_shared_device() {
                         self.set_drill(Drill::Device(SHARED_DEVICE_ID.into()));
                         self.status = Some("showing copied history".into());
                         self.set_page(Page::Overview);
+                    } else if self.selected == add_index {
+                        self.begin_device_picker();
                     }
                     return;
                 };
@@ -729,9 +751,7 @@ impl App {
                     self.set_page(Page::Overview);
                     return;
                 };
-                if !record.discovered {
-                    self.status = Some(format!("SSH Host `{host}` is no longer in your config"));
-                } else if !record.enabled {
+                if !record.enabled {
                     self.request_device(DeviceRequest::ConnectHost(host));
                 // 快照坏掉的设备 available 为 false，所以 Enter 落在这里重新同步 ——
                 // 重建那份快照正是唯一的修法。
@@ -851,22 +871,183 @@ impl App {
     }
 
     pub fn device_row_count(&self) -> usize {
-        self.devices.len() + usize::from(self.has_shared_device())
+        if self.device_picker {
+            self.device_candidates().len()
+        } else {
+            self.devices.len() + usize::from(self.has_shared_device()) + 1
+        }
+    }
+
+    pub fn device_candidates(&self) -> Vec<String> {
+        let query = self.device_query.to_ascii_lowercase();
+        let mut candidates: Vec<_> = self
+            .available_ssh_hosts
+            .iter()
+            .filter(|host| query.is_empty() || host.to_ascii_lowercase().contains(&query))
+            .cloned()
+            .collect();
+        let manual = self.device_query.trim();
+        if candidates.is_empty()
+            && crate::settings::validate_ssh_alias(manual).is_ok()
+            && !self.settings.ssh_host_enabled(manual)
+        {
+            candidates.push(manual.to_string());
+        }
+        candidates
+    }
+
+    pub fn begin_device_picker(&mut self) {
+        self.device_picker = true;
+        self.device_query.clear();
+        self.selected = 0;
+        self.scroll = 0;
+        self.status =
+            Some("type to filter SSH hosts · Enter connect · Ctrl+u install · Esc back".into());
+        self.needs_redraw = true;
+    }
+
+    pub fn cancel_device_picker(&mut self) {
+        if self.device_picker {
+            self.device_picker = false;
+            self.device_query.clear();
+            self.selected = 0;
+            self.scroll = 0;
+            self.disarm_update();
+            self.needs_redraw = true;
+        }
+    }
+
+    pub fn push_device_query(&mut self, ch: char) {
+        if !ch.is_control() && self.device_query.len() < 255 {
+            self.device_query.push(ch);
+            self.selected = 0;
+            self.scroll = 0;
+            self.disarm_update();
+            self.needs_redraw = true;
+        }
+    }
+
+    pub fn pop_device_query(&mut self) {
+        if self.device_query.pop().is_some() {
+            self.selected = 0;
+            self.scroll = 0;
+            self.disarm_update();
+            self.needs_redraw = true;
+        }
+    }
+
+    fn selected_ssh_host(&self) -> Option<String> {
+        if self.device_picker {
+            self.device_candidates().get(self.selected).cloned()
+        } else {
+            self.devices.get(self.selected).and_then(|device| device.host.clone())
+        }
     }
 
     pub fn activate_setting(&mut self, index: usize) {
         let before = self.settings.clone();
         match index {
             0 => self.settings.aggregate_devices = !self.settings.aggregate_devices,
+            1 => {
+                self.begin_device_name_editor();
+                return;
+            }
+            2 => {
+                self.set_page(Page::Devices);
+                self.status = Some("select Add SSH device… or an existing host".into());
+                return;
+            }
+            3 => {
+                self.status =
+                    Some("manage aliases with `readout project-alias set|remove|list`".into());
+                return;
+            }
+            4 => {
+                self.status = Some(format!("settings file: {}", self.settings_path));
+                return;
+            }
             _ => return,
         }
-        if let Err(error) = self.settings.save() {
+        if let Err(error) = self.save_settings() {
             self.settings = before;
             self.status = Some(format!("could not save settings: {error}"));
             return;
         }
         self.status = Some("settings saved".into());
         self.recompute(true);
+    }
+
+    pub fn begin_device_name_editor(&mut self) {
+        self.device_name_editor = true;
+        self.device_name_input.clone_from(&self.settings.device.name);
+        self.selected = 0;
+        self.scroll = 0;
+        self.status = Some("edit the local name · Ctrl+u clear · Enter save · Esc cancel".into());
+        self.needs_redraw = true;
+    }
+
+    pub fn cancel_device_name_editor(&mut self) {
+        if self.device_name_editor {
+            self.device_name_editor = false;
+            self.device_name_input.clear();
+            self.selected = 1;
+            self.scroll = 0;
+            self.needs_redraw = true;
+        }
+    }
+
+    pub fn clear_device_name_input(&mut self) {
+        self.device_name_input.clear();
+        self.needs_redraw = true;
+    }
+
+    pub fn push_device_name_input(&mut self, ch: char) {
+        let next_len = self.device_name_input.len().saturating_add(ch.len_utf8());
+        let text = ch.to_string();
+        let safe = crate::fmt::terminal_text(&text) == text;
+        if !ch.is_control() && safe && next_len <= 128 {
+            self.device_name_input.push(ch);
+            self.needs_redraw = true;
+        }
+    }
+
+    pub fn pop_device_name_input(&mut self) {
+        if self.device_name_input.pop().is_some() {
+            self.needs_redraw = true;
+        }
+    }
+
+    pub fn save_device_name_input(&mut self) {
+        let name = self.device_name_input.trim().to_string();
+        let before = self.settings.clone();
+        if let Err(error) = self.settings.set_device_name(name.clone()) {
+            self.status = Some(format!("invalid device name: {error}"));
+            self.needs_redraw = true;
+            return;
+        }
+        if let Err(error) = self.save_settings() {
+            self.settings = before;
+            self.status = Some(format!("could not save settings: {error}"));
+            self.needs_redraw = true;
+            return;
+        }
+        if let Some(local) = self.devices.iter_mut().find(|device| device.is_local) {
+            local.name.clone_from(&name);
+        }
+        self.device_name_editor = false;
+        self.device_name_input.clear();
+        self.selected = 1;
+        self.scroll = 0;
+        self.status = Some(format!("local device renamed to {name}"));
+        self.needs_redraw = true;
+    }
+
+    fn save_settings(&self) -> anyhow::Result<()> {
+        let path = self
+            .settings_file
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("settings path is unavailable"))?;
+        self.settings.save_to(path)
     }
 
     pub fn request_sync(&mut self) {
@@ -900,23 +1081,22 @@ impl App {
     /// 第一次按 `u` 只是把这台设备装上膛，第二次才真的执行。远端升级会下载并运行
     /// 官方安装器，替换掉另一台机器上的二进制——这类动作值得一次明确确认。
     pub fn update_selected_device(&mut self) {
-        let Some(device) = self.devices.get(self.selected) else {
-            self.status = Some("select an SSH device to update".into());
-            return;
-        };
-        let Some(host) = device.host.clone() else {
+        if !self.device_picker
+            && self.devices.get(self.selected).is_some_and(|device| device.is_local)
+        {
             self.status =
                 Some("the local device uses `readout update` outside the dashboard".into());
             return;
-        };
-        if !device.discovered {
-            self.status = Some(format!("SSH Host `{host}` is no longer in your config"));
-            return;
         }
+        let Some(host) = self.selected_ssh_host() else {
+            self.status = Some("select an SSH device to update".into());
+            return;
+        };
         if self.update_armed.as_deref() != Some(host.as_str()) {
             self.update_armed = Some(host.clone());
+            let key = if self.device_picker { "Ctrl+u" } else { "u" };
             self.status =
-                Some(format!("press u again to run the installer on {host}, or Esc to cancel"));
+                Some(format!("press {key} again to run the installer on {host}, or Esc to cancel"));
             self.needs_redraw = true;
             return;
         }
@@ -933,6 +1113,10 @@ impl App {
     }
 
     pub fn disable_selected_device(&mut self) {
+        if self.device_picker {
+            self.status = Some("press Esc to leave the device picker".into());
+            return;
+        }
         let Some(host) = self.devices.get(self.selected).and_then(|device| device.host.clone())
         else {
             self.status = Some("select an enabled SSH device to disable".into());
@@ -997,6 +1181,9 @@ impl App {
         } else {
             format!("connected {host}")
         });
+        self.device_picker = false;
+        self.device_query.clear();
+        self.available_ssh_hosts.retain(|item| item != host);
         self.request_rescan(Rescan::Watch);
     }
 
@@ -1375,6 +1562,48 @@ mod tests {
     }
 
     #[test]
+    fn every_user_can_rename_the_local_device_in_settings_without_changing_its_id() {
+        let mut a = App::new(Source::ALL.to_vec(), Filter::default(), Pricing::builtin());
+        let id = a.settings.device.id.clone();
+        let path = std::env::temp_dir()
+            .join(format!("readout-tui-device-name-{}.json", std::process::id()));
+        a.settings_file = Some(path.clone());
+        a.page = Page::Settings;
+        a.selected = 1;
+        a.activate_selected();
+        assert!(a.device_name_editor);
+        assert_eq!(a.device_name_input, a.settings.device.name);
+
+        a.clear_device_name_input();
+        a.save_device_name_input();
+        assert!(a.device_name_editor, "an invalid empty name stays in the editor");
+        assert!(a.status.as_deref().is_some_and(|status| status.contains("invalid")));
+
+        for ch in "workstation".chars() {
+            a.push_device_name_input(ch);
+        }
+        a.save_device_name_input();
+        assert!(!a.device_name_editor);
+        assert_eq!(a.settings.device.name, "workstation");
+        assert_eq!(a.settings.device.id, id);
+        assert_eq!(a.devices[0].name, "workstation");
+        let persisted = Settings::load_from(&path).unwrap();
+        assert_eq!(persisted.device.name, "workstation");
+        assert_eq!(persisted.device.id, id);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn the_ssh_settings_row_opens_the_shared_device_management_flow() {
+        let mut a = App::new(Source::ALL.to_vec(), Filter::default(), Pricing::builtin());
+        a.page = Page::Settings;
+        a.selected = 2;
+        a.activate_selected();
+        assert_eq!(a.page, Page::Devices);
+        assert_eq!(a.status.as_deref(), Some("select Add SSH device… or an existing host"));
+    }
+
+    #[test]
     fn an_all_time_chart_window_is_bounded() {
         assert_eq!(Range::D7.chart_days(0), 7);
         assert_eq!(Range::All.chart_days(0), 30, "no data means a default window");
@@ -1424,7 +1653,10 @@ mod tests {
         let mut a = App::new(Source::ALL.to_vec(), Filter::default(), Pricing::builtin());
         a.apply_discovered_ssh_hosts(vec!["workstation".into()]);
         a.page = Page::Devices;
+        assert_eq!(a.devices.len(), 1, "unconfigured hosts stay out of the main list");
         a.selected = 1;
+        a.activate_selected();
+        assert!(a.device_picker);
         a.activate_selected();
 
         assert!(!a.settings.ssh_host_enabled("workstation"));
@@ -1433,7 +1665,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_hosts_missing_from_ssh_config_stay_visible_but_cannot_connect() {
+    fn configured_direct_hosts_stay_visible_and_can_sync_without_ssh_config() {
         let mut settings = Settings::default();
         settings.enable_ssh_host("old-host".into()).unwrap();
         let mut a = App::with_settings(
@@ -1449,7 +1681,7 @@ mod tests {
             exporter_version: Some("0.2.3".into()),
             generated_at: 1,
             is_local: false,
-            available: true,
+            available: false,
             enabled: true,
             discovered: true,
             problem: None,
@@ -1459,8 +1691,8 @@ mod tests {
         a.selected = 1;
         a.activate_selected();
 
-        assert!(a.device_requested.is_none());
-        assert!(a.status.as_deref().is_some_and(|status| status.contains("no longer")));
+        assert_eq!(a.device_requested, Some(DeviceRequest::SyncHost("old-host".into())));
+        assert_eq!(a.status.as_deref(), Some("syncing old-host…"));
     }
 
     #[test]
@@ -1470,12 +1702,12 @@ mod tests {
         let mut a = App::new(Source::ALL.to_vec(), Filter::default(), Pricing::builtin());
         a.apply_discovered_ssh_hosts(vec!["gpu-01".into(), "workstation".into()]);
         a.page = Page::Devices;
-        a.selected = 1;
+        a.begin_device_picker();
 
         a.update_selected_device();
         assert!(a.device_requested.is_none(), "the first press only arms it");
         assert_eq!(a.update_armed.as_deref(), Some("gpu-01"));
-        assert!(a.status.as_deref().is_some_and(|status| status.contains("press u again")));
+        assert!(a.status.as_deref().is_some_and(|status| status.contains("press Ctrl+u again")));
 
         a.move_selection(1);
         a.update_selected_device();
@@ -1485,6 +1717,43 @@ mod tests {
         a.update_selected_device();
         assert_eq!(a.device_requested, Some(DeviceRequest::UpdateHost("workstation".into())));
         assert!(a.update_armed.is_none());
+    }
+
+    #[test]
+    fn the_device_picker_filters_large_host_lists_without_changing_settings() {
+        let mut a = App::new(Source::ALL.to_vec(), Filter::default(), Pricing::builtin());
+        a.apply_discovered_ssh_hosts(vec![
+            "gpu-01".into(),
+            "gpu-02".into(),
+            "laptop".into(),
+            "workstation".into(),
+        ]);
+        a.page = Page::Devices;
+        a.begin_device_picker();
+        a.push_device_query('g');
+        a.push_device_query('p');
+        a.push_device_query('u');
+
+        assert_eq!(a.device_candidates(), vec!["gpu-01", "gpu-02"]);
+        assert!(a.settings.ssh_hosts.is_empty());
+        a.pop_device_query();
+        assert_eq!(a.device_candidates().len(), 2);
+        a.cancel_device_picker();
+        assert!(!a.device_picker);
+        assert_eq!(a.device_row_count(), 2, "local row plus explicit add row");
+    }
+
+    #[test]
+    fn the_device_picker_accepts_a_safe_hostname_not_present_in_ssh_config() {
+        let mut a = App::new(Source::ALL.to_vec(), Filter::default(), Pricing::builtin());
+        a.page = Page::Devices;
+        a.begin_device_picker();
+        for ch in "server-42".chars() {
+            a.push_device_query(ch);
+        }
+        assert_eq!(a.device_candidates(), vec!["server-42"]);
+        a.activate_selected();
+        assert_eq!(a.device_requested, Some(DeviceRequest::ConnectHost("server-42".into())));
     }
 
     #[test]

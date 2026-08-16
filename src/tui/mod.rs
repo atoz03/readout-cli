@@ -222,7 +222,7 @@ fn spawn_device(settings: Settings, request: DeviceRequest) -> Receiver<DeviceMs
         };
         let message = match result {
             Ok(message) => message,
-            Err(error) => DeviceMsg::Failed(error.to_string()),
+            Err(error) => DeviceMsg::Failed(crate::fmt::error_chain(&error)),
         };
         let _ = tx.send(message);
     });
@@ -430,6 +430,12 @@ fn on_key(app: &mut App, k: KeyEvent) {
     if k.modifiers.contains(KeyModifiers::CONTROL) {
         match k.code {
             KeyCode::Char('c') | KeyCode::Char('d') => app.should_quit = true,
+            KeyCode::Char('u') if app.page == Page::Settings && app.device_name_editor => {
+                app.clear_device_name_input();
+            }
+            KeyCode::Char('u') if app.page == Page::Devices && app.device_picker => {
+                app.update_selected_device();
+            }
             _ => {}
         }
         return;
@@ -451,7 +457,48 @@ fn on_key(app: &mut App, k: KeyEvent) {
         }
     }
 
-    if app.page == Page::Devices {
+    if app.page == Page::Settings && app.device_name_editor {
+        match k.code {
+            KeyCode::Esc => {
+                app.cancel_device_name_editor();
+                app.status = Some("device name edit cancelled".into());
+            }
+            KeyCode::Backspace => app.pop_device_name_input(),
+            KeyCode::Enter => app.save_device_name_input(),
+            KeyCode::Char(ch)
+                if !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                app.push_device_name_input(ch);
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    if app.page == Page::Devices && app.device_picker {
+        match k.code {
+            KeyCode::Esc => {
+                app.cancel_device_picker();
+                app.status = Some("device picker closed".into());
+                return;
+            }
+            KeyCode::Backspace => {
+                app.pop_device_query();
+                return;
+            }
+            KeyCode::Enter => {
+                app.activate_selected();
+                return;
+            }
+            KeyCode::Char(ch)
+                if !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                app.push_device_query(ch);
+                return;
+            }
+            _ => {}
+        }
+    } else if app.page == Page::Devices {
         match k.code {
             KeyCode::Char('r') => {
                 app.request_sync();
@@ -662,6 +709,33 @@ mod tests {
             },
         );
         assert!(a.should_quit);
+    }
+
+    #[test]
+    fn the_settings_name_editor_captures_keys_and_renders_the_current_value() {
+        let mut a = app_with_data();
+        a.set_page(Page::Settings);
+        a.begin_device_name_editor();
+        on_key(
+            &mut a,
+            KeyEvent {
+                code: KeyCode::Char('u'),
+                modifiers: KeyModifiers::CONTROL,
+                kind: KeyEventKind::Press,
+                state: event::KeyEventState::NONE,
+            },
+        );
+        for ch in "custom-node".chars() {
+            press(&mut a, KeyCode::Char(ch));
+        }
+        let frame = buffer_text(&render(&mut a, 110, 24));
+        assert!(frame.contains("Rename local device"));
+        assert!(frame.contains("custom-node_"));
+        assert!(!a.should_quit);
+
+        press(&mut a, KeyCode::Esc);
+        assert!(!a.device_name_editor);
+        assert_eq!(a.page, Page::Settings);
     }
 
     #[test]
