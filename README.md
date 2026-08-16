@@ -1,49 +1,36 @@
 # readout
 
+English | [简体中文](README.zh-CN.md)
+
 [![CI](https://github.com/atoz03/readout-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/atoz03/readout-cli/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/readout.svg)](https://crates.io/crates/readout)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A terminal dashboard for what Claude Code and Codex actually cost you.
+A terminal dashboard for Claude Code and Codex usage, sessions, tokens, and
+estimated cost.
 
-`readout` reads the transcripts both tools already write, and reports tokens,
-requests, sessions and estimated spend — by day, by model, by project, by
-session, and by hour of the day. It is a mouse-driven TUI with a plain CLI
-behind it for scripts.
+`readout` reads the local transcripts both tools already write. It provides a
+clickable TUI for exploration and text, JSON, and CSV output for scripts. It
+never proxies requests, reads API credentials, or modifies Claude Code or Codex
+configuration.
 
+```sh
+readout                  # open the dashboard
+readout summary          # print a summary
+readout summary --json   # emit JSON
 ```
-readout                  # the dashboard
-readout summary          # the same numbers, printed
-readout summary --json   # …for a script
-```
 
-## Read-only, by construction
+## Features
 
-`readout` 的 transcript 扫描范围只有两个目录：
+- Break down Claude Code and Codex usage by date, model, project, session, and hour
+- View today, the last 7/30/90 days, or all recorded history
+- Estimate model cost while clearly marking unpriced usage
+- Replay messages and tool calls from local sessions on a timeline
+- Aggregate multiple machines over SSH without double-counting copied transcripts
+- Incrementally scan transcripts and keep the dashboard live at low overhead
+- Export JSON, CSV, and fixed-size dashboard snapshots with consistent CLI filters
 
-- `~/.claude/projects/**/*.jsonl`
-- `~/.codex/sessions/**/*.jsonl` (active sessions only; `archived_sessions/` is
-  intentionally out of scope)
-
-进入 Devices 页面时，它会额外按需读取 `~/.ssh/config` 及其中的 `Include`，只提取
-具体的 `Host` 别名；不会读取或保存密码、私钥、`IdentityFile`、`ProxyCommand` 等连接
-配置，也不会因为发现设备就建立连接。
-
-It never opens `~/.claude/settings.json`, `~/.codex/config.toml`, or
-`~/.codex/auth.json`. Those files hold live API credentials, and nothing here
-needs them — they are not read, not copied, not backed up. Usage cache 和远端
-usage bundle 写入系统 cache 目录下的 `readout/`，持久化设置写入系统 config 目录下的
-`readout/settings.json`（Linux 通常分别是 `~/.cache/readout/` 与
-`~/.config/readout/`）。Neither tool's configuration is modified, so there is
-no way for this to break a working setup.
-
-Session Replay 只在用户打开具体 session 时按需读取消息和工具调用。正文不会写入
-`~/.cache/readout/`；增量缓存仍然只保存 usage 元数据。
-
-Switching providers, editing configs, and proxying requests are deliberately
-out of scope. This tool answers "what did I spend", and nothing else.
-
-## Install
+## Installation
 
 Linux and macOS:
 
@@ -57,345 +44,242 @@ Windows:
 powershell -c "irm https://github.com/atoz03/readout-cli/releases/latest/download/install.ps1 | iex"
 ```
 
-Either one downloads the binary for your platform — into `~/.local/bin`, or
-`%LOCALAPPDATA%\Programs\readout` — checks it against the SHA-256 published with
-the release, and touches nothing else. Neither edits your PATH; if the install
-directory isn't on it, they print the line that adds it. Set
-`READOUT_INSTALL_DIR` to put the binary elsewhere or `READOUT_VERSION` to pin a
-version.
+The installers download a prebuilt binary for the current platform and verify
+its published SHA-256 checksum. Their default destinations are:
 
-From the registry, if you have Rust:
+- Linux/macOS: `~/.local/bin`
+- Windows: `%LOCALAPPDATA%\Programs\readout`
+
+They do not edit `PATH`. If the destination is not already available, the
+installer prints the line needed to add it. Set `READOUT_INSTALL_DIR` to choose
+another directory or `READOUT_VERSION` to pin a release.
+
+Update an existing installation with:
+
+```sh
+readout update
+```
+
+If Rust is installed, readout is also available from crates.io:
 
 ```sh
 cargo install readout
 ```
 
-Or from source:
+Platform archives and checksums are attached to every
+[GitHub Release](https://github.com/atoz03/readout-cli/releases/latest).
+
+## Quick start
 
 ```sh
-git clone https://github.com/atoz03/readout-cli && cd readout-cli
-cargo build --release && ./target/release/readout
+readout                 # all recorded history
+readout -d 30           # the last 30 days
+readout -s claude       # Claude Code only
+readout -s codex        # Codex only
+readout -w              # refresh incrementally every few seconds
 ```
 
-The repository is `readout-cli`; the crate and the command are both `readout`.
+The same filters apply to the dashboard and all reporting commands:
 
-已安装 release 后可原地更新到最新版：
-
-```sh
-readout update
-```
-
-它复用同一套官方安装器和 SHA-256 校验，不在二进制里重复维护下载与解包逻辑。
-
-**Prebuilt binaries** are attached to every [release]: Linux x86-64 and arm64
-(static musl, so the distro doesn't matter), macOS Intel and Apple Silicon, and
-Windows x86-64 — which is what ARM Windows gets too, under emulation, until
-there is an arm64 build. To skip the installers, download the archive and put
-the binary on your PATH yourself. Building from source needs a recent stable
-Rust — the crate is on the 2024 edition and uses let-chains.
-
-[release]: https://github.com/atoz03/readout-cli/releases/latest
-
-## The dashboard
-
-```
-readout            # opens on Overview
-readout -d 30      # start with the window limited to 30 days
-readout -s claude  # one tool only
-readout -w         # keep the numbers live while you work
-```
-
-`-d` opens on the chip that matches, rounding up to the next one when the
-number falls between two — the chips are the only thing naming the active
-window, so the dashboard never shows a window its header disagrees with. The
-text subcommands take `-d` exactly.
-
-Everything on screen that means something is clickable.
-
-| Mouse | |
+| Option | Meaning |
 |---|---|
-| Sidebar entry | switch page |
-| `Today` `7d` `30d` `90d` `All` | change the time window |
-| `● Claude Code` / `● Codex` | include or exclude that tool |
-| A model row | select it; click again to filter the dashboard by it |
-| A project row | open that project's sessions |
-| A session row | open Session Replay |
-| A device row | 已同步设备按设备过滤；`Add SSH device…` 打开可搜索添加器 |
-| Devices card header | sync enabled SSH hosts |
-| A Settings row | toggle the value, edit the local name, or open its management page |
-| Replay controls and timeline events | play/pause, change speed, or seek to an event |
-| A day or rate row | select it |
-| A KPI tile | jump to the page that breaks it down |
-| A card header (`›`) | open the full page for that card |
-| `● live`, bottom right | start or stop watching |
-| The scan summary, bottom right | re-scan |
-| `✕`, top right | quit |
-| Wheel | scroll the focused list |
+| `-d, --days N` | Limit the view to the last N days |
+| `-s, --source claude\|codex` | Include only one tool |
+| `-p, --project PATH` | Include one full project path |
+| `-m, --model MODEL` | Include one model |
+| `--no-cache` | Ignore the incremental cache and parse everything |
 
-| Keys | |
+## Dashboard
+
+The pages move from high-level totals to details, sessions, devices, and
+configuration:
+
+| Page | What it shows |
 |---|---|
-| `↑` `↓` / `j` `k` | move the selection (the window scrolls to follow) |
-| `PgUp` `PgDn` `Home` `End` | move it faster |
-| `Enter` | filter/open the selected row；Devices 中添加/连接 Host；Settings 中编辑或打开管理页 |
-| `Delete` / `Backspace` | 在 Devices 中禁用选中的 SSH Host |
-| `u` | 在 Devices 中升级选中的远端 readout；按两次确认，`Esc` 取消 |
-| Type / `Backspace` | 在 Add SSH device 中过滤 SSH config，或直接输入主机名 |
-| Type / `Backspace` | 在本机名称编辑器中修改显示名 |
-| `Ctrl-U` | 在添加器中安装/升级当前候选（按两次确认），或清空名称编辑器 |
-| `r` | 在 Devices 中异步同步已启用设备；其他页面重新扫描本机 usage |
-| `Esc` | clear that filter |
-| `Tab` / `Shift-Tab`, `←` `→` | change page |
-| `t` / `1` `2` `3` `4` | today / 7d / 30d / 90d / all time |
-| `c` / `x` | toggle Claude Code / Codex |
-| `r` | re-scan |
-| `w` | watch: keep the numbers live |
-| `?` | what's clickable |
-| `q`, `Ctrl-C` | quit |
+| Overview | Tokens, estimated cost, requests, sessions, and recent trends |
+| Daily | Usage by day |
+| Models | Model distribution and pricing coverage |
+| Projects | Projects, with navigation into their sessions |
+| Sessions / Replay | Session usage and local message/tool timelines |
+| Devices | The local machine, configured SSH devices, and sync state |
+| Pricing | Effective model prices |
+| Settings | Aggregation, local identity, devices, aliases, and config paths |
 
-### Session Replay
+Sidebar entries, filters, rows, card headers, and Replay events are clickable.
+The essential keyboard controls are:
 
-项目和 session 现在是明确的两级导航：点击项目进入该项目过滤后的 Sessions，点击
-session 进入独立的 Replay 页面。Replay 会按时间排列用户消息、助手消息、工具调用、
-工具结果和失败结果，并显示可点击的时间轴。
+| Key | Action |
+|---|---|
+| `↑/↓`, `j/k` | Move the selection |
+| `Enter` | Open or confirm the selected row |
+| `Esc` | Go back, clear a filter, or cancel confirmation |
+| `Tab` / `Shift-Tab`, `←/→` | Change page |
+| `t`, `1/2/3/4` | Today, 7 days, 30 days, 90 days, all time |
+| `c/x` | Toggle Claude Code / Codex |
+| `r` | Sync devices on Devices; rescan locally elsewhere |
+| `w` | Toggle watch mode |
+| `u` twice | Update the selected configured remote |
+| `Delete` / `Backspace` | Remove the selected SSH device |
+| `?` | Show contextual help |
+| `q`, `Ctrl-C` | Quit |
 
-Replay 默认暂停在首个事件。`Space` 播放或暂停，`1`/`2`/`4` 切换倍速，`[`/`]`
-逐事件移动，`Esc` 返回当前项目的 Sessions。播放位置、列表选中项和时间轴指示器会
-同步更新；进入页面时沿用 dashboard 的缓入动画。
+Replay starts paused. Press `Space` to play or pause, `1/2/4` to change speed,
+and `[`/`]` to move one event at a time. Remote bundles contain no message
+content, so remote sessions are usage-only; full Replay is available only where
+the transcript itself exists.
 
-远端 bundle 不包含消息或工具正文。远程 session 仍会显示 usage、模型、项目、时间和
-设备，但 Replay 页面会明确标记为 usage-only；只有当前设备持有 active transcript 时
-才会读取完整 Replay。
+## Multiple devices
 
-## 多设备与 SSH
+readout uses OpenSSH to run `readout export` on remote machines. Exported
+bundles contain usage metadata only—never prompts, assistant messages, tool
+arguments, tool results, passwords, or keys.
 
-中心设备默认合并本机 usage 和已经同步的远端 bundle。Bundle 只包含 token、费用所需
-字段、时间、模型、项目和 session ID，不包含 prompt、助手消息、工具参数、工具结果或
-任何认证信息。
+### Add a device
 
-本机身份由“稳定 device ID + 可修改显示名”组成。首次运行时，显示名通过操作系统原生
-hostname API 取得；只有原生读取不可用时才回退到 `COMPUTERNAME`/`HOSTNAME`，不会把
-SSH config 里的某个 Host 猜成本机。旧版本生成的 `this-device` 会在首次读取时迁移为
-系统 hostname，但 device ID 保持不变。机器名不符合用户习惯时，可在 Settings 选中
-`Local device` 按 `Enter` 直接编辑，也可运行 `readout device rename NAME`；改名只影响
-显示和后续导出，不会制造一台“新设备”。
+1. Run `ssh HOST` once to accept the host key and verify authentication.
+2. Open Devices and select `Add SSH device…`.
+3. Search the hosts from `~/.ssh/config`, or type a hostname directly.
+4. If readout is already installed remotely, press `Enter` to validate and add it.
+5. If it is missing, press `Ctrl-U` twice in the picker to install it.
+6. Return to Devices and press `r` to sync all configured machines.
 
-Devices 默认只显示本机和用户已经添加的远端，不会把大型 SSH config 全部铺到主列表。
-选择 `Add SSH device…` 后，readout 才从 `~/.ssh/config`（含 `Include` 和通配 include
-文件）提供可搜索的具体 `Host` 别名；也可以直接输入一个安全的主机名或别名。按 `Enter`
-后执行固定命令 `ssh <host> readout export`，校验 bundle schema、设备 ID 和输出边界，
-成功后才保存到 `settings.json`。SSH 的 User、HostName、端口、密钥和跳板机继续完全交给
-OpenSSH；设置 `READOUT_SSH_CONFIG` 时，同一路径也会通过 `ssh -F` 用于实际连接。
+The main list contains only devices you explicitly add. SSH usernames, ports,
+identity files, and jump hosts remain under OpenSSH's control; readout does not
+copy or reinterpret them.
 
-首次 host key 确认仍应由用户正常执行一次 `ssh <host>`。需要安装或升级时选中后按 `u`；
-添加器内使用 `Ctrl-U`。第一次按只是确认对象，第二次才会在远端执行操作。readout 先尝试
-`readout update`，远端尚未安装或版本早于 0.2.4 时，自动回退到 GitHub Release 随附的
-Linux/macOS 或 Windows 官方安装器；选中行一变或按 `Esc` 就取消。
-非交互 SSH 不一定读取远端的 shell profile；因此即使 `~/.local/bin`（Windows 为
-`%LOCALAPPDATA%\Programs\readout`）不在远端 PATH，readout 也会自动尝试官方安装器的
-默认用户目录，不需要为了同步去修改系统级 PATH。
-若失败来自 DNS、认证、host key 或超时，readout 会直接显示该连接根因，不会继续尝试其他
-安装器；只有 SSH 已连接而远端命令返回非零状态时，才会进入安装器回退。
+Non-interactive SSH sessions do not always load the remote shell profile.
+readout checks `PATH` first, then the official installers' per-user defaults:
 
-某台设备的快照读不出来（文件损坏，或者两台机器共用了同一份 settings.json 因而报告了
-相同的设备 ID）时，只有那一行会显示为 `unreadable`，本机数字照常显示，原因写在状态栏，
-`readout summary` 则打到 stderr。选中那一行按 `Enter` 重新同步即可重建它。
+- Unix/macOS: `$HOME/.local/bin/readout`
+- Windows: `%LOCALAPPDATA%\Programs\readout\readout.exe`
 
-设备也可以完全从命令行管理：
+Press `u` twice on a configured remote to update it. DNS, authentication, host
+key, and timeout failures are reported directly and never mistaken for a
+missing installation.
+
+### Device names and project paths
+
+Each machine has a stable device ID and an editable display name. Renaming a
+machine does not create a new device:
 
 ```sh
-readout sync     # 拉取 Devices 中所有已启用设备
-readout update   # 更新本机 readout
-readout device list
-readout device add HOST
-readout device remove HOST
-readout device rename NAME
+readout device rename workstation
 ```
 
-同步使用 BatchMode、连接超时、总超时和有界输出，不保存密码或私钥。Settings 页面可
-直接修改本机显示名；选中 `SSH devices` 会进入同一个 Devices 管理流程，同时展示项目
-别名、配置文件位置和稳定 device ID。聚合开关关闭后 Overview/Models/Projects/Sessions
-只看本机。SSH 不做定时同步：在 Devices 页面按 `r` 或点击卡片标题会启动后台同步，
-界面不会被 SSH 阻塞。
-
-Devices 页面始终保留全设备状态。若同一个 transcript 出现在多台设备，稳定事件 ID 会
-保证总量只计算一次；由于 Codex 记录不包含真实主机 ID，这部分会进入 `Shared`，不会
-伪装成某台设备的独占 usage。
-
-同一项目在不同系统上的 cwd 不同时，可以映射到统一名称。别名只在中心设备上设置，
-每台设备的路径各写一条：
+When one project has different paths across operating systems, map each exact
+path to a shared name on the central machine:
 
 ```sh
 readout project-alias set readout-cli /mnt/work/readout-cli
 readout project-alias set readout-cli 'C:\work\readout-cli'
-readout project-alias list
 ```
 
-`readout export` 导出的始终是原始 cwd，不是远端自己的别名。远端若先改过名字，中心
-就再也没有原始路径可以匹配，同一个项目会被永远拆成两行。
+If the same transcript appears on multiple machines, readout counts it once.
+Copied events that cannot be attributed to a single machine appear under the
+`Shared` device bucket.
 
-所有日期都由中心设备根据 bundle 中的 Unix 时间戳重新分桶，因此 Overview 的
-`Today` 始终使用当前查看设备的时区，不会直接相加各设备含义不同的“今天”。
+## CLI
 
-At least one tool always stays on: switching the last one off would leave a
-dashboard of zeroes rather than an answer.
-
-## Today, and keeping it live
-
-The window totals answer "what have I spent". The question after that is
-usually "what have I spent *today*", so today is always on screen — in the
-line under the header, in `readout summary`, and under `"today"` in the JSON:
-
-```
-           tokens        cost   requests  sessions
-      613,900,468     $449.37      3,652        18   TOTAL
-      569,241,294     $417.09      3,251        11   Claude Code
-       44,659,174      $32.28        401         7   Codex
-
-      245,542,893     $189.95      1,706         6   today
-```
-
-`Today` is also a window of its own — the chip, `t`, or `readout -d 1`. Under
-it the trend chart gives way to that day's hours, because a one-day trend is
-one bar next to its own axis.
-
-Watch mode keeps all of it current:
-
-```sh
-readout --watch     # or press w in the dashboard
-```
-
-Every five seconds it re-runs the same incremental scan, which reads only what
-the transcripts appended. A figure that moved eases from the number you were
-looking at to the new one, rather than counting up from zero as if the
-dashboard had just opened.
-
-A scan that finds nothing new draws no frame and writes no cache. So watching
-costs a warm scan's worth of CPU every five seconds and *nothing at all down
-the wire* — the terminal sees not one byte until a number actually changes,
-which is what makes it reasonable over ssh. It repaints when the numbers move,
-when a failed scan recovers, and at midnight, when every window shifts a day
-without a single token moving.
-
-## The CLI
-
-```
+```text
 readout summary [--json|--csv] [--timing]
 readout models
 readout projects
-readout daily
+readout daily [--json|--csv]
 readout pricing [--init]
 readout refresh [--clear]
+readout snapshot [--width N] [--height N] [--page PAGE]
+
 readout sync
 readout update
-readout device list|add|remove|rename
-readout project-alias set|remove|list
-readout snapshot [--width N] [--height N] [--page overview|daily|models|projects|sessions|devices|pricing|settings]
+readout device list
+readout device add HOST
+readout device remove HOST
+readout device rename NAME
+
+readout project-alias set NAME PATH
+readout project-alias remove PATH
+readout project-alias list
 ```
 
-Filters apply to every subcommand, the dashboard included:
+`summary --json` includes device coverage so scripts can distinguish newly
+synced history from newly generated usage. `summary --csv` and `daily --csv`
+include cost coverage, preventing partial estimates from looking complete.
 
-```
--d, --days N        the last N days, 1–36500 (default: all time)
--s, --source S      claude or codex
--p, --project P     one project, identified by its full working directory
--m, --model M       one model
-    --no-cache      reparse everything, ignoring the incremental cache
-```
+`snapshot` renders one dashboard frame at a fixed size without entering an
+interactive terminal mode:
 
-`snapshot` prints a single dashboard frame at a fixed size, with no terminal
-setup and no input — useful in a bug report, a diff, or a layout check.
-Daily CSV includes `cost_coverage`, so a partial estimate cannot be mistaken
-for a complete cost.
-
-`--json` 输出里的 `devices` 和 `by_device` 说明这份总量覆盖了哪些设备：默认聚合会把
-已同步的远端 usage 合进 `total`，脚本必须能看出这一点，才不会把启用一台设备造成的
-跳变当成用量本身变了。被多台设备观察到的事件只落在 `@shared` 一桶里，所以
-`by_device` 各项之和正好等于 `total`。
-
-## Cost, and what `+` means
-
-Prices come from a built-in table, with cache reads at 0.10× input and cache
-writes at 1.25× (5-minute TTL) or 2.00× (1-hour TTL).
-
-The two halves of that table have different provenance, and it matters:
-
-- **Anthropic rates are first-party list prices.**
-- **OpenAI rates are secondhand** — taken from the `model_pricing` table
-  cc-switch ships in `~/.cc-switch/cc-switch.db` (read 2026-08-14). Neither
-  vendor publishes them somewhere this tool can verify, so treat Codex cost as
-  a good estimate rather than an invoice. Override any row in `pricing.json`.
-
-Reasoning-effort suffixes bill at the base model's rate, so `gpt-5.2-xhigh`
-and `gpt-5.2` share a price row. Model *tiers* do not: `gpt-5-mini` and
-`gpt-5.1-codex-max` are priced separately, as they should be.
-
-If your Codex usage runs on a ChatGPT plan rather than an API key, none of
-those tokens are billed per token at all — the figure is then what the same
-work would have cost through the API, not what you paid.
-
-A model with no rate on file is **unpriced, not free**. Its tokens are counted
-and its cost is left out, and every figure that includes it is marked:
-
-- `$863.46+` — this is a floor; some tokens in this total had no rate
-- `—` — nothing in this row could be priced at all
-- `<1% of tokens excluded from cost` — how much of the window the gap covers,
-  never rounded down to `0%` while the gap is real
-
-To fill the gap, write your own rates:
-
-```
-readout pricing --init      # writes ~/.cache/readout/pricing.json,
-                            # pre-filled with every model in your data
+```sh
+readout snapshot --width 120 --height 40 --page devices
 ```
 
-Known models come out at their built-in rate; unknown ones come out zeroed as
-placeholders, but remain unpriced until you edit their `input` / `output`
-numbers (USD per million tokens). The edited values take precedence over the
-built-in table on the next run. `--init` will not overwrite a file that already
-exists.
+## Cost estimates
 
-Claude Sonnet 5 is billed at the standard $3/$15 rather than the promotional
-$2/$10 introductory rate: applying a promo retroactively across months of
-history would silently understate what was actually spent.
+Cost is calculated from the built-in model price table and should be treated as
+an estimate, not an invoice. When Codex is used through a ChatGPT subscription,
+the displayed value estimates equivalent API pricing rather than the
+subscription charge.
 
-## Speed
+- `$12.34` — every token in the total has a known price
+- `$12.34+` — some tokens are unpriced, so the value is a lower bound
+- `—` — none of the usage in this row can be priced
 
-The scan is incremental. Each file is remembered by device+inode, size and
-mtime, and a file that only grew is re-read from the byte where the last scan
-stopped. On a 1.4 GB corpus of 455 transcripts:
+Inspect prices or create an override file with:
 
-```
-cold   455 files, 1.4 GB   →  ~390 ms  (360 ms of it parsing, in parallel)
-warm   454 reused, 1 grown →  ~140 ms, 3.3 kB read
+```sh
+readout pricing
+readout pricing --init
 ```
 
-The cache is rewritten only when a scan actually learned something. It holds
-the parsed events for every file, so saving it costs the whole corpus rather
-than the part that changed — fine once per launch, wrong every five seconds
-under `--watch`.
+Override rates are USD per million tokens and take precedence over built-in
+values. Unknown models remain unpriced rather than being treated as free.
 
-`readout refresh` rebuilds the cache; `readout refresh --clear` deletes it.
-Set `READOUT_STATE_DIR` to move the cache, remote usage snapshots, and price
-overrides elsewhere. Set `READOUT_CONFIG_DIR` to move readout's own settings.
+## Data and privacy
 
-## Accuracy notes
+By default, readout scans only:
 
-Both tools write more records than they bill for, in different ways, and the
-numbers here are the result of reconciling them:
+- `~/.claude/projects/**/*.jsonl`
+- `~/.codex/sessions/**/*.jsonl`
 
-- **Claude** repeats a response across forked transcripts, so records are
-  deduplicated by `message.id`. Where a streamed response reports a
-  `cache_creation` TTL breakdown that under-sums its own total, the
-  authoritative total is kept and split in the breakdown's proportion.
-- **Codex** writes a running cumulative total. Per-turn deltas come from the
-  exact `last_token_usage` where present, and from high-water subtraction
-  where it is not — never from summing the cumulative figure.
-- **Codex counts cached tokens inside `input_tokens`; Claude does not.** The
-  overlap is subtracted at parse time, so "input" means the same thing in both
-  columns.
-- Sub-agent and Workflow transcripts are included. Skipping them would make
-  every token spent inside a `Task` or a `Workflow` disappear from the totals.
-- **Codex 记录现在也有稳定事件 ID**，由 session、时间戳、usage 快照和 session 内序号
-  内容寻址得到，因此同一份 rollout 被复制或恢复出两份时只计一次。这是多设备聚合的
-  前提，也意味着升级到这个版本后 Codex 的历史总量可能比之前略低——降低的那部分正是
-  以前重复计算的副本。缓存会自动重建，不需要手动清。
+Codex `archived_sessions/` is intentionally excluded. Session Replay reads
+message content only when a specific session is opened.
+
+readout never opens `~/.claude/settings.json`, `~/.codex/config.toml`, or
+`~/.codex/auth.json`, and it never modifies either tool's configuration. Its
+only persistent data is its own settings, usage cache, price overrides, and
+remote usage snapshots.
+
+| Environment variable | Purpose |
+|---|---|
+| `READOUT_CLAUDE_DIR` | Override the Claude transcript directory |
+| `READOUT_CODEX_DIR` | Override the Codex transcript directory |
+| `READOUT_STATE_DIR` | Override cache, remote snapshot, and price data |
+| `READOUT_CONFIG_DIR` | Override the readout settings directory |
+| `READOUT_SSH_CONFIG` | Use a specific SSH config for discovery and connections |
+
+The incremental cache stores usage metadata only, never prompts, responses, or
+tool content. `readout refresh` rebuilds it; `readout refresh --clear` only
+removes it.
+
+## Accounting model
+
+Claude Code responses are deduplicated by message ID. Codex cumulative usage is
+converted into per-request deltas. The parsers normalize the tools' different
+treatment of cached input, and sub-agent and Workflow transcripts are included.
+
+These rules prevent known forms of duplication and cumulative over-counting,
+but the result remains a local transcript-based view rather than a vendor bill.
+
+## Development
+
+```sh
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo fmt --all --check
+```
+
+The codebase uses Rust 2024 edition. Releases build binaries for Linux x86-64
+and arm64, macOS Intel and Apple Silicon, and Windows x86-64.
+
+## License
+
+[MIT](LICENSE)
