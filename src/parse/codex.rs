@@ -24,7 +24,7 @@
 //! everywhere downstream.
 
 use crate::model::{Source, Tokens, UsageEvent};
-use crate::parse::{FileParse, ParseCursor, complete_lines};
+use crate::parse::{FileParse, ParseCursor, complete_lines, looks_like_json_object};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -72,11 +72,18 @@ pub fn parse_file(path: &Path, cursor: &ParseCursor, bytes: &[u8]) -> FileParse 
     let mut by_source = st.source_map();
     let mut events: Vec<UsageEvent> = Vec::new();
     let mut consumed = 0usize;
+    let mut malformed_lines = 0u32;
 
     for (start, end) in complete_lines(bytes) {
         consumed = end + 1;
         let raw = &bytes[start..end];
-        if raw.is_empty() {
+        if raw.trim_ascii().is_empty() {
+            continue;
+        }
+        // Counted on every line, not only on the few that survive the marker
+        // test: corruption in a `response_item` is still corruption.
+        if !looks_like_json_object(raw) {
+            malformed_lines = malformed_lines.saturating_add(1);
             continue;
         }
 
@@ -93,7 +100,10 @@ pub fn parse_file(path: &Path, cursor: &ParseCursor, bytes: &[u8]) -> FileParse 
             continue;
         }
 
-        let Ok(v) = serde_json::from_slice::<Value>(raw) else { continue };
+        let Ok(v) = serde_json::from_slice::<Value>(raw) else {
+            malformed_lines = malformed_lines.saturating_add(1);
+            continue;
+        };
         let Some(kind) = v.get("type").and_then(Value::as_str) else { continue };
         let Some(payload) = v.get("payload") else { continue };
 
@@ -228,6 +238,7 @@ pub fn parse_file(path: &Path, cursor: &ParseCursor, bytes: &[u8]) -> FileParse 
         consumed,
         cursor: ParseCursor { codex: Some(st), ..ParseCursor::default() },
         skipped_synthetic: 0,
+        malformed_lines,
     }
 }
 
@@ -355,6 +366,23 @@ fn file_stem(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn broken_rollout_lines_are_counted_wherever_they_sit() {
+        // Rollouts are almost entirely `response_item` bodies that the marker
+        // test rejects without parsing. Damage inside one is still damage, so
+        // the structural check has to run before that rejection.
+        let text = concat!(
+            "{\"type\":\"response_item\",\"payload\":{}}\n",
+            "garbage not json\n",
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"t1\",\"cwd\":\"/w\"}}\n",
+            "{\"truncated\": \n",
+        );
+        let out =
+            parse_file(Path::new("/t/rollout-t1.jsonl"), &ParseCursor::default(), text.as_bytes());
+        assert_eq!(out.malformed_lines, 2, "the bare garbage and the unclosed object");
+        assert_eq!(out.events.len(), 0);
+    }
 
     fn parse(text: &str) -> FileParse {
         parse_file(Path::new("/tmp/rollout-x.jsonl"), &ParseCursor::default(), text.as_bytes())

@@ -4,7 +4,7 @@
 //! a human in a terminal are hard to script against. Every view the dashboard
 //! shows is also available here.
 
-use crate::agg::{Summary, dense_daily};
+use crate::agg::{Insights, Summary, dense_daily};
 use crate::fmt;
 use crate::model::Source;
 use crate::pricing::Pricing;
@@ -142,6 +142,394 @@ pub fn text(s: &Summary, stats: &ScanStats, days: Option<i64>) -> String {
         fmt::duration_ms(stats.total_ms),
     );
     o
+}
+
+/// The derived view: ratios, rates and rankings rather than totals.
+pub fn insights_text(i: &Insights, days: Option<i64>) -> String {
+    let mut o = String::new();
+    let window = match days {
+        Some(d) => format!("last {d} days"),
+        None => "all time".to_string(),
+    };
+    let _ = writeln!(o, "readout insights — {window}");
+    if i.is_empty() {
+        let _ = writeln!(o, "\n  No usage in this window.");
+        return o;
+    }
+
+    // A ratio with nothing behind it prints as an em dash, never as 0 — the
+    // same rule the cost figures follow.
+    let ratio =
+        |v: Option<f64>, render: fn(f64) -> String| v.map_or_else(|| "—".to_string(), render);
+    let _ = writeln!(o, "\n  Efficiency");
+    let _ = writeln!(
+        o,
+        "    {:<22} {:>10}   {} of {} tokens of context served from cache",
+        "cache hit ratio",
+        ratio(i.cache_hit_ratio, fmt::share),
+        fmt::tokens(i.tokens.cache_read),
+        fmt::tokens(i.tokens.context()),
+    );
+    let _ = writeln!(
+        o,
+        "    {:<22} {:>10}   output per token of context sent",
+        "output ratio",
+        ratio(i.output_per_context, fmt::multiplier),
+    );
+    let _ = writeln!(
+        o,
+        "    {:<22} {:>10}   context carried by the average request",
+        "context per request",
+        ratio(i.context_per_request, |v| fmt::tokens(v.round() as u64)),
+    );
+    let _ = writeln!(
+        o,
+        "    {:<22} {:>10}",
+        "tokens per request",
+        ratio(i.tokens_per_request, |v| fmt::tokens(v.round() as u64)),
+    );
+    let _ = writeln!(
+        o,
+        "    {:<22} {:>10}",
+        "requests per session",
+        ratio(i.requests_per_session, |v| format!("{v:.1}")),
+    );
+
+    let cost = |v: f64| fmt::money_partial(v, i.cost_coverage);
+    let _ = writeln!(o, "\n  Burn rate");
+    let _ = writeln!(
+        o,
+        "    {:<22} {:>10}   over {} calendar days",
+        "per day",
+        cost(i.cost_per_day),
+        i.span_days,
+    );
+    let _ = writeln!(
+        o,
+        "    {:<22} {:>10}   over {} days with activity",
+        "per active day",
+        cost(i.cost_per_active_day),
+        i.active_days,
+    );
+    let _ = writeln!(o, "    {:<22} {:>10}", "per session", cost(i.cost_per_session));
+    let _ = writeln!(o, "    {:<22} {:>10}", "per request", cost(i.cost_per_request));
+    let _ = writeln!(
+        o,
+        "    {:<22} {:>10}   {}",
+        "month to date",
+        fmt::money_partial(i.month_to_date.cost, i.month_to_date.coverage()),
+        match i.projected_month {
+            Some(projected) =>
+                format!("on track for {}", fmt::money_partial(projected, i.cost_coverage)),
+            None => "widen the window to project the month".to_string(),
+        },
+    );
+
+    if let Some(p) = &i.previous {
+        let _ = writeln!(o, "\n  Against the previous {} days", p.span_days);
+        let row = |o: &mut String,
+                   label: &str,
+                   change: crate::agg::Change,
+                   value: String,
+                   was: String| {
+            let _ = writeln!(
+                o,
+                "    {:<22} {:>10}   {:>6}   was {was}",
+                label,
+                value,
+                fmt::delta(change.ratio()),
+            );
+        };
+        row(
+            &mut o,
+            "tokens",
+            p.tokens,
+            fmt::tokens(p.tokens.current as u64),
+            fmt::tokens(p.tokens.previous as u64),
+        );
+        row(
+            &mut o,
+            "cost",
+            p.cost,
+            cost(p.cost.current),
+            fmt::money_partial(p.cost.previous, p.previous_coverage),
+        );
+        row(
+            &mut o,
+            "requests",
+            p.requests,
+            fmt::count(p.requests.current as u64),
+            fmt::count(p.requests.previous as u64),
+        );
+        row(
+            &mut o,
+            "sessions",
+            p.sessions,
+            fmt::count(p.sessions.current as u64),
+            fmt::count(p.sessions.previous as u64),
+        );
+    }
+
+    if !i.costly_sessions.is_empty() {
+        let _ = writeln!(o, "\n  Most expensive sessions{}", ranked_note(i.session_total));
+        for s in i.costly_sessions.iter().take(10) {
+            let _ = writeln!(
+                o,
+                "    {:>10}  {:>9}  {:>6} req  {:<40}  {:<22}  {}",
+                fmt::money_partial(s.priced.cost, s.priced.coverage()),
+                fmt::tokens(s.tokens.total()),
+                fmt::count(s.events),
+                fmt::terminal_ellipsize(&s.project, 40),
+                fmt::terminal_ellipsize(&s.model, 22),
+                fmt::relative(s.last_ts),
+            );
+        }
+    }
+
+    if !i.context_heavy.is_empty() {
+        let _ = writeln!(o, "\n  Context-heavy sessions (2+ requests, by context per request)");
+        for s in i.context_heavy.iter().take(10).filter(|s| s.events >= 2) {
+            let _ = writeln!(
+                o,
+                "    {:>10}  {:>9}  {:>6} req  {:<40}  {}",
+                s.context_per_request().map_or_else(
+                    || "—".to_string(),
+                    |v| format!("{}/req", fmt::tokens(v.round() as u64))
+                ),
+                fmt::tokens(s.tokens.total()),
+                fmt::count(s.events),
+                fmt::terminal_ellipsize(&s.project, 40),
+                fmt::terminal_ellipsize(&s.session, 20),
+            );
+        }
+    }
+
+    for (title, rows) in
+        [("Cost by project", &i.costly_projects), ("Cost by model", &i.costly_models)]
+    {
+        if rows.is_empty() {
+            continue;
+        }
+        let _ = writeln!(o, "\n  {title}");
+        for row in rows.iter().take(10) {
+            let _ = writeln!(
+                o,
+                "    {:>10}  {:>15}  {:>6} {:<8}  {}",
+                fmt::money_partial(row.cost, row.coverage),
+                fmt::count(row.tokens),
+                fmt::count(row.sessions as u64),
+                if row.sessions == 1 { "session" } else { "sessions" },
+                fmt::terminal_ellipsize(&row.label, 48),
+            );
+        }
+    }
+    o
+}
+
+/// Search results, grouped by session and most recent first.
+pub fn search_text(results: &crate::search::Results) -> String {
+    let mut o = String::new();
+    let _ = writeln!(
+        o,
+        "readout search — {}",
+        fmt::terminal_ellipsize(&format!("\"{}\"", results.query), 72)
+    );
+    let _ = writeln!(
+        o,
+        "  {} {} in {} {} · {} of {} transcripts read in {}",
+        results.total_matches,
+        plural(results.total_matches, "match", "matches"),
+        results.sessions_matched,
+        plural(results.sessions_matched, "session", "sessions"),
+        results.files_searched,
+        results.files_total,
+        fmt::duration_ms(results.elapsed_ms),
+    );
+    if results.files_failed > 0 {
+        let _ = writeln!(
+            o,
+            "  note: {} {} could not be read and {} skipped",
+            results.files_failed,
+            plural(results.files_failed, "transcript", "transcripts"),
+            plural(results.files_failed, "was", "were"),
+        );
+    }
+    if results.truncated {
+        // A cap that shows as a shorter list and says nothing reads as "that
+        // is all there was".
+        let _ = writeln!(o, "  note: a search limit was reached; the figures above are floors");
+    }
+    if results.is_empty() {
+        let _ = writeln!(o, "\n  Nothing matched.");
+        return o;
+    }
+    if results.sessions_matched > results.sessions.len() {
+        let _ = writeln!(
+            o,
+            "  showing the {} most recent; pass --limit for more",
+            results.sessions.len()
+        );
+    }
+
+    for session in &results.sessions {
+        let _ = writeln!(o);
+        let _ = writeln!(
+            o,
+            "  {:<14} {:<7} {:<38} {:>4} {:<4} {}",
+            fmt::terminal_ellipsize(&session.session, 14),
+            session.source.short(),
+            fmt::terminal_ellipsize(&session.project, 38),
+            session.matches,
+            plural(session.matches, "hit", "hits"),
+            fmt::relative(session.last_ts_ms.div_euclid(1_000)),
+        );
+        for hit in &session.samples {
+            // The title is what Replay labels the row: a role for a message,
+            // the tool's name for a call — more use than the kind alone.
+            let _ = writeln!(
+                o,
+                "    {:<5} {:<9} {}",
+                hit_time(hit.ts_ms),
+                fmt::terminal_ellipsize(&hit.title, 9),
+                fmt::terminal_ellipsize(&hit.snippet, 80),
+            );
+        }
+        if session.matches > session.samples.len() {
+            let _ = writeln!(o, "    {:<5} {} more", "", session.matches - session.samples.len());
+        }
+    }
+    o
+}
+
+pub fn search_json(results: &crate::search::Results) -> String {
+    let hit = |h: &crate::search::Hit| {
+        json!({
+            "ts_ms": h.ts_ms,
+            "kind": h.kind.label(),
+            "title": h.title,
+            "snippet": h.snippet,
+        })
+    };
+    let v = json!({
+        "query": results.query,
+        "generated_ts": chrono::Local::now().timestamp(),
+        "total_matches": results.total_matches,
+        "sessions_matched": results.sessions_matched,
+        "files_searched": results.files_searched,
+        "files_failed": results.files_failed,
+        "files_total": results.files_total,
+        "bytes_read": results.bytes_read,
+        // True means every count above is a floor, not a total.
+        "truncated": results.truncated,
+        "elapsed_ms": results.elapsed_ms,
+        "sessions": results.sessions.iter().map(|s| json!({
+            "session": s.session,
+            "source": s.source.short(),
+            "project": s.project,
+            "last_ts_ms": s.last_ts_ms,
+            "matches": s.matches,
+            "samples": s.samples.iter().map(hit).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    });
+    serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".into())
+}
+
+fn hit_time(ts_ms: i64) -> String {
+    crate::agg::local_datetime(ts_ms.div_euclid(1_000))
+        .map_or_else(|| "—".to_string(), |dt| dt.format("%H:%M").to_string())
+}
+
+fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
+    if n == 1 { one } else { many }
+}
+
+/// Say when a ranking was cut, so a capped list never reads as the whole set.
+fn ranked_note(total: usize) -> String {
+    if total > crate::agg::RANKED_LIMIT {
+        format!(" (top {} of {total})", crate::agg::RANKED_LIMIT)
+    } else {
+        String::new()
+    }
+}
+
+pub fn insights_json(i: &Insights, days: Option<i64>) -> String {
+    let session = |s: &crate::agg::SessionInsight| {
+        json!({
+            "session": s.session,
+            "source": s.source.short(),
+            "project": s.project,
+            "model": s.model,
+            "tokens": {
+                "input": s.tokens.input,
+                "output": s.tokens.output,
+                "cache_read": s.tokens.cache_read,
+                "cache_write": s.tokens.cache_write(),
+                "context": s.tokens.context(),
+                "total": s.tokens.total(),
+            },
+            "cost_usd": s.priced.cost,
+            "cost_coverage": s.priced.coverage(),
+            "requests": s.events,
+            "context_per_request": s.context_per_request(),
+            "last_ts": s.last_ts,
+        })
+    };
+    let cost_row = |r: &crate::agg::CostRow| {
+        json!({
+            "label": r.label,
+            "cost_usd": r.cost,
+            "cost_coverage": r.coverage,
+            "tokens": r.tokens,
+            "requests": r.events,
+            "sessions": r.sessions,
+        })
+    };
+    let change = |c: crate::agg::Change| json!({ "current": c.current, "previous": c.previous, "delta": c.delta(), "ratio": c.ratio() });
+
+    let v = json!({
+        "window_days": days,
+        "generated_ts": chrono::Local::now().timestamp(),
+        "span_days": i.span_days,
+        "active_days": i.active_days,
+        "efficiency": {
+            // Null, not zero: "nothing was sent" and "nothing came from cache"
+            // are different findings and a script must be able to tell them apart.
+            "cache_hit_ratio": i.cache_hit_ratio,
+            "output_per_context": i.output_per_context,
+            "context_per_request": i.context_per_request,
+            "tokens_per_request": i.tokens_per_request,
+            "requests_per_session": i.requests_per_session,
+            "context_tokens": i.tokens.context(),
+            "cached_context_tokens": i.tokens.cache_read,
+        },
+        "burn": {
+            "tokens_per_day": i.tokens_per_day,
+            "cost_per_day": i.cost_per_day,
+            "cost_per_active_day": i.cost_per_active_day,
+            "cost_per_session": i.cost_per_session,
+            "cost_per_request": i.cost_per_request,
+            "cost_coverage": i.cost_coverage,
+            "month_to_date_usd": i.month_to_date.cost,
+            "month_to_date_coverage": i.month_to_date.coverage(),
+            "projected_month_usd": i.projected_month,
+        },
+        "previous_window": i.previous.map(|p| json!({
+            "span_days": p.span_days,
+            "cost_coverage": p.previous_coverage,
+            "tokens": change(p.tokens),
+            "cost_usd": change(p.cost),
+            "requests": change(p.requests),
+            "sessions": change(p.sessions),
+        })),
+        "ranked_limit": crate::agg::RANKED_LIMIT,
+        "session_total": i.session_total,
+        "costly_sessions": i.costly_sessions.iter().map(session).collect::<Vec<_>>(),
+        "context_heavy_sessions": i.context_heavy.iter()
+            .filter(|s| s.events >= 2).map(session).collect::<Vec<_>>(),
+        "costly_projects": i.costly_projects.iter().map(cost_row).collect::<Vec<_>>(),
+        "costly_models": i.costly_models.iter().map(cost_row).collect::<Vec<_>>(),
+    });
+    serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".into())
 }
 
 /// Timing detail for `--timing`, so the incremental cache's value is visible.
@@ -336,6 +724,60 @@ mod tests {
     use crate::agg::{Filter, summarize};
     use crate::model::{Tokens, UsageEvent};
 
+    fn search_sample(matches: usize, truncated: bool) -> crate::search::Results {
+        crate::search::Results {
+            query: "deadlock".into(),
+            sessions: vec![crate::search::SessionHits {
+                source: Source::Claude,
+                session: "s1".into(),
+                project: "alpha".into(),
+                last_ts_ms: chrono::Local::now().timestamp() * 1_000,
+                matches,
+                samples: vec![crate::search::Hit {
+                    ts_ms: chrono::Local::now().timestamp() * 1_000,
+                    kind: crate::replay::ReplayKind::ToolCall,
+                    title: "Bash".into(),
+                    snippet: "grep deadlock src".into(),
+                }],
+            }],
+            sessions_matched: 4,
+            total_matches: matches,
+            files_searched: 9,
+            files_failed: 0,
+            files_total: 10,
+            bytes_read: 1234,
+            truncated,
+            elapsed_ms: 12,
+        }
+    }
+
+    #[test]
+    fn search_output_says_when_a_list_was_cut_rather_than_just_being_shorter() {
+        let out = search_text(&search_sample(9, false));
+        assert!(out.contains("9 matches in 4 sessions"));
+        // One session is shown of four found; silence here would read as
+        // "that is all there was".
+        assert!(out.contains("showing the 1 most recent"), "{out}");
+        assert!(out.contains("8 more"), "the samples are a sample, not the matches: {out}");
+        assert!(!out.contains("limit was reached"));
+
+        let capped = search_text(&search_sample(9, true));
+        assert!(capped.contains("floors"), "a search that stopped early must say so");
+    }
+
+    #[test]
+    fn search_output_labels_a_hit_the_way_replay_would() {
+        let out = search_text(&search_sample(1, false));
+        assert!(out.contains("Bash"), "a tool hit names its tool, not just its kind: {out}");
+        assert!(out.contains("1 hit "), "singular when there is one");
+
+        let value: serde_json::Value =
+            serde_json::from_str(&search_json(&search_sample(1, false))).unwrap();
+        assert_eq!(value["sessions"][0]["samples"][0]["kind"], "tool");
+        assert_eq!(value["sessions"][0]["samples"][0]["title"], "Bash");
+        assert_eq!(value["truncated"], false);
+    }
+
     fn sample() -> Vec<UsageEvent> {
         vec![
             UsageEvent {
@@ -449,6 +891,33 @@ mod tests {
         let s = summarize(&sample(), &Filter::default(), &p);
         let out = text(&s, &ScanStats::default(), Some(1));
         assert!(!out.lines().any(|l| l.ends_with("   today")), "TOTAL already is today");
+    }
+
+    #[test]
+    fn insight_json_keeps_an_unmeasurable_ratio_null_rather_than_zero() {
+        // A script has to be able to tell "nothing came from cache" from
+        // "nothing was sent", and `0.0` says the first about both.
+        let p = Pricing::builtin();
+        let empty = summarize(&[], &Filter::default(), &p);
+        let i = crate::agg::insights(&empty, None, Some(7));
+        let v: serde_json::Value = serde_json::from_str(&insights_json(&i, Some(7))).unwrap();
+        assert!(v["efficiency"]["cache_hit_ratio"].is_null());
+        assert!(v["previous_window"].is_null(), "no comparison was supplied");
+        assert_eq!(v["window_days"], 7);
+    }
+
+    #[test]
+    fn insight_text_marks_partly_priced_figures_and_names_its_cap() {
+        let p = Pricing::builtin();
+        let s = summarize(&sample(), &Filter::default(), &p);
+        let i = crate::agg::insights(&s, None, None);
+        let out = insights_text(&i, None);
+        assert!(out.contains("readout insights — all time"));
+        assert!(out.contains("cache hit ratio"));
+        // Half the sample is on a model with no rate, so every cost figure
+        // derived from it has to carry the `+` that says "at least".
+        assert!(out.contains("+"), "a partly priced burn rate must say so: {out}");
+        assert!(!out.contains("top 100 of"), "nothing was truncated at this size");
     }
 
     #[test]

@@ -36,6 +36,33 @@ pub struct FileParse {
     pub cursor: ParseCursor,
     /// Records recognized but deliberately excluded (e.g. `<synthetic>`).
     pub skipped_synthetic: u32,
+    /// Complete lines that could not be read.
+    ///
+    /// Two things count: a line that is not shaped like a JSON object at all,
+    /// and a line that looked like a usage record and then failed to parse.
+    /// A structurally intact line that we never had reason to parse does not,
+    /// because proving it well-formed would mean running serde over every
+    /// record in a multi-gigabyte corpus to answer a question about damage —
+    /// the cost the substring pre-filters exist to avoid. The figure is
+    /// therefore a floor on the damage, and never a false alarm.
+    ///
+    /// It is never "the line held nothing we wanted": most records in a
+    /// transcript legitimately carry no usage. A torn final line is excluded
+    /// too — it is unconsumed by design and arrives whole on the next scan.
+    pub malformed_lines: u32,
+}
+
+/// Whether a complete line is shaped like the JSON object a JSONL record must
+/// be, without paying for a parse.
+///
+/// Both parsers reject most lines on a substring test precisely so serde stays
+/// off the hot path — a Codex corpus is gigabytes of message bodies. This is
+/// the cheap structural check that still runs on every line, so truncation and
+/// corruption are visible anywhere in a file rather than only in the records
+/// that happened to look interesting.
+pub fn looks_like_json_object(raw: &[u8]) -> bool {
+    let trimmed = raw.trim_ascii();
+    trimmed.first() == Some(&b'{') && trimmed.last() == Some(&b'}')
 }
 
 /// Parse an RFC 3339 / ISO 8601 timestamp into unix seconds.
@@ -62,6 +89,17 @@ mod tests {
         // An explicit offset is honoured rather than assumed to be UTC.
         assert_eq!(parse_ts("2026-08-14T18:00:00+08:00"), Some(1786701600));
         assert_eq!(parse_ts("not a date"), None);
+    }
+
+    #[test]
+    fn a_record_is_shaped_like_an_object_or_it_is_damage() {
+        assert!(looks_like_json_object(br#"{"type":"assistant"}"#));
+        // A CRLF transcript still ends its records with `}`.
+        assert!(looks_like_json_object(b"  {\"a\":1}  \r"));
+        assert!(!looks_like_json_object(br#"{"type":"assis"#), "a truncated record is damage");
+        assert!(!looks_like_json_object(b"not json at all"));
+        assert!(!looks_like_json_object(b"[1,2]"), "JSONL records are objects");
+        assert!(!looks_like_json_object(b""));
     }
 
     #[test]

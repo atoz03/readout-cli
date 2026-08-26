@@ -40,7 +40,9 @@ which is the only way an agent can — render one settled frame as text:
 
 ```sh
 cargo run -- snapshot --width 120 --height 40 --page overview
-# pages: overview | daily | models | projects | sessions | devices | pricing | settings
+# pages: overview | daily | insights | models | projects | sessions | search
+#        | devices | pricing | settings
+cargo run -- snapshot --page search --query deadlock   # Search draws nothing until it has run
 ```
 
 `snapshot` and `summary --json` are also CI's cross-platform smoke tests.
@@ -83,7 +85,25 @@ render        report.rs (text/JSON/CSV)  |  tui/ (dashboard)
 
 Because `summarize` is a pure function re-run on every filter change, the pages
 cannot disagree with each other. Add a view by deriving it in `agg.rs`, not by
-accumulating state alongside an existing one.
+accumulating state alongside an existing one. `agg::insights` follows that rule
+literally: it is a pure function of two `Summary` values (the window and the one
+before it), so the Insights page cannot contradict the Overview it sits beside.
+
+**Message text is never cached** (`replay.rs`, `search.rs`). The usage pipeline
+above keeps billing metadata only. Bodies and tool output are read on demand and
+dropped — Replay when a session is opened, Search on every run, which is why a
+search over a gigabyte-scale corpus costs seconds rather than milliseconds. Both
+decode records through `replay::record_texts`, so a search hit and the Replay row
+it opens are produced by one piece of code and cannot describe a record
+differently. Search's raw-byte pre-filter is an accelerator and is held to an
+accelerator's contract: it may skip work, never an answer. Records are JSON on
+disk and folded through `preview` before anything compares against them, so the
+gate uses only the longest stretch of the query surviving both — nothing
+whitespace, `"` or `\`. See `search::prefilter_token`.
+
+`readout doctor` (`doctor.rs`) is the diagnosis layer over the same pipeline: it
+reports and never repairs, and exits `2` — `main::FINDINGS_EXIT_CODE` — only when
+a figure readout prints is wrong or missing. `1` remains "readout itself failed".
 
 **Multi-device merge** (`devices.rs`). `load_usage` is the only entry point the
 CLI and the TUI both scan through. With no SSH host enabled it skips the merge

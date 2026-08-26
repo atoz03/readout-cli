@@ -7,6 +7,7 @@
 mod agg;
 mod cache;
 mod devices;
+mod doctor;
 mod fmt;
 mod model;
 mod parse;
@@ -15,6 +16,7 @@ mod pricing;
 mod replay;
 mod report;
 mod scan;
+mod search;
 mod settings;
 mod tui;
 mod updater;
@@ -119,6 +121,34 @@ enum Command {
         #[arg(long)]
         csv: bool,
     },
+    /// Cache efficiency, burn rate, costly sessions, and period-over-period change
+    Insights {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Search Claude Code and Codex history for a phrase
+    ///
+    /// Reads the transcripts directly, as Replay does, so nothing about the
+    /// text is cached. Exits 0 whether or not anything matched: an empty
+    /// result is an answer, not a failure.
+    Search {
+        /// Text to look for; matching ignores ASCII case
+        query: String,
+        /// Sessions to show, most recent first
+        #[arg(long, short = 'n', default_value_t = search::DEFAULT_LIMIT)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check transcript coverage, malformed records, pricing gaps, cache and device sync
+    ///
+    /// Exits 2 only when a figure readout reports is wrong or missing, so it is
+    /// safe to gate a script on. Warnings and notes exit 0; 1 means readout
+    /// itself could not run.
+    Doctor {
+        #[arg(long)]
+        json: bool,
+    },
     /// Show the model price table
     Pricing {
         /// Write a starter override file listing every model in your data
@@ -137,9 +167,12 @@ enum Command {
         width: u16,
         #[arg(long, default_value_t = 40)]
         height: u16,
-        /// overview, daily, models, projects, sessions, devices, pricing, settings
+        /// overview, daily, insights, models, projects, sessions, search, devices, pricing, settings
         #[arg(long, default_value = "overview")]
         page: String,
+        /// Run this search first, so `--page search` has results to draw
+        #[arg(long)]
+        query: Option<String>,
     },
     /// SSH 设备协议：导出只含 usage 的 bundle
     #[command(hide = true)]
@@ -188,7 +221,11 @@ enum ProjectAliasCommand {
 
 fn main() -> std::process::ExitCode {
     match run() {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+        Ok(Outcome::Ok) => std::process::ExitCode::SUCCESS,
+        // `readout doctor` reports a diagnosis rather than a crash, so a
+        // finding has to reach the shell as a distinct code: 1 is "readout
+        // itself failed", 2 is "readout ran and found something wrong".
+        Ok(Outcome::Findings) => std::process::ExitCode::from(FINDINGS_EXIT_CODE),
         Err(error) => {
             eprintln!("error: {}", fmt::terminal_text(&format!("{error:#}")));
             std::process::ExitCode::FAILURE
@@ -196,11 +233,21 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-fn run() -> Result<()> {
+/// Whether the command completed cleanly or completed with something to report.
+enum Outcome {
+    Ok,
+    Findings,
+}
+
+/// `readout doctor` ran and found something wrong, as distinct from readout
+/// itself failing to run (1). Kept here so the report and the shell agree.
+pub const FINDINGS_EXIT_CODE: u8 = 2;
+
+fn run() -> Result<Outcome> {
     let cli = Cli::parse();
     // 更新器不读取 transcript 或 settings；即使用户配置损坏，也应能修复二进制。
     if matches!(&cli.command, Some(Command::Update)) {
-        return updater::update();
+        return updater::update().map(|()| Outcome::Ok);
     }
     let sources = resolve_sources(&cli.common)?;
     let mut settings = settings::Settings::load_or_create()?;
@@ -211,7 +258,7 @@ fn run() -> Result<()> {
         None | Some(Command::Tui { .. }) => {
             let watch = cli.watch || matches!(cli.command, Some(Command::Tui { watch: true }));
             let filter = build_filter(&cli.common, &sources, &settings);
-            tui::run(sources, filter, !cli.common.no_cache, watch, settings)
+            tui::run(sources, filter, !cli.common.no_cache, watch, settings).map(|()| Outcome::Ok)
         }
         Some(Command::Summary { json, csv, timing }) => {
             let Loaded { summary: s, stats, devices, .. } = load(&cli.common, &sources, &settings)?;
@@ -228,7 +275,7 @@ fn run() -> Result<()> {
             if timing {
                 println!("\n{}", report::timing(&stats));
             }
-            Ok(())
+            Ok(Outcome::Ok)
         }
         Some(Command::Models { json }) => {
             let Loaded { summary: s, stats, devices, .. } = load(&cli.common, &sources, &settings)?;
@@ -237,7 +284,7 @@ fn run() -> Result<()> {
             } else {
                 print_buckets(&s.by_model, "model", s.total.tokens.total());
             }
-            Ok(())
+            Ok(Outcome::Ok)
         }
         Some(Command::Projects { json }) => {
             let Loaded { summary: s, stats, devices, .. } = load(&cli.common, &sources, &settings)?;
@@ -246,7 +293,7 @@ fn run() -> Result<()> {
             } else {
                 print_buckets(&s.by_project, "project", s.total.tokens.total());
             }
-            Ok(())
+            Ok(Outcome::Ok)
         }
         Some(Command::Daily { json, csv }) => {
             let Loaded { summary: s, stats, devices, .. } = load(&cli.common, &sources, &settings)?;
@@ -266,7 +313,74 @@ fn run() -> Result<()> {
                     );
                 }
             }
-            Ok(())
+            Ok(Outcome::Ok)
+        }
+        Some(Command::Insights { json }) => {
+            let Loaded { summary, events, pricing, .. } = load(&cli.common, &sources, &settings)?;
+            let filter = build_filter(&cli.common, &sources, &settings);
+            // The comparison window is the same filter shifted back by its own
+            // length, so everything but the dates is held constant.
+            let previous =
+                agg::previous_window(&filter).map(|window| summarize(&events, &window, &pricing));
+            let insights = agg::insights(&summary, previous.as_ref(), cli.common.days);
+            if json {
+                println!("{}", report::insights_json(&insights, cli.common.days));
+            } else {
+                print!("{}", report::insights_text(&insights, cli.common.days));
+            }
+            Ok(Outcome::Ok)
+        }
+        Some(Command::Search { query, limit, json }) => {
+            // Search takes its session and project labels from the usage
+            // layer, so a result names a session exactly as `readout sessions`
+            // would rather than inventing a second naming scheme.
+            let Loaded { summary, .. } = load(&cli.common, &sources, &settings)?;
+            let filter = build_filter(&cli.common, &sources, &settings);
+            // A model is a property of a billed request, not of a sentence;
+            // silently ignoring the flag would misreport what was searched.
+            if cli.common.model.is_some() {
+                eprintln!("readout: --model does not apply to search and was ignored");
+            }
+            let results = search::run(&search::Request {
+                query,
+                sources: sources.clone(),
+                index: search::SessionIndex::from_summary(&summary),
+                project: filter.project.clone(),
+                since: filter.since,
+                until: filter.until,
+                limit,
+            })?;
+            if json {
+                println!("{}", report::search_json(&results));
+            } else {
+                print!("{}", report::search_text(&results));
+            }
+            Ok(Outcome::Ok)
+        }
+        Some(Command::Doctor { json }) => {
+            // Doctor needs the warnings `load` prints and swallows, so it
+            // drives the scan itself rather than going through it.
+            let pricing = Pricing::load(paths::pricing_override_file().ok().as_deref())?;
+            let loaded = devices::load_usage(&sources, !cli.common.no_cache, &settings, None)?;
+            let filter = build_filter(&cli.common, &sources, &settings);
+            let summary = summarize(&loaded.scan.events, &filter, &pricing);
+            let report = doctor::run(&doctor::Input {
+                events: &loaded.scan.events,
+                summary: &summary,
+                stats: &loaded.scan.stats,
+                devices: &loaded.devices,
+                device_warnings: &loaded.warnings,
+                pricing: &pricing,
+                filter: &filter,
+                sources: &sources,
+                cache_path: cache::default_path().ok(),
+            });
+            if json {
+                println!("{}", doctor::json(&report, &filter));
+            } else {
+                print!("{}", doctor::text(&report, &filter));
+            }
+            Ok(if report.failed() { Outcome::Findings } else { Outcome::Ok })
         }
         Some(Command::Pricing { init }) => {
             let pricing = Pricing::load(paths::pricing_override_file().ok().as_deref())?;
@@ -294,7 +408,7 @@ fn run() -> Result<()> {
                     );
                 }
             }
-            Ok(())
+            Ok(Outcome::Ok)
         }
         Some(Command::Refresh { clear }) => {
             let path = cache::default_path()?;
@@ -305,20 +419,22 @@ fn run() -> Result<()> {
                 } else {
                     println!("No cache at {}", fmt::terminal_text(&path.display().to_string()));
                 }
-                return Ok(());
+                return Ok(Outcome::Ok);
             }
             let _ = std::fs::remove_file(&path);
             let result = scan::scan_with_cache(&sources, true, None)?;
             print!("{}", report::timing(&result.stats));
-            Ok(())
+            Ok(Outcome::Ok)
         }
-        Some(Command::Snapshot { width, height, page }) => {
+        Some(Command::Snapshot { width, height, page, query }) => {
             let page = match page.to_ascii_lowercase().as_str() {
                 "overview" => tui::app::Page::Overview,
                 "daily" => tui::app::Page::Daily,
+                "insights" => tui::app::Page::Insights,
                 "models" => tui::app::Page::Models,
                 "projects" => tui::app::Page::Projects,
                 "sessions" => tui::app::Page::Sessions,
+                "search" => tui::app::Page::Search,
                 "devices" => tui::app::Page::Devices,
                 "pricing" => tui::app::Page::Pricing,
                 "settings" => tui::app::Page::Settings,
@@ -327,17 +443,18 @@ fn run() -> Result<()> {
             let filter = build_filter(&cli.common, &sources, &settings);
             print!(
                 "{}",
-                tui::snapshot(
+                tui::snapshot(tui::SnapshotRequest {
                     sources,
                     filter,
-                    !cli.common.no_cache,
+                    use_cache: !cli.common.no_cache,
                     width,
                     height,
                     page,
-                    settings
-                )?
+                    query,
+                    settings,
+                })?
             );
-            Ok(())
+            Ok(Outcome::Ok)
         }
         Some(Command::Export { output }) => {
             let bundle = devices::export_local(&sources, !cli.common.no_cache, &settings)?;
@@ -349,7 +466,7 @@ fn run() -> Result<()> {
                 bundle.write_json(&mut writer)?;
                 std::io::Write::flush(&mut writer)?;
             }
-            Ok(())
+            Ok(Outcome::Ok)
         }
         Some(Command::Sync) => {
             let report = devices::sync_all(&settings, None)?;
@@ -360,7 +477,7 @@ fn run() -> Result<()> {
                 eprintln!("Failed {failure}");
             }
             anyhow::ensure!(report.failed.is_empty(), "one or more devices failed to sync");
-            Ok(())
+            Ok(Outcome::Ok)
         }
         Some(Command::Update) => unreachable!("handled before loading settings"),
         Some(Command::Device { action }) => {
@@ -406,7 +523,7 @@ fn run() -> Result<()> {
                     println!("Renamed the local device to {}.", fmt::terminal_text(&name));
                 }
             }
-            Ok(())
+            Ok(Outcome::Ok)
         }
         Some(Command::ProjectAlias { action }) => {
             match action {
@@ -437,7 +554,7 @@ fn run() -> Result<()> {
                     }
                 }
             }
-            Ok(())
+            Ok(Outcome::Ok)
         }
     }
 }
@@ -446,6 +563,10 @@ struct Loaded {
     summary: agg::Summary,
     stats: scan::ScanStats,
     devices: Vec<devices::DeviceRecord>,
+    /// Kept so a view that needs a second window — the period an insight
+    /// compares against — can summarize it without rescanning.
+    events: Vec<model::UsageEvent>,
+    pricing: Pricing,
 }
 
 fn load(common: &Common, sources: &[Source], settings: &settings::Settings) -> Result<Loaded> {
@@ -457,7 +578,13 @@ fn load(common: &Common, sources: &[Source], settings: &settings::Settings) -> R
     }
     let filter = build_filter(common, sources, settings);
     let summary = summarize(&loaded.scan.events, &filter, &pricing);
-    Ok(Loaded { summary, stats: loaded.scan.stats, devices: loaded.devices })
+    Ok(Loaded {
+        summary,
+        stats: loaded.scan.stats,
+        devices: loaded.devices,
+        events: loaded.scan.events,
+        pricing,
+    })
 }
 
 fn build_filter(common: &Common, sources: &[Source], settings: &settings::Settings) -> Filter {

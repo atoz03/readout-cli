@@ -27,7 +27,7 @@ use std::os::unix::fs::OpenOptionsExt;
 
 /// Bumped whenever the parsers or the on-disk shape change meaning. A stale
 /// cache is discarded silently and rebuilt rather than migrated.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// 损坏或被替换的缓存不能迫使进程分配无限内存。
 const MAX_CACHE_BYTES: u64 = 512 * 1024 * 1024;
@@ -86,6 +86,13 @@ pub struct FileEntry {
     pub cursor: ParseCursor,
     pub events: Vec<UsageEvent>,
     pub skipped_synthetic: u32,
+    /// Lines in this file that could not be read as a JSON object.
+    ///
+    /// Deliberately not `#[serde(default)]`: an entry written before this
+    /// field existed never counted anything, and defaulting it to zero would
+    /// report "no damage" as a finding rather than as an absence of one. The
+    /// schema bump discards those entries instead.
+    pub malformed_lines: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -272,6 +279,7 @@ mod tests {
             cursor: ParseCursor::default(),
             events: vec![],
             skipped_synthetic: 0,
+            malformed_lines: 0,
         }
     }
 
@@ -358,6 +366,7 @@ mod tests {
                 cursor: ParseCursor::default(),
                 events: vec![],
                 skipped_synthetic: 1,
+                malformed_lines: 0,
             },
         );
         c.save(&p).unwrap();

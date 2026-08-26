@@ -73,5 +73,24 @@ jobs:
       # state, which is exactly the path a fresh install hits first.
       - name: Smoke-test the renderer
         run: cargo run --quiet -- snapshot --width 100 --height 30
+      # Every page the keyboard can reach, because a page that only renders on
+      # one developer's machine is a page nobody tested. `--query` matters on
+      # Windows in particular: it is the only place path components are split
+      # on a separator that is not `/`.
+      - name: Smoke-test every page
+        shell: bash
+        run: |
+          for page in overview daily insights models projects sessions search devices pricing settings; do
+            cargo run --quiet -- snapshot --width 100 --height 30 --page "$page" > /dev/null
+          done
+          cargo run --quiet -- snapshot --width 100 --height 30 --page search --query readout > /dev/null
       - name: Smoke-test the text output
         run: cargo run --quiet -- summary --json
+      # Both exit 0 on an empty corpus; doctor's 2 means "a reported figure is
+      # wrong", which a fresh checkout has no way to be.
+      - name: Smoke-test insights, search and doctor
+        shell: bash
+        run: |
+          cargo run --quiet -- insights --json > /dev/null
+          cargo run --quiet -- search readout --json > /dev/null
+          cargo run --quiet -- doctor --json > /dev/null

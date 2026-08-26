@@ -37,6 +37,20 @@ pub enum ReplayKind {
     System,
 }
 
+impl ReplayKind {
+    /// The name for output that has no colour or glyph to lean on.
+    pub fn label(self) -> &'static str {
+        match self {
+            ReplayKind::User => "user",
+            ReplayKind::Assistant => "assistant",
+            ReplayKind::ToolCall => "tool",
+            ReplayKind::ToolResult => "result",
+            ReplayKind::ToolError => "error",
+            ReplayKind::System => "system",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplayEvent {
     /// Unix 毫秒；源记录没有时间时为 0。
@@ -210,7 +224,54 @@ fn load_targets(request: ReplayRequest, targets: Vec<scan::Target>) -> Result<Se
     Ok(SessionReplay { events, first_ts_ms, last_ts_ms, truncated })
 }
 
-fn path_matches_session(path: &Path, session: &str) -> bool {
+/// What one transcript record says, as text.
+///
+/// Search reads this rather than reimplementing the two message shapes, so a
+/// hit and the Replay row it opens can never describe the record differently.
+#[derive(Debug, Clone)]
+pub struct RecordText {
+    pub ts_ms: i64,
+    pub kind: ReplayKind,
+    pub title: String,
+    pub detail: String,
+    /// Identity of the underlying record, where it has one.
+    ///
+    /// Claude copies earlier records verbatim into forked transcripts, so one
+    /// message can sit in several files of the same session. Replay collapses
+    /// them; anything else reading records has to as well, or it counts one
+    /// sentence as several.
+    pub dedup_key: Option<String>,
+}
+
+/// Decode one JSONL record into the lines a reader would see.
+///
+/// `call_names` carries tool-call names forward within a file so a result row
+/// can be labelled with the tool that produced it, exactly as Replay does.
+pub fn record_texts(
+    source: Source,
+    value: &Value,
+    call_names: &mut HashMap<String, String>,
+) -> Vec<RecordText> {
+    let parsed = match source {
+        Source::Claude => parse_claude(value, call_names),
+        Source::Codex => parse_codex(value, call_names),
+    };
+    parsed
+        .into_iter()
+        .map(|event| RecordText {
+            ts_ms: event.ts_ms,
+            kind: event.kind,
+            title: event.title,
+            detail: event.detail,
+            dedup_key: event.dedup_key,
+        })
+        .collect()
+}
+
+/// Whether a transcript file belongs to a session.
+///
+/// Shared with search so both resolve a session to the same set of files.
+pub fn path_matches_session(path: &Path, session: &str) -> bool {
     let wanted = OsStr::new(session);
     path.file_stem().is_some_and(|stem| stem == wanted)
         || path.components().any(|component| component.as_os_str() == wanted)
@@ -461,7 +522,13 @@ fn value_reports_failure(value: &Value) -> bool {
     }
 }
 
-fn preview(raw: &str) -> String {
+/// Fold raw transcript text into the single bounded line a reader sees.
+///
+/// Public because search has to fold its *query* the same way. Every string in
+/// a [`RecordText`] has been through here, so a newline in the file is a space
+/// by the time anything compares against it; a query that skipped this step
+/// could never match text that did.
+pub fn preview(raw: &str) -> String {
     let mut out = String::new();
     let mut pending_space = false;
     for ch in raw.chars() {

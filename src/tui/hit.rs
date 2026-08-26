@@ -26,6 +26,14 @@ pub enum Action {
     ProjectRow(usize),
     /// 打开 session replay。
     SessionRow(usize),
+    /// 打开 Insights 排名中某一行对应的 session replay。
+    InsightSessionRow(usize),
+    /// 选中一条搜索结果，并从它的第一处命中开始 replay。
+    SearchRow(usize),
+    /// 从选中 session 的某一条具体命中开始 replay。
+    SearchSample(usize),
+    /// 开始编辑搜索词。
+    SearchEdit,
     /// 返回当前项目的 Sessions 页。
     BackToSessions,
     /// 播放或暂停 replay。

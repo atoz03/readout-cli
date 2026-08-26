@@ -22,6 +22,9 @@ readout summary --json   # 输出 JSON
 - 显示今日、最近 7/30/90 天或全部历史
 - 提供模型费用估算，并明确标记未定价部分
 - 回放本机 session 的消息与工具调用时间线
+- 全文搜索本机 Claude Code 与 Codex 历史，并直接跳进 Replay
+- 计算缓存命中率、消耗速率、高成本会话和相邻周期的变化
+- 诊断覆盖范围、损坏记录、缺价模型、缓存状态和设备同步
 - 通过 SSH 聚合多台设备，同时对重复会话记录去重
 - 增量扫描会话记录，支持低开销 watch 模式
 - 提供 JSON、CSV、固定尺寸快照和统一的 CLI 过滤参数
@@ -92,6 +95,8 @@ readout -w              # 每几秒增量刷新
 | Models | 模型分布与费用覆盖率 |
 | Projects | 项目列表；进入后查看 Sessions |
 | Sessions / Replay | 会话用量，以及本机 transcript 的消息和工具时间线 |
+| Insights | 缓存效率、消耗速率、高成本与高上下文会话 |
+| Search | 全文搜索本机历史，回车在命中处打开 Replay |
 | Devices | 本机、已添加的 SSH 设备和同步状态 |
 | Pricing | 当前模型价格 |
 | Settings | 聚合开关、本机名称、SSH 设备、项目别名和配置路径 |
@@ -110,6 +115,7 @@ readout -w              # 每几秒增量刷新
 | `w` | 开关 watch 模式 |
 | `u` 两次 | 更新选中的已添加远端 |
 | `Delete` / `Backspace` | 删除选中的 SSH 设备 |
+| `/` | 搜索 Claude Code 与 Codex 历史 |
 | `?` | 显示当前页面帮助 |
 | `q`、`Ctrl-C` | 退出 |
 
@@ -161,9 +167,12 @@ readout summary [--json|--csv] [--timing]
 readout models
 readout projects
 readout daily [--json|--csv]
+readout insights [--json]
+readout search QUERY [-n LIMIT] [--json]
+readout doctor [--json]
 readout pricing [--init]
 readout refresh [--clear]
-readout snapshot [--width N] [--height N] [--page PAGE]
+readout snapshot [--width N] [--height N] [--page PAGE] [--query TEXT]
 
 readout sync
 readout update
@@ -209,7 +218,7 @@ readout 默认只扫描：
 - `~/.claude/projects/**/*.jsonl`
 - `~/.codex/sessions/**/*.jsonl`
 
-Codex 的 `archived_sessions/` 不在默认范围。Session Replay 仅在打开具体会话时按需读取正文。
+Codex 的 `archived_sessions/` 不在默认范围。正文只在需要时读取——Session Replay 在打开具体会话时读，Search 在搜索过程中读——且从不写入缓存。这也是每次搜索都重新读取 transcript、而不是查索引的原因。
 
 readout 不读取 `~/.claude/settings.json`、`~/.codex/config.toml` 或 `~/.codex/auth.json`，也不会修改两种工具的配置。持久化内容只有 readout 自己的设置、用量缓存、价格覆盖和远端 usage 快照。
 

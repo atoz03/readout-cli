@@ -68,6 +68,16 @@ impl Tokens {
         self.cache_write_5m.saturating_add(self.cache_write_1h)
     }
 
+    /// Everything sent to the model on the way in — fresh input plus whatever
+    /// was served from, or written to, the prompt cache.
+    ///
+    /// This is the denominator for "how much context did a turn carry", which
+    /// is a different question from what the turn cost: output is billed at a
+    /// higher rate but says nothing about how heavy the conversation got.
+    pub fn context(&self) -> u64 {
+        self.input.saturating_add(self.cache_read).saturating_add(self.cache_write())
+    }
+
     /// Every token the request was billed for, cached or not.
     pub fn total(&self) -> u64 {
         self.input
@@ -182,6 +192,8 @@ mod tests {
             Tokens { input: 1, output: 2, cache_read: 4, cache_write_5m: 8, cache_write_1h: 16 };
         assert_eq!(t.cache_write(), 24);
         assert_eq!(t.total(), 31);
+        // Context is what went in, so output is the one class it leaves out.
+        assert_eq!(t.context(), 29);
     }
 
     #[test]

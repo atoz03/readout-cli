@@ -15,7 +15,7 @@
 //! cheap scan and contributes nothing.
 
 use crate::model::{Source, Tokens, UsageEvent, normalize_model};
-use crate::parse::{FileParse, ParseCursor, complete_lines};
+use crate::parse::{FileParse, ParseCursor, complete_lines, looks_like_json_object};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
@@ -49,11 +49,19 @@ pub fn parse_file(path: &Path, cursor: &ParseCursor, bytes: &[u8]) -> FileParse 
     let mut consumed = 0usize;
     let mut cwd: Option<String> = cursor.claude_cwd.clone();
     let mut skipped_synthetic = 0u32;
+    let mut malformed_lines = 0u32;
 
     for (start, end) in complete_lines(bytes) {
         consumed = end + 1;
         let raw = &bytes[start..end];
-        if raw.is_empty() {
+        if raw.trim_ascii().is_empty() {
+            continue;
+        }
+        // Damage is counted wherever it sits, not only in the records that
+        // pass the marker test below — a truncated line halfway through a
+        // transcript is exactly what a reader needs to hear about.
+        if !looks_like_json_object(raw) {
+            malformed_lines = malformed_lines.saturating_add(1);
             continue;
         }
         // Cheap reject before paying for JSON: every record we want carries
@@ -69,7 +77,10 @@ pub fn parse_file(path: &Path, cursor: &ParseCursor, bytes: &[u8]) -> FileParse 
             }
             continue;
         }
-        let Ok(v) = serde_json::from_slice::<Value>(raw) else { continue };
+        let Ok(v) = serde_json::from_slice::<Value>(raw) else {
+            malformed_lines = malformed_lines.saturating_add(1);
+            continue;
+        };
         if v.get("type").and_then(Value::as_str) != Some("assistant") {
             continue;
         }
@@ -140,6 +151,7 @@ pub fn parse_file(path: &Path, cursor: &ParseCursor, bytes: &[u8]) -> FileParse 
         consumed,
         cursor: ParseCursor { claude_cwd: cwd, ..ParseCursor::default() },
         skipped_synthetic,
+        malformed_lines,
     }
 }
 
@@ -313,6 +325,35 @@ mod tests {
         let out = parse(&format!("{synth}\n"));
         assert!(out.events.is_empty());
         assert_eq!(out.skipped_synthetic, 1);
+    }
+
+    #[test]
+    fn broken_lines_are_counted_but_a_torn_tail_is_not() {
+        // Garbage, and a usage record that will not parse. A torn final line
+        // is neither: it is unconsumed by design and arrives whole on the next
+        // scan, so counting it would make every transcript being written to
+        // look corrupt.
+        let broken_usage = r#"{"type":"assistant","message":{"usage":{"input_tokens":}}}"#;
+        let out = parse(&format!("{MSG}\nnot json at all\n{broken_usage}\n{{\"type\":\"assis"));
+        assert_eq!(out.malformed_lines, 2);
+        assert_eq!(out.events.len(), 1);
+
+        // A record that simply carries no usage is not damage — most of a
+        // transcript is exactly that.
+        let ordinary = parse(&format!("{{\"type\":\"user\",\"cwd\":\"/a\"}}\n{MSG}\n"));
+        assert_eq!(ordinary.malformed_lines, 0);
+    }
+
+    #[test]
+    fn the_damage_count_is_a_floor_rather_than_a_false_alarm() {
+        // Proving an uninteresting line well-formed would mean running serde
+        // over every record in a multi-gigabyte corpus — exactly the cost the
+        // substring pre-filter exists to avoid. So a broken line carrying no
+        // usage marker goes unnoticed, and that is the deliberate trade: the
+        // figure may understate damage, but it never invents any.
+        let out = parse(&format!("{{\"a\": bad}}\n{MSG}\n"));
+        assert_eq!(out.malformed_lines, 0, "structurally intact and never parsed");
+        assert_eq!(out.events.len(), 1, "the real records still land");
     }
 
     #[test]

@@ -19,6 +19,9 @@ use std::time::Instant;
 pub(crate) const MAX_TRANSCRIPT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 pub(crate) const MAX_JSONL_LINE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_SCAN_THREADS: usize = 4;
+/// How many damaged files a scan names. The total count is always exact; this
+/// bounds only the list of paths carried alongside it.
+pub const MAX_REPORTED_MALFORMED_FILES: usize = 10;
 
 /// A transcript file to consider.
 #[derive(Debug, Clone)]
@@ -46,6 +49,14 @@ pub struct ScanStats {
     pub events: usize,
     pub duplicates_dropped: usize,
     pub skipped_synthetic: u32,
+    /// Lines across the corpus that could not be read as a JSON object.
+    pub malformed_lines: u64,
+    /// The files carrying them, worst first and capped — enough to act on,
+    /// not enough to turn a diagnosis into a wall of paths.
+    pub malformed_files: Vec<(String, u32)>,
+    /// Transcripts that parsed cleanly but held no billed request. Ordinary
+    /// on its own (a journal, an aborted session), and worth knowing in bulk.
+    pub files_without_events: usize,
     /// Cache entries dropped because their file is gone.
     pub files_forgotten: usize,
     pub discover_ms: u128,
@@ -262,11 +273,23 @@ pub fn scan(
         }
         stats.bytes_total = stats.bytes_total.saturating_add(entry.size);
         stats.skipped_synthetic = stats.skipped_synthetic.saturating_add(entry.skipped_synthetic);
+        stats.malformed_lines =
+            stats.malformed_lines.saturating_add(u64::from(entry.malformed_lines));
+        if entry.malformed_lines > 0 {
+            stats.malformed_files.push((key.clone(), entry.malformed_lines));
+        }
+        if entry.events.is_empty() {
+            stats.files_without_events += 1;
+        }
         all.extend(entry.events.iter().cloned());
         seen.insert(key.clone());
         cache.files.insert(key, entry);
     }
     stats.files_forgotten = cache.retain_existing(&seen);
+    // Worst first, then by path so two runs over the same corpus name the same
+    // files. The list is a sample; `malformed_lines` remains the whole count.
+    stats.malformed_files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    stats.malformed_files.truncate(MAX_REPORTED_MALFORMED_FILES);
 
     let before = all.len();
     let events = dedup(all);
@@ -277,7 +300,13 @@ pub fn scan(
     Ok(ScanResult { events, stats })
 }
 
-fn scan_pool() -> &'static rayon::ThreadPool {
+/// The bounded pool every corpus-wide read shares.
+///
+/// Transcript work is IO-heavy and runs behind an interactive dashboard;
+/// letting rayon take every core would make a search or a scan the most
+/// disruptive thing on the machine. Search borrows the same pool rather than
+/// building a second one, so two reads cannot double the thread count.
+pub(crate) fn scan_pool() -> &'static rayon::ThreadPool {
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
     POOL.get_or_init(|| {
         let available = std::thread::available_parallelism().map_or(1, usize::from);
@@ -297,6 +326,7 @@ struct StreamParse {
     events: Vec<UsageEvent>,
     cursor: parse::ParseCursor,
     skipped_synthetic: u32,
+    malformed_lines: u32,
     offset: u64,
     bytes_read: u64,
 }
@@ -334,6 +364,7 @@ fn scan_one(t: &Target, cache: &Cache) -> Result<(String, FileEntry, ParseOutcom
                 cursor: parsed.cursor,
                 events,
                 skipped_synthetic: prev.skipped_synthetic.saturating_add(parsed.skipped_synthetic),
+                malformed_lines: prev.malformed_lines.saturating_add(parsed.malformed_lines),
             };
             Ok((key, entry, ParseOutcome { plan, bytes_read: parsed.bytes_read }))
         }
@@ -347,6 +378,7 @@ fn scan_one(t: &Target, cache: &Cache) -> Result<(String, FileEntry, ParseOutcom
                 cursor: parsed.cursor,
                 events: dedup(parsed.events),
                 skipped_synthetic: parsed.skipped_synthetic,
+                malformed_lines: parsed.malformed_lines,
             };
             Ok((key, entry, ParseOutcome { plan, bytes_read: parsed.bytes_read }))
         }
@@ -365,6 +397,7 @@ fn parse_stream(t: &Target, cursor: &parse::ParseCursor, from_offset: u64) -> Re
     let mut event_text_bytes = 0usize;
     let mut next_cursor = cursor.clone();
     let mut skipped_synthetic = 0u32;
+    let mut malformed_lines = 0u32;
     let mut offset = from_offset;
     let mut bytes_read = 0u64;
 
@@ -420,9 +453,17 @@ fn parse_stream(t: &Target, cursor: &parse::ParseCursor, from_offset: u64) -> Re
             t.path.display()
         );
         skipped_synthetic = skipped_synthetic.saturating_add(parsed.skipped_synthetic);
+        malformed_lines = malformed_lines.saturating_add(parsed.malformed_lines);
     }
 
-    Ok(StreamParse { events, cursor: next_cursor, skipped_synthetic, offset, bytes_read })
+    Ok(StreamParse {
+        events,
+        cursor: next_cursor,
+        skipped_synthetic,
+        malformed_lines,
+        offset,
+        bytes_read,
+    })
 }
 
 fn run_parser(t: &Target, cursor: &parse::ParseCursor, bytes: &[u8]) -> parse::FileParse {

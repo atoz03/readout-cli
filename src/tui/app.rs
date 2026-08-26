@@ -5,7 +5,9 @@
 //! is cheap next to the scan — rather than mutating per-view state, so the
 //! pages can never disagree with each other.
 
-use crate::agg::{Filter, SHARED_DEVICE_ID, Summary, summarize};
+use crate::agg::{
+    Filter, Insights, SHARED_DEVICE_ID, Summary, insights, previous_window, summarize,
+};
 use crate::devices::DeviceRecord;
 use crate::model::{Source, UsageEvent};
 use crate::pricing::Pricing;
@@ -19,9 +21,11 @@ use crate::tui::hit::Registry;
 pub enum Page {
     Overview,
     Daily,
+    Insights,
     Models,
     Projects,
     Sessions,
+    Search,
     Replay,
     Devices,
     Pricing,
@@ -31,17 +35,19 @@ pub enum Page {
 impl Page {
     /// Sidebar order, grouped under headings.
     pub const GROUPS: [(&'static str, &'static [Page]); 3] = [
-        ("Overview", &[Page::Overview, Page::Daily]),
-        ("Breakdown", &[Page::Models, Page::Projects, Page::Sessions, Page::Devices]),
+        ("Overview", &[Page::Overview, Page::Daily, Page::Insights]),
+        ("Breakdown", &[Page::Models, Page::Projects, Page::Sessions, Page::Search, Page::Devices]),
         ("Config", &[Page::Pricing, Page::Settings]),
     ];
 
-    pub const ORDER: [Page; 8] = [
+    pub const ORDER: [Page; 10] = [
         Page::Overview,
         Page::Daily,
+        Page::Insights,
         Page::Models,
         Page::Projects,
         Page::Sessions,
+        Page::Search,
         Page::Devices,
         Page::Pricing,
         Page::Settings,
@@ -51,9 +57,11 @@ impl Page {
         match self {
             Page::Overview => "Readout",
             Page::Daily => "Daily",
+            Page::Insights => "Insights",
             Page::Models => "Models",
             Page::Projects => "Projects",
             Page::Sessions => "Sessions",
+            Page::Search => "Search",
             Page::Replay => "Session Replay",
             Page::Devices => "Devices",
             Page::Pricing => "Pricing",
@@ -65,9 +73,11 @@ impl Page {
         match self {
             Page::Overview => "◈",
             Page::Daily => "▤",
+            Page::Insights => "◑",
             Page::Models => "◱",
             Page::Projects => "▣",
             Page::Sessions => "◷",
+            Page::Search => "⌕",
             Page::Replay => "▷",
             Page::Devices => "◫",
             Page::Pricing => "$",
@@ -218,7 +228,15 @@ pub struct ReplayUi {
     pub speed: u8,
     pub position_ms: f64,
     pub last_tick: std::time::Instant,
+    /// Which list this replay was opened from, so Esc returns there.
+    pub return_page: Page,
     pub return_session_index: usize,
+    /// Where to land once the transcript arrives, unix milliseconds.
+    ///
+    /// A search hit names a moment, not a session, and the transcript is read
+    /// on a background thread — so the target has to wait here until there is
+    /// something to seek within.
+    pub pending_seek_ts_ms: Option<i64>,
 }
 
 impl Default for ReplayUi {
@@ -232,9 +250,24 @@ impl Default for ReplayUi {
             speed: 1,
             position_ms: 0.0,
             last_tick: std::time::Instant::now(),
+            return_page: Page::Sessions,
             return_session_index: 0,
+            pending_seek_ts_ms: None,
         }
     }
+}
+
+/// Search 页面自己的短生命周期状态；命中的正文不会进入 usage cache。
+#[derive(Debug, Default)]
+pub struct SearchUi {
+    /// What the user is typing.
+    pub query: String,
+    /// The editor has focus. A search reads the whole corpus, so it runs on
+    /// Enter rather than on every keystroke.
+    pub editing: bool,
+    pub running: bool,
+    pub results: Option<crate::search::Results>,
+    pub error: Option<String>,
 }
 
 /// How often watch mode looks for new transcripts.
@@ -279,6 +312,11 @@ pub struct App {
     pub update_armed: Option<String>,
     pub pricing: Pricing,
     pub summary: Summary,
+    /// Derived ratios and rankings for the current window. Computed in
+    /// [`App::recompute`] rather than while drawing: it re-summarizes the
+    /// previous period, which is scan-sized work and has no business inside a
+    /// frame that has to finish in a few milliseconds.
+    pub insights: Insights,
     pub stats: ScanStats,
     pub loading: Loading,
 
@@ -322,6 +360,10 @@ pub struct App {
     pub replay: ReplayUi,
     /// event loop 取走请求后在后台读取 transcript。
     pub replay_requested: Option<ReplayRequest>,
+
+    pub search: SearchUi,
+    /// event loop 取走请求后在后台重读整个语料。
+    pub search_requested: Option<crate::search::Request>,
 }
 
 impl App {
@@ -387,6 +429,7 @@ impl App {
             update_armed: None,
             pricing,
             summary: Summary::default(),
+            insights: Insights::default(),
             stats: ScanStats::default(),
             loading: Loading::Scanning(None),
             selected: 0,
@@ -409,6 +452,8 @@ impl App {
             status: None,
             replay: ReplayUi::default(),
             replay_requested: None,
+            search: SearchUi::default(),
+            search_requested: None,
         }
     }
 
@@ -441,10 +486,16 @@ impl App {
 
     /// Recompute every rollup and restart the entrance animations.
     pub fn recompute(&mut self, animate: bool) {
-        self.summary = summarize(&self.events, &self.filter(), &self.pricing);
-        let mut device_filter = self.filter();
+        let filter = self.filter();
+        self.summary = summarize(&self.events, &filter, &self.pricing);
+        let mut device_filter = filter.clone();
         device_filter.device = None;
         self.device_summary = summarize(&self.events, &device_filter, &self.pricing);
+        // The comparison window costs a second pass, so it is only walked when
+        // there is one — an all-time range has no period before it.
+        let previous =
+            previous_window(&filter).map(|window| summarize(&self.events, &window, &self.pricing));
+        self.insights = insights(&self.summary, previous.as_ref(), self.range.days());
         self.summary_date = chrono::Local::now().date_naive();
         let targets = [
             self.summary.total.tokens.total() as f64,
@@ -590,9 +641,11 @@ impl App {
         match self.page {
             Page::Overview => self.summary.by_model.len(),
             Page::Daily => self.summary.daily.len(),
+            Page::Insights => self.insights.costly_sessions.len(),
             Page::Models => self.summary.by_model.len(),
             Page::Projects => self.summary.by_project.len(),
             Page::Sessions => self.summary.by_session.len(),
+            Page::Search => self.search.results.as_ref().map_or(0, |r| r.sessions.len()),
             Page::Replay => self.replay.data.as_ref().map_or(0, |replay| replay.events.len()),
             Page::Devices => self.device_row_count(),
             Page::Pricing => self.pricing.known_models().len(),
@@ -617,6 +670,9 @@ impl App {
         if self.page == Page::Settings && page != Page::Settings {
             self.cancel_device_name_editor();
         }
+        if self.page == Page::Search && page != Page::Search {
+            self.search.editing = false;
+        }
         if self.page != page {
             self.page = page;
             self.selected = 0;
@@ -627,6 +683,11 @@ impl App {
         }
         if page == Page::Devices && self.discover_ssh_hosts && !self.ssh_hosts_loaded {
             self.refresh_ssh_hosts();
+        }
+        // An empty Search page is a prompt, so land in the editor rather than
+        // on a list with nothing in it.
+        if page == Page::Search && self.search.results.is_none() && !self.search.running {
+            self.begin_search_edit();
         }
     }
 
@@ -723,6 +784,8 @@ impl App {
             }
             Page::Projects => self.open_project(self.selected),
             Page::Sessions => self.open_session(self.selected),
+            Page::Insights => self.open_insight_session(self.selected),
+            Page::Search => self.open_search_session(self.selected),
             Page::Replay => self.seek_replay(self.selected),
             Page::Devices => {
                 if self.device_picker {
@@ -785,6 +848,42 @@ impl App {
         let bucket_source = bucket.sources.iter().next().copied();
         let project = bucket.top_project().unwrap_or("unknown").to_string();
         let model = bucket.top_model().unwrap_or("unknown").to_string();
+        self.open_session_by_identity(
+            session,
+            bucket_source,
+            project,
+            model,
+            Page::Sessions,
+            index,
+        );
+    }
+
+    /// Open the session behind a ranked insight row.
+    ///
+    /// Insights ranks by cost, so its row indices are its own — resolving them
+    /// against `by_session`, which is ordered by recency, would replay whatever
+    /// session happened to sit at the same offset.
+    pub fn open_insight_session(&mut self, index: usize) {
+        let Some(row) = self.insights.costly_sessions.get(index) else { return };
+        let (session, source, project, model) =
+            (row.session.clone(), row.source, row.project.clone(), row.model.clone());
+        self.open_session_by_identity(session, Some(source), project, model, Page::Insights, index);
+    }
+
+    /// Load a session's transcript, however the caller identified it.
+    ///
+    /// `return_page` is where Esc goes back to, so a replay opened from a
+    /// ranking returns to that ranking rather than to a list the user was
+    /// never on.
+    fn open_session_by_identity(
+        &mut self,
+        session: String,
+        bucket_source: Option<Source>,
+        project: String,
+        model: String,
+        return_page: Page,
+        return_index: usize,
+    ) {
         let filter = self.filter();
         let matching: Vec<_> = self
             .events
@@ -819,7 +918,8 @@ impl App {
                     "usage-only remote session; Replay remains on {}",
                     names.join(", ")
                 )),
-                return_session_index: index,
+                return_page,
+                return_session_index: return_index,
                 ..ReplayUi::default()
             };
             self.page = Page::Replay;
@@ -828,10 +928,29 @@ impl App {
             self.needs_redraw = true;
             return;
         }
+        self.open_replay(request, return_page, return_index, None);
+    }
+
+    /// Show a replay for a request that is already resolved.
+    ///
+    /// Separate from the lookup above because a caller can arrive holding the
+    /// answer: search matched the transcript on this machine, so re-deriving
+    /// the source from the filtered event stream could only lose it — a
+    /// session outside the current window, or one that was never billed, has
+    /// no event to find and yet has a file full of text.
+    fn open_replay(
+        &mut self,
+        request: ReplayRequest,
+        return_page: Page,
+        return_index: usize,
+        seek_ts_ms: Option<i64>,
+    ) {
         self.replay = ReplayUi {
             request: Some(request.clone()),
             loading: true,
-            return_session_index: index,
+            return_page,
+            return_session_index: return_index,
+            pending_seek_ts_ms: seek_ts_ms,
             ..ReplayUi::default()
         };
         self.replay_requested = Some(request);
@@ -851,12 +970,167 @@ impl App {
         self.selected = 0;
         self.scroll = 0;
         self.needs_redraw = true;
+        // A search hit asked for a moment rather than for the session's start.
+        if let Some(target) = self.replay.pending_seek_ts_ms.take() {
+            self.seek_replay_to_ts(target);
+        }
+    }
+
+    /// Land on the first event at or after `target`, unix milliseconds.
+    ///
+    /// At-or-after rather than nearest: the reader asked to see something, and
+    /// stopping just before it would show the turn that preceded the answer.
+    fn seek_replay_to_ts(&mut self, target: i64) {
+        let Some(replay) = self.replay.data.as_ref() else { return };
+        let index = replay
+            .events
+            .iter()
+            .position(|event| event.ts_ms >= target && event.ts_ms > 0)
+            .unwrap_or_else(|| replay.events.len().saturating_sub(1));
+        self.seek_replay(index);
     }
 
     pub fn fail_replay(&mut self, error: String) {
         self.replay.loading = false;
         self.replay.error = Some(error);
         self.needs_redraw = true;
+    }
+
+    pub fn begin_search_edit(&mut self) {
+        self.search.editing = true;
+        self.search.error = None;
+        self.status = Some("type a phrase · Enter search · Esc back to results".into());
+        self.needs_redraw = true;
+    }
+
+    pub fn cancel_search_edit(&mut self) {
+        self.search.editing = false;
+        self.needs_redraw = true;
+    }
+
+    pub fn push_search_query(&mut self, ch: char) {
+        if !ch.is_control() && self.search.query.chars().count() < 512 {
+            self.search.query.push(ch);
+            self.search.error = None;
+            self.needs_redraw = true;
+        }
+    }
+
+    pub fn pop_search_query(&mut self) {
+        if self.search.query.pop().is_some() {
+            self.search.error = None;
+            self.needs_redraw = true;
+        }
+    }
+
+    pub fn clear_search_query(&mut self) {
+        self.search.query.clear();
+        self.search.error = None;
+        self.needs_redraw = true;
+    }
+
+    /// Hand the current query to the background reader.
+    ///
+    /// Searching costs a full pass over the corpus, so it happens on Enter and
+    /// never on a keystroke — a dashboard that re-read a gigabyte per letter
+    /// would be a worse way to find a sentence than `grep`.
+    pub fn submit_search(&mut self) {
+        let query = self.search.query.trim().to_string();
+        if query.chars().count() < crate::search::MIN_QUERY_CHARS {
+            self.search.error =
+                Some(format!("type at least {} characters", crate::search::MIN_QUERY_CHARS));
+            self.needs_redraw = true;
+            return;
+        }
+        if self.search.running {
+            self.status = Some("a search is already running".into());
+            return;
+        }
+        let filter = self.filter();
+        // A model is a property of a billed request, not of a sentence. The
+        // drill stays on the rest of the dashboard; saying nothing here would
+        // let a narrowed header imply a narrowed search.
+        if filter.model.is_some() {
+            self.status =
+                Some("searching every model — a model filter cannot apply to text".into());
+        }
+        self.search_requested = Some(crate::search::Request {
+            query,
+            sources: filter.sources.clone(),
+            // Labels come from the usage layer, so a result names a session
+            // exactly as the Sessions page does. `device_summary` rather than
+            // `summary`: search reads local files either way, so a device
+            // drill must not strip the names off what it finds.
+            index: crate::search::SessionIndex::from_summary(&self.device_summary),
+            project: filter.project.clone(),
+            since: filter.since,
+            until: filter.until,
+            limit: crate::search::DEFAULT_LIMIT,
+        });
+        self.search.running = true;
+        self.search.editing = false;
+        self.search.error = None;
+        self.selected = 0;
+        self.scroll = 0;
+        self.needs_redraw = true;
+    }
+
+    pub fn apply_search(&mut self, results: crate::search::Results) {
+        self.search.running = false;
+        self.search.error = None;
+        self.status = Some(format!(
+            "{} matches in {} sessions · {} transcripts read in {}",
+            results.total_matches,
+            results.sessions_matched,
+            results.files_searched,
+            crate::fmt::duration_ms(results.elapsed_ms),
+        ));
+        self.search.results = Some(results);
+        // Only if the reader is still here: a search runs for seconds, and
+        // resetting a selection they moved on another page would be the
+        // background thread reaching into a list it knows nothing about.
+        if self.page == Page::Search {
+            self.selected = 0;
+            self.scroll = 0;
+        }
+        self.needs_redraw = true;
+    }
+
+    pub fn fail_search(&mut self, error: String) {
+        self.search.running = false;
+        self.search.error = Some(error);
+        self.search.editing = true;
+        self.needs_redraw = true;
+    }
+
+    /// The session under the cursor, if the Search page has one.
+    pub fn selected_search_session(&self) -> Option<&crate::search::SessionHits> {
+        self.search.results.as_ref()?.sessions.get(self.selected)
+    }
+
+    /// Open the replay for a search result, landing on its first match.
+    pub fn open_search_session(&mut self, index: usize) {
+        self.open_search_hit(index, 0);
+    }
+
+    /// Open the replay for one specific hit inside the selected session.
+    pub fn open_search_sample(&mut self, sample: usize) {
+        self.open_search_hit(self.selected, sample);
+    }
+
+    fn open_search_hit(&mut self, index: usize, sample: usize) {
+        let Some(results) = self.search.results.as_ref() else { return };
+        let Some(session) = results.sessions.get(index) else { return };
+        let seek = session.samples.get(sample).map(|hit| hit.ts_ms).filter(|ts| *ts > 0);
+        let request = ReplayRequest {
+            source: session.source,
+            session: session.session.clone(),
+            project: session.project.clone(),
+            // Search matched words, not billed requests, so there is no model
+            // to attribute the session to. Replay shows it as context only.
+            model: "—".to_string(),
+        };
+        self.open_replay(request, Page::Search, index, seek);
     }
 
     pub fn device_name<'a>(&'a self, id: &'a str) -> &'a str {
@@ -1195,8 +1469,8 @@ impl App {
 
     pub fn back_to_sessions(&mut self) {
         let index = self.replay.return_session_index;
-        self.page = Page::Sessions;
-        self.selected = index.min(self.summary.by_session.len().saturating_sub(1));
+        self.page = self.replay.return_page;
+        self.selected = index.min(self.row_count().saturating_sub(1));
         self.scroll = self.selected;
         self.replay.playing = false;
         self.replay_requested = None;

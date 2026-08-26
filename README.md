@@ -26,6 +26,9 @@ readout summary --json   # emit JSON
 - View today, the last 7/30/90 days, or all recorded history
 - Estimate model cost while clearly marking unpriced usage
 - Replay messages and tool calls from local sessions on a timeline
+- Search every Claude Code and Codex transcript and jump straight into Replay
+- Derive cache hit ratio, burn rate, costly sessions, and period-over-period change
+- Diagnose coverage, damaged records, pricing gaps, cache health, and device sync
 - Aggregate multiple machines over SSH without double-counting copied transcripts
 - Incrementally scan transcripts and keep the dashboard live at low overhead
 - Export JSON, CSV, and fixed-size dashboard snapshots with consistent CLI filters
@@ -101,6 +104,8 @@ configuration:
 | Models | Model distribution and pricing coverage |
 | Projects | Projects, with navigation into their sessions |
 | Sessions / Replay | Session usage and local message/tool timelines |
+| Insights | Cache efficiency, burn rate, costly and context-heavy sessions |
+| Search | Full-text search over local history, opening Replay at the match |
 | Devices | The local machine, configured SSH devices, and sync state |
 | Pricing | Effective model prices |
 | Settings | Aggregation, local identity, devices, aliases, and config paths |
@@ -120,6 +125,7 @@ The essential keyboard controls are:
 | `w` | Toggle watch mode |
 | `u` twice | Update the selected configured remote |
 | `Delete` / `Backspace` | Remove the selected SSH device |
+| `/` | Search your Claude Code and Codex history |
 | `?` | Show contextual help |
 | `q`, `Ctrl-C` | Quit |
 
@@ -185,9 +191,12 @@ readout summary [--json|--csv] [--timing]
 readout models
 readout projects
 readout daily [--json|--csv]
+readout insights [--json]
+readout search QUERY [-n LIMIT] [--json]
+readout doctor [--json]
 readout pricing [--init]
 readout refresh [--clear]
-readout snapshot [--width N] [--height N] [--page PAGE]
+readout snapshot [--width N] [--height N] [--page PAGE] [--query TEXT]
 
 readout sync
 readout update
@@ -240,8 +249,10 @@ By default, readout scans only:
 - `~/.claude/projects/**/*.jsonl`
 - `~/.codex/sessions/**/*.jsonl`
 
-Codex `archived_sessions/` is intentionally excluded. Session Replay reads
-message content only when a specific session is opened.
+Codex `archived_sessions/` is intentionally excluded. Message content is read
+only on demand — by Session Replay when you open a session, and by Search while
+it runs — and is never written to the cache. That is why a search re-reads the
+transcripts every time instead of answering from an index.
 
 readout never opens `~/.claude/settings.json`, `~/.codex/config.toml`, or
 `~/.codex/auth.json`, and it never modifies either tool's configuration. Its

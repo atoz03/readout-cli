@@ -31,6 +31,8 @@ enum NavList {
     Projects,
     Days,
     Sessions,
+    InsightSessions,
+    SearchSessions,
     ReplayEvents,
     Devices,
     Rates,
@@ -49,7 +51,9 @@ fn owns_selection(page: Page, list: NavList) -> bool {
         Page::Overview | Page::Models => list == NavList::Models,
         Page::Projects => list == NavList::Projects,
         Page::Daily => list == NavList::Days,
+        Page::Insights => list == NavList::InsightSessions,
         Page::Sessions => list == NavList::Sessions,
+        Page::Search => list == NavList::SearchSessions,
         Page::Replay => list == NavList::ReplayEvents,
         Page::Devices => list == NavList::Devices,
         Page::Pricing => list == NavList::Rates,
@@ -87,9 +91,11 @@ pub fn draw(app: &mut App, buf: &mut Buffer, area: Rect) {
         match app.page {
             Page::Overview => overview(app, buf, &mut hits, content),
             Page::Daily => daily(app, buf, &mut hits, content),
+            Page::Insights => insights(app, buf, &mut hits, content),
             Page::Models => ranked(app, buf, &mut hits, content, RankKind::Model),
             Page::Projects => ranked(app, buf, &mut hits, content, RankKind::Project),
             Page::Sessions => sessions(app, buf, &mut hits, content),
+            Page::Search => search(app, buf, &mut hits, content),
             Page::Replay => replay(app, buf, &mut hits, content),
             Page::Devices => devices(app, buf, &mut hits, content),
             Page::Pricing => pricing(app, buf, &mut hits, content),
@@ -112,7 +118,7 @@ fn is_empty(app: &App) -> bool {
     // what it has rather than claiming there is nothing.
     app.summary.total.events == 0
         && !matches!(app.loading, Loading::Scanning(_))
-        && !matches!(app.page, Page::Pricing | Page::Devices | Page::Settings)
+        && !matches!(app.page, Page::Pricing | Page::Devices | Page::Settings | Page::Search)
 }
 
 fn draw_empty(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
@@ -865,6 +871,491 @@ fn day_table(app: &App, buf: &mut Buffer, hits: &mut Registry, table_area: Rect)
     }
 }
 
+// ── Insights ────────────────────────────────────────────────────────────────
+
+/// One label/value row, optionally with the bar its value is a fraction of.
+///
+/// A bar appears only where the number really is a share of something. Drawing
+/// one under a rate ("$18/day") would invite the reader to compare its length
+/// against a whole that does not exist.
+struct Metric<'a> {
+    label: &'a str,
+    value: String,
+    fraction: Option<f64>,
+    color: ratatui::style::Color,
+}
+
+fn metric_rows(buf: &mut Buffer, area: Rect, rows: &[Metric<'_>], grow: f64) {
+    if area.width < 12 || area.height == 0 {
+        return;
+    }
+    let value_w =
+        rows.iter().map(|r| r.value.chars().count() as u16).max().unwrap_or(6).min(area.width / 2);
+    let label_w = rows
+        .iter()
+        .map(|r| r.label.chars().count() as u16)
+        .max()
+        .unwrap_or(8)
+        .min(area.width.saturating_sub(value_w + 2));
+    for (i, row) in rows.iter().enumerate().take(area.height as usize) {
+        let y = area.y + i as u16;
+        w::text(
+            buf,
+            area.x,
+            y,
+            label_w,
+            &fmt::ellipsize(row.label, label_w as usize),
+            Style::default().fg(theme::TEXT_SECONDARY),
+        );
+        if let Some(fraction) = row.fraction {
+            let track_x = area.x + label_w + 1;
+            let track_w = area.width.saturating_sub(label_w + value_w + 2);
+            w::hbar(buf, track_x, y, track_w, fraction * grow, row.color);
+        }
+        w::text_right(
+            buf,
+            area.right().saturating_sub(value_w),
+            y,
+            value_w,
+            &row.value,
+            Style::default().fg(theme::TEXT_PRIMARY),
+        );
+    }
+}
+
+/// A ratio with nothing behind it, rendered the way an unpriced cost is: as a
+/// dash. `0%` would be a measurement, and there wasn't one.
+fn optional(value: Option<f64>, render: impl Fn(f64) -> String) -> String {
+    value.map_or_else(|| "—".to_string(), render)
+}
+
+fn insights(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
+    // Three cards fit side by side only on a wide terminal. Narrower, the
+    // period comparison drops to a single line rather than being dropped
+    // altogether — it is the answer to "is this getting worse", and losing it
+    // to a column boundary would be the wrong thing to lose.
+    let has_previous = app.insights.previous.is_some();
+    let three_up = area.width >= 100 && has_previous;
+    let tiles_h = if area.height >= 8 { 4 } else { area.height };
+    let rest = area.height.saturating_sub(tiles_h);
+    let compare_h = u16::from(has_previous && !three_up && rest >= 14);
+    let body = rest.saturating_sub(compare_h);
+    let cards_h = if body >= 16 {
+        8
+    } else if body >= 12 {
+        body - 6
+    } else {
+        0
+    };
+    let [tiles, cards, compare, lists] = Layout::vertical([
+        Constraint::Length(tiles_h),
+        Constraint::Length(cards_h),
+        Constraint::Length(compare_h),
+        Constraint::Length(body - cards_h),
+    ])
+    .areas(area);
+
+    insight_tiles(app, buf, hits, tiles);
+
+    if cards_h > 0 {
+        if three_up {
+            let [efficiency, burn, previous] =
+                Layout::horizontal([Constraint::Ratio(1, 3); 3]).spacing(1).areas(cards);
+            efficiency_card(app, buf, hits, efficiency);
+            burn_card(app, buf, hits, burn);
+            comparison_card(app, buf, hits, previous);
+        } else if cards.width >= 52 {
+            let [efficiency, burn] =
+                Layout::horizontal([Constraint::Ratio(1, 2); 2]).spacing(1).areas(cards);
+            efficiency_card(app, buf, hits, efficiency);
+            burn_card(app, buf, hits, burn);
+        } else {
+            efficiency_card(app, buf, hits, cards);
+        }
+    }
+    if compare_h > 0 {
+        comparison_line(app, buf, compare);
+    }
+
+    if lists.height > 0 {
+        if lists.width >= 96 {
+            let [sessions, projects] =
+                Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)])
+                    .spacing(1)
+                    .areas(lists);
+            costly_session_list(app, buf, hits, sessions);
+            cost_rank_card(app, buf, hits, projects);
+        } else {
+            costly_session_list(app, buf, hits, lists);
+        }
+    }
+}
+
+/// The period comparison compressed to one line, for terminals with no room
+/// for the card. Each measure keeps its name, so a truncated line loses whole
+/// facts rather than turning one into another.
+fn comparison_line(app: &App, buf: &mut Buffer, area: Rect) {
+    let Some(p) = app.insights.previous else { return };
+    let parts = [
+        format!("tokens {}", fmt::delta(p.tokens.ratio())),
+        format!("cost {}", fmt::delta(p.cost.ratio())),
+        format!("reqs {}", fmt::delta(p.requests.ratio())),
+        format!("sessions {}", fmt::delta(p.sessions.ratio())),
+    ];
+    let mut line = format!("vs previous {}d", p.span_days);
+    for part in parts {
+        if line.chars().count() + part.chars().count() + 3 > area.width as usize {
+            break;
+        }
+        line.push_str(" · ");
+        line.push_str(&part);
+    }
+    w::text(buf, area.x, area.y, area.width, &line, Style::default().fg(theme::TEXT_MUTED));
+}
+
+fn insight_tiles(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
+    let i = &app.insights;
+    let cols = Layout::horizontal([Constraint::Ratio(1, 4); 4]).spacing(1).split(area);
+    // A tile's label is the only thing naming its number, so it shortens
+    // rather than clips — the rule the Overview tiles already follow.
+    let narrow = cols[1].width < 14;
+    let cost = |v: f64| fmt::money_partial(v, i.cost_coverage);
+    let tiles: [(String, &str, ratatui::style::Color); 4] = [
+        (
+            optional(i.cache_hit_ratio, fmt::share),
+            if narrow { "Cached" } else { "Cache hit" },
+            theme::SERIES[2],
+        ),
+        (cost(i.cost_per_day), if narrow { "$/day" } else { "Cost/day" }, theme::SERIES[3]),
+        (cost(i.cost_per_session), if narrow { "$/run" } else { "Cost/session" }, theme::SERIES[4]),
+        (
+            optional(i.context_per_request, |v| fmt::tokens(v.round() as u64)),
+            if narrow { "Ctx/req" } else { "Context/req" },
+            theme::SERIES[0],
+        ),
+    ];
+    for (index, (value, label, accent)) in tiles.into_iter().enumerate() {
+        let hovered = app.hover == Some(w::hover_id(label));
+        w::kpi_tile(buf, hits, cols[index], &value, label, accent, None, hovered);
+    }
+}
+
+fn efficiency_card(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
+    let i = &app.insights;
+    let inner = w::card(
+        buf,
+        hits,
+        area,
+        Card {
+            title: "Efficiency",
+            glyph: "◑",
+            glyph_color: theme::SERIES[2],
+            meta: Some(format!("{} context", fmt::tokens(i.tokens.context()))),
+            action: None,
+        },
+    );
+    let rows = [
+        Metric {
+            label: "cache hit",
+            value: optional(i.cache_hit_ratio, fmt::share),
+            fraction: i.cache_hit_ratio,
+            color: theme::SERIES[2],
+        },
+        Metric {
+            label: "output ratio",
+            value: optional(i.output_per_context, fmt::multiplier),
+            fraction: None,
+            color: theme::SERIES[0],
+        },
+        Metric {
+            label: "context / req",
+            value: optional(i.context_per_request, |v| fmt::tokens(v.round() as u64)),
+            fraction: None,
+            color: theme::SERIES[0],
+        },
+        Metric {
+            label: "tokens / req",
+            value: optional(i.tokens_per_request, |v| fmt::tokens(v.round() as u64)),
+            fraction: None,
+            color: theme::SERIES[0],
+        },
+        Metric {
+            label: "reqs / session",
+            value: optional(i.requests_per_session, |v| format!("{v:.1}")),
+            fraction: None,
+            color: theme::SERIES[0],
+        },
+    ];
+    metric_rows(buf, inner, &rows, app.grow.value());
+}
+
+fn burn_card(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
+    let i = &app.insights;
+    let cost = |v: f64| fmt::money_partial(v, i.cost_coverage);
+    let inner = w::card(
+        buf,
+        hits,
+        area,
+        Card {
+            title: "Burn Rate",
+            glyph: "$",
+            glyph_color: theme::SERIES[3],
+            meta: Some(format!("{}/{}d active", i.active_days, i.span_days)),
+            action: Some(Action::Page(Page::Pricing)),
+        },
+    );
+    let mut rows = vec![
+        Metric {
+            label: "per day",
+            value: cost(i.cost_per_day),
+            fraction: None,
+            color: theme::SERIES[3],
+        },
+        Metric {
+            label: "per active day",
+            value: cost(i.cost_per_active_day),
+            fraction: None,
+            color: theme::SERIES[3],
+        },
+        Metric {
+            label: "per session",
+            value: cost(i.cost_per_session),
+            fraction: None,
+            color: theme::SERIES[3],
+        },
+        Metric {
+            label: "per request",
+            value: cost(i.cost_per_request),
+            fraction: None,
+            color: theme::SERIES[3],
+        },
+        Metric {
+            label: "month to date",
+            value: fmt::money_partial(i.month_to_date.cost, i.month_to_date.coverage()),
+            fraction: None,
+            color: theme::SERIES[3],
+        },
+    ];
+    // A month cannot be projected from a window that does not reach the first
+    // of it, so the row is absent there rather than showing a dash the reader
+    // would have to interpret.
+    if let Some(projected) = i.projected_month {
+        rows.push(Metric {
+            label: "month on track for",
+            value: fmt::money_partial(projected, i.cost_coverage),
+            fraction: None,
+            color: theme::SERIES[3],
+        });
+    }
+    metric_rows(buf, inner, &rows, app.grow.value());
+}
+
+fn comparison_card(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
+    let Some(p) = app.insights.previous else { return };
+    let inner = w::card(
+        buf,
+        hits,
+        area,
+        Card {
+            title: "vs Previous",
+            glyph: "⇄",
+            glyph_color: theme::SERIES[6],
+            meta: Some(format!("{}d", p.span_days)),
+            action: None,
+        },
+    );
+    // Rising spend is worth noticing but is not an error, so the delta carries
+    // a categorical hue rather than a reserved status color.
+    let hue = |change: crate::agg::Change| {
+        if change.delta() > 0.0 { theme::SERIES[1] } else { theme::SERIES[5] }
+    };
+    let row = |label: &'static str, change: crate::agg::Change, current: String| Metric {
+        label,
+        value: format!("{current} {}", fmt::delta(change.ratio())),
+        fraction: None,
+        color: hue(change),
+    };
+    let rows = [
+        row("tokens", p.tokens, fmt::tokens(p.tokens.current as u64)),
+        row("cost", p.cost, fmt::money_partial(p.cost.current, app.insights.cost_coverage)),
+        row("requests", p.requests, fmt::count(p.requests.current as u64)),
+        row("sessions", p.sessions, fmt::count(p.sessions.current as u64)),
+    ];
+    metric_rows(buf, inner, &rows, app.grow.value());
+    if inner.height > rows.len() as u16 {
+        // A delta drawn between a fully priced window and a partly priced one
+        // is not comparing like with like, and the reader has to be told.
+        let note = if p.previous_coverage >= 0.999 {
+            format!(
+                "was {} · {}",
+                fmt::money_partial(p.cost.previous, p.previous_coverage),
+                fmt::tokens(p.tokens.previous as u64)
+            )
+        } else {
+            format!(
+                "was {} ({} of tokens unpriced then)",
+                fmt::money_partial(p.cost.previous, p.previous_coverage),
+                fmt::share(1.0 - p.previous_coverage)
+            )
+        };
+        w::text(
+            buf,
+            inner.x,
+            inner.y + rows.len() as u16,
+            inner.width,
+            &fmt::ellipsize(&note, inner.width as usize),
+            Style::default().fg(theme::TEXT_MUTED),
+        );
+    }
+}
+
+fn costly_session_list(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
+    let i = &app.insights;
+    let shown = i.costly_sessions.len();
+    let inner = w::card(
+        buf,
+        hits,
+        area,
+        Card {
+            title: "Most Expensive Sessions",
+            glyph: "◷",
+            glyph_color: theme::SERIES[4],
+            // A capped ranking says so. "100 sessions" over a corpus of nine
+            // thousand would read as the whole set.
+            meta: Some(if i.session_total > shown {
+                format!("top {shown} of {}", i.session_total)
+            } else {
+                format!("{shown} in window")
+            }),
+            action: None,
+        },
+    );
+    if inner.height == 0 || inner.width < 20 {
+        return;
+    }
+    if i.costly_sessions.is_empty() {
+        w::text(
+            buf,
+            inner.x,
+            inner.y,
+            inner.width,
+            "no sessions in this window",
+            Style::default().fg(theme::TEXT_MUTED),
+        );
+        return;
+    }
+    let rows = inner.height as usize;
+    if owns_selection(app.page, NavList::InsightSessions) {
+        app.list_rows.set(rows);
+    }
+    let max = i.costly_sessions.first().map_or(0.0, |s| s.priced.cost).max(f64::MIN_POSITIVE);
+    let values: Vec<String> = i
+        .costly_sessions
+        .iter()
+        .map(|s| {
+            format!(
+                "{:>9} {:>8} {:>6}r",
+                fmt::money_partial(s.priced.cost, s.priced.coverage()),
+                fmt::tokens(s.tokens.total()),
+                fmt::count(s.events),
+            )
+        })
+        .collect();
+    let value_w = values.iter().map(|v| v.chars().count() as u16).max().unwrap_or(24);
+    let label_w = inner.width.saturating_sub(value_w + 4).clamp(8, 44);
+    for (index, s) in i.costly_sessions.iter().enumerate().skip(app.scroll).take(rows) {
+        let y = inner.y + (index - app.scroll) as u16;
+        let row = Rect { x: inner.x, y, width: inner.width, height: 1 };
+        // A session id names nothing to a reader; the project and model do.
+        let label = format!("{}  {}", s.project, s.model);
+        w::bar_row(
+            buf,
+            row,
+            label_w,
+            value_w,
+            BarRow {
+                label: &label,
+                value: &values[index],
+                fraction: s.priced.cost / max * app.grow.value(),
+                color: theme::series_for(&s.model),
+                selected: index == app.selected,
+                hovered: app.hover == Some(w::hover_id(&format!("insight:{index}"))),
+            },
+        );
+        hits.add_hoverable(
+            row,
+            Action::InsightSessionRow(index),
+            w::hover_id(&format!("insight:{index}")),
+        );
+    }
+}
+
+fn cost_rank_card(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
+    // Projects and models both rank by cost here; the Projects page ranks the
+    // same rows by tokens, and the two answer different questions.
+    let i = &app.insights;
+    // Sized to the rows they hold, so a short list does not leave a card-shaped
+    // hole between the two rankings.
+    let height_for = |rows: usize| (rows as u16 + 1).min(area.height.saturating_sub(1)).max(2);
+    let projects_h = height_for(i.costly_projects.len());
+    let models_h = height_for(i.costly_models.len());
+    let [projects_area, models_area, _] = Layout::vertical([
+        Constraint::Length(projects_h),
+        Constraint::Length(if area.height > projects_h + 3 { models_h } else { 0 }),
+        Constraint::Min(0),
+    ])
+    .areas(area);
+    cost_rows_card(app, buf, hits, projects_area, "Cost by Project", &i.costly_projects);
+    if models_area.height > 0 {
+        cost_rows_card(app, buf, hits, models_area, "Cost by Model", &i.costly_models);
+    }
+}
+
+fn cost_rows_card(
+    app: &App,
+    buf: &mut Buffer,
+    hits: &mut Registry,
+    area: Rect,
+    title: &str,
+    rows: &[crate::agg::CostRow],
+) {
+    let inner = w::card(
+        buf,
+        hits,
+        area,
+        Card {
+            title,
+            glyph: "▣",
+            glyph_color: theme::SERIES[3],
+            meta: Some(format!("{}", rows.len())),
+            action: None,
+        },
+    );
+    if inner.height == 0 || inner.width < 16 {
+        return;
+    }
+    let max = rows.first().map_or(0.0, |r| r.cost).max(f64::MIN_POSITIVE);
+    let values: Vec<String> = rows.iter().map(|r| fmt::money_partial(r.cost, r.coverage)).collect();
+    let value_w = values.iter().map(|v| v.chars().count() as u16).max().unwrap_or(8);
+    let label_w = inner.width.saturating_sub(value_w + 4).clamp(6, 30);
+    for (index, row) in rows.iter().enumerate().take(inner.height as usize) {
+        w::bar_row(
+            buf,
+            Rect { x: inner.x, y: inner.y + index as u16, width: inner.width, height: 1 },
+            label_w,
+            value_w,
+            BarRow {
+                label: &row.label,
+                value: &values[index],
+                fraction: row.cost / max * app.grow.value(),
+                color: theme::series_for(&row.label),
+                selected: false,
+                hovered: false,
+            },
+        );
+    }
+}
+
 // ── Ranked lists ────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1084,6 +1575,318 @@ fn session_list(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect, sc
         );
         hits.add_hoverable(row, Action::SessionRow(i), hover_id);
     }
+}
+
+// ── Search ─────────────────────────────────────────────────────────────────
+
+fn search(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
+    // The query line is always drawn: it is both the control and the record of
+    // what the list below is showing.
+    let [query, body] = Layout::vertical([Constraint::Length(3), Constraint::Min(3)]).areas(area);
+    search_query(app, buf, hits, query);
+    // The quoted lines are the point of a search result — "which session" is
+    // only half an answer. Side by side where there is width for both, stacked
+    // where there is not, and dropped only when neither fits.
+    let has_results = app.search.results.is_some();
+    if has_results && body.width >= 92 {
+        let [list, detail] =
+            Layout::horizontal([Constraint::Percentage(58), Constraint::Min(30)]).areas(body);
+        search_results(app, buf, hits, list);
+        search_samples(app, buf, hits, detail);
+    } else if has_results && body.width >= 44 && body.height >= 14 {
+        let [list, detail] =
+            Layout::vertical([Constraint::Min(5), Constraint::Length(8)]).areas(body);
+        search_results(app, buf, hits, list);
+        search_samples(app, buf, hits, detail);
+    } else {
+        search_results(app, buf, hits, body);
+    }
+}
+
+fn search_query(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
+    let meta = if app.search.editing {
+        "Enter search · Ctrl+u clear · Esc back".to_string()
+    } else {
+        "/ edit · Enter open replay at the hit".to_string()
+    };
+    let inner = w::card(
+        buf,
+        hits,
+        area,
+        Card {
+            title: "Search",
+            glyph: "⌕",
+            glyph_color: theme::SERIES[3],
+            meta: Some(meta),
+            action: Some(Action::SearchEdit),
+        },
+    );
+    if inner.height == 0 {
+        return;
+    }
+    let row = Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 };
+    if app.search.editing {
+        w::fill(buf, row, theme::SURFACE_SELECTED);
+    }
+    let shown = match (app.search.editing, app.search.query.is_empty()) {
+        (true, _) => format!("{}_", app.search.query),
+        (false, true) => "press / to search your Claude Code and Codex history".to_string(),
+        (false, false) => app.search.query.clone(),
+    };
+    let style = if app.search.query.is_empty() && !app.search.editing {
+        Style::default().fg(theme::TEXT_MUTED)
+    } else {
+        Style::default().fg(theme::TEXT_PRIMARY).add_modifier(Modifier::BOLD)
+    };
+    w::text(
+        buf,
+        row.x + 1,
+        row.y,
+        row.width.saturating_sub(2),
+        &fmt::terminal_ellipsize(&shown, row.width.saturating_sub(2) as usize),
+        style,
+    );
+    hits.add(row, Action::SearchEdit);
+}
+
+fn search_results(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
+    let results = app.search.results.as_ref();
+    let meta = match (app.search.running, results) {
+        (true, _) => "reading every transcript…".to_string(),
+        // Narrow, the timing is the first thing worth dropping: it says how
+        // the answer was reached rather than what the answer is.
+        (false, Some(r)) if area.width < 56 => {
+            format!(
+                "{} · {} sessions",
+                plural(r.total_matches, "match", "matches"),
+                r.sessions_matched
+            )
+        }
+        (false, Some(r)) => format!(
+            "{} · {} · {}",
+            plural(r.total_matches, "match", "matches"),
+            plural(r.sessions_matched, "session", "sessions"),
+            fmt::duration_ms(r.elapsed_ms),
+        ),
+        (false, None) => "nothing searched yet".to_string(),
+    };
+    let inner = w::card(
+        buf,
+        hits,
+        area,
+        Card {
+            title: "Results",
+            glyph: "◷",
+            glyph_color: theme::SERIES[2],
+            meta: Some(meta),
+            action: None,
+        },
+    );
+    if inner.height == 0 || inner.width < 16 {
+        return;
+    }
+    let rows = inner.height as usize;
+    if owns_selection(app.page, NavList::SearchSessions) {
+        app.list_rows.set(rows);
+    }
+    if let Some(error) = app.search.error.as_deref() {
+        w::text(buf, inner.x, inner.y, inner.width, error, Style::default().fg(theme::CRITICAL));
+        return;
+    }
+    let Some(results) = results else {
+        // Nothing has been asked yet. Say what the box will search rather than
+        // leaving an empty panel that could mean "no results".
+        for (line, text) in [
+            "Type a phrase and press Enter.",
+            "",
+            "Every Claude Code and Codex transcript on this machine is read \
+             fresh — message text is never cached.",
+            "",
+            "The window and source chips above narrow the search; a result \
+             opens Replay at the moment it matched.",
+        ]
+        .iter()
+        .enumerate()
+        {
+            if (line as u16) < inner.height {
+                w::text(
+                    buf,
+                    inner.x,
+                    inner.y + line as u16,
+                    inner.width,
+                    &fmt::ellipsize(text, inner.width as usize),
+                    Style::default().fg(theme::TEXT_MUTED),
+                );
+            }
+        }
+        return;
+    };
+    if results.sessions.is_empty() {
+        w::text(
+            buf,
+            inner.x,
+            inner.y,
+            inner.width,
+            if app.search.running { "searching…" } else { "nothing matched" },
+            Style::default().fg(theme::TEXT_MUTED),
+        );
+        return;
+    }
+    // A capped list that says nothing reads as the whole set.
+    let note = (results.sessions_matched > results.sessions.len() || results.truncated)
+        .then_some(results.sessions.len());
+    let list_rows = rows.saturating_sub(usize::from(note.is_some()));
+    let time_w = 10u16;
+    let hits_w = 5u16;
+    for (i, session) in results.sessions.iter().enumerate().skip(app.scroll).take(list_rows) {
+        let y = inner.y + (i - app.scroll) as u16;
+        let row = Rect { x: inner.x, y, width: inner.width, height: 1 };
+        let selected = i == app.selected;
+        let hover_id = w::hover_id(&format!("search:{i}"));
+        if selected || app.hover == Some(hover_id) {
+            w::fill(
+                buf,
+                row,
+                if selected { theme::SURFACE_SELECTED } else { theme::SURFACE_RAISED },
+            );
+        }
+        let mark = if selected { theme::SELECT_MARK } else { theme::DOT };
+        w::text(
+            buf,
+            row.x,
+            y,
+            1,
+            mark,
+            Style::default().fg(theme::series_for(session.source.label())),
+        );
+        // The dot's hue already separates the two tools, but colour alone is
+        // not a label — name the source as well.
+        let src_w = 7u16;
+        w::text(
+            buf,
+            row.x + 2,
+            y,
+            src_w,
+            session.source.short(),
+            Style::default().fg(theme::TEXT_MUTED),
+        );
+        let label_w = row.width.saturating_sub(time_w + hits_w + src_w + 4);
+        w::text(
+            buf,
+            row.x + 2 + src_w,
+            y,
+            label_w,
+            &fmt::terminal_ellipsize(&session.project, label_w as usize),
+            Style::default().fg(if selected { theme::TEXT_PRIMARY } else { theme::TEXT_SECONDARY }),
+        );
+        w::text_right(
+            buf,
+            row.right().saturating_sub(time_w + hits_w),
+            y,
+            hits_w,
+            &format!("{}", session.matches),
+            Style::default().fg(theme::TEXT_SECONDARY),
+        );
+        w::text_right(
+            buf,
+            row.right().saturating_sub(time_w),
+            y,
+            time_w,
+            &fmt::relative(session.last_ts_ms.div_euclid(1_000)),
+            Style::default().fg(theme::TEXT_MUTED),
+        );
+        hits.add_hoverable(row, Action::SearchRow(i), hover_id);
+    }
+    if let Some(shown) = note {
+        let text = if results.truncated {
+            format!(
+                "showing {shown} of at least {} — a search limit was hit",
+                results.sessions_matched
+            )
+        } else {
+            format!("showing the {shown} most recent of {}", results.sessions_matched)
+        };
+        w::text(
+            buf,
+            inner.x,
+            inner.y + list_rows as u16,
+            inner.width,
+            &fmt::ellipsize(&text, inner.width as usize),
+            Style::default().fg(theme::TEXT_MUTED),
+        );
+    }
+}
+
+/// The matching lines inside the selected session.
+fn search_samples(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
+    let session = app.selected_search_session();
+    let inner = w::card(
+        buf,
+        hits,
+        area,
+        Card {
+            title: "Matches",
+            glyph: "⌕",
+            glyph_color: theme::SERIES[3],
+            meta: session.map(|s| {
+                let shown = s.samples.len().min(crate::search::MAX_SAMPLES_PER_SESSION);
+                if s.matches > shown {
+                    format!("{shown} of {} · click to open there", s.matches)
+                } else {
+                    format!("{} · click to open there", plural(s.matches, "match", "matches"))
+                }
+            }),
+            action: None,
+        },
+    );
+    let Some(session) = session else { return };
+    if inner.height == 0 || inner.width < 20 {
+        return;
+    }
+    // Two lines each: what said it, then what it said.
+    let mut y = inner.y;
+    for (index, hit) in session.samples.iter().enumerate() {
+        if y + 1 >= inner.bottom() {
+            break;
+        }
+        let head = Rect { x: inner.x, y, width: inner.width, height: 2 };
+        let hover_id = w::hover_id(&format!("search-sample:{index}"));
+        if app.hover == Some(hover_id) {
+            w::fill(buf, head, theme::SURFACE_RAISED);
+        }
+        let stamp = crate::agg::local_datetime(hit.ts_ms.div_euclid(1_000))
+            .map_or_else(|| "—".to_string(), |dt| dt.format("%b %-d %H:%M").to_string());
+        let used = w::text(
+            buf,
+            inner.x,
+            y,
+            inner.width,
+            &fmt::terminal_ellipsize(&hit.title, 18),
+            Style::default().fg(replay_color(hit.kind)).add_modifier(Modifier::BOLD),
+        );
+        w::text(
+            buf,
+            inner.x + used + 1,
+            y,
+            inner.width.saturating_sub(used + 1),
+            &stamp,
+            Style::default().fg(theme::TEXT_MUTED),
+        );
+        w::text(
+            buf,
+            inner.x,
+            y + 1,
+            inner.width,
+            &fmt::terminal_ellipsize(&hit.snippet, inner.width as usize),
+            Style::default().fg(theme::TEXT_SECONDARY),
+        );
+        hits.add_hoverable(head, Action::SearchSample(index), hover_id);
+        y += 3;
+    }
+}
+
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
 }
 
 // ── Devices ────────────────────────────────────────────────────────────────

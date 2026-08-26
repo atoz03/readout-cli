@@ -56,6 +56,11 @@ enum ReplayMsg {
     Failed(String),
 }
 
+enum SearchMsg {
+    Done(Box<crate::search::Results>),
+    Failed(String),
+}
+
 pub fn run(
     sources: Vec<Source>,
     base: Filter,
@@ -90,17 +95,25 @@ pub fn run(
 /// This exists so the layout can be inspected at an exact size — in a test, in
 /// a bug report, or piped to a file — rather than only by eye at whatever size
 /// the window happens to be.
-pub fn snapshot(
-    sources: Vec<Source>,
-    base: Filter,
-    use_cache: bool,
-    width: u16,
-    height: u16,
-    page: Page,
-    settings: Settings,
-) -> Result<String> {
+pub struct SnapshotRequest {
+    pub sources: Vec<Source>,
+    pub filter: Filter,
+    pub use_cache: bool,
+    pub width: u16,
+    pub height: u16,
+    pub page: Page,
+    /// Run this search before drawing. The Search page is a prompt until
+    /// something has been searched, so without it a snapshot of that page
+    /// could never show the layout it exists to show.
+    pub query: Option<String>,
+    pub settings: Settings,
+}
+
+pub fn snapshot(request: SnapshotRequest) -> Result<String> {
+    let SnapshotRequest { sources, filter, use_cache, width, height, page, query, settings } =
+        request;
     let pricing = Pricing::load(crate::paths::pricing_override_file().ok().as_deref())?;
-    let mut app = App::with_settings(sources.clone(), base, pricing, settings.clone());
+    let mut app = App::with_settings(sources.clone(), filter, pricing, settings.clone());
     let result = devices::load_usage(&sources, use_cache, &settings, None)?;
     app.events = result.scan.events;
     app.stats = result.scan.stats;
@@ -113,6 +126,17 @@ pub fn snapshot(
     // Snapshots show the settled state; animating into a still image would
     // only ever capture a half-drawn frame.
     app.recompute(false);
+    if let Some(query) = query {
+        app.search.query = query;
+        app.submit_search();
+        match app.search_requested.take() {
+            Some(request) => match crate::search::run(&request) {
+                Ok(results) => app.apply_search(results),
+                Err(error) => app.fail_search(crate::fmt::error_chain(&error)),
+            },
+            None => app.search.editing = true,
+        }
+    }
 
     let area = ratatui::layout::Rect { x: 0, y: 0, width, height };
     let mut buf = ratatui::buffer::Buffer::empty(area);
@@ -241,6 +265,20 @@ fn spawn_replay(request: ReplayRequest) -> Receiver<ReplayMsg> {
     rx
 }
 
+/// Search reads the whole corpus, so it runs where the scan does: off the
+/// event loop, leaving the dashboard responsive while it works.
+fn spawn_search(request: crate::search::Request) -> Receiver<SearchMsg> {
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        let message = match crate::search::run(&request) {
+            Ok(results) => SearchMsg::Done(Box::new(results)),
+            Err(error) => SearchMsg::Failed(crate::fmt::error_chain(&error)),
+        };
+        let _ = tx.send(message);
+    });
+    rx
+}
+
 fn event_loop(
     terminal: &mut Term,
     app: &mut App,
@@ -249,6 +287,7 @@ fn event_loop(
 ) -> Result<()> {
     let mut rx = spawn_scan(sources.clone(), use_cache, app.settings.clone());
     let mut replay_rx: Option<Receiver<ReplayMsg>> = None;
+    let mut search_rx: Option<Receiver<SearchMsg>> = None;
     let mut device_rx: Option<Receiver<DeviceMsg>> = None;
     app.scan_pending = true;
     let mut kind = Rescan::Manual;
@@ -263,6 +302,14 @@ fn event_loop(
             && drain_replay(app, receiver)
         {
             replay_rx = None;
+        }
+        if let Some(request) = app.search_requested.take() {
+            search_rx = Some(spawn_search(request));
+        }
+        if let Some(receiver) = search_rx.as_ref()
+            && drain_search(app, receiver)
+        {
+            search_rx = None;
         }
         if let Some(receiver) = device_rx.as_ref()
             && drain_device(app, receiver)
@@ -345,6 +392,27 @@ fn drain_device(app: &mut App, rx: &Receiver<DeviceMsg>) -> bool {
         Err(TryRecvError::Disconnected) => {
             if app.device_pending {
                 app.sync_failed("the device worker stopped without reporting".into());
+            }
+            true
+        }
+    }
+}
+
+/// 返回 true 表示后台搜索已经结束，可以丢弃 receiver。
+fn drain_search(app: &mut App, rx: &Receiver<SearchMsg>) -> bool {
+    match rx.try_recv() {
+        Ok(SearchMsg::Done(results)) => {
+            app.apply_search(*results);
+            true
+        }
+        Ok(SearchMsg::Failed(error)) => {
+            app.fail_search(error);
+            true
+        }
+        Err(TryRecvError::Empty) => false,
+        Err(TryRecvError::Disconnected) => {
+            if app.search.running {
+                app.fail_search("the search stopped without reporting".into());
             }
             true
         }
@@ -436,6 +504,9 @@ fn on_key(app: &mut App, k: KeyEvent) {
             KeyCode::Char('u') if app.page == Page::Devices && app.device_picker => {
                 app.update_selected_device();
             }
+            KeyCode::Char('u') if app.page == Page::Search && app.search.editing => {
+                app.clear_search_query();
+            }
             _ => {}
         }
         return;
@@ -473,6 +544,36 @@ fn on_key(app: &mut App, k: KeyEvent) {
             _ => {}
         }
         return;
+    }
+
+    // The query editor owns the keyboard while it has focus, so `d`, `q` and
+    // the rest reach the query rather than the dashboard's shortcuts.
+    if app.page == Page::Search && app.search.editing {
+        match k.code {
+            KeyCode::Esc => app.cancel_search_edit(),
+            KeyCode::Backspace => app.pop_search_query(),
+            KeyCode::Enter => app.submit_search(),
+            KeyCode::Char(ch)
+                if !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                app.push_search_query(ch);
+            }
+            _ => {}
+        }
+        return;
+    }
+    if app.page == Page::Search {
+        match k.code {
+            KeyCode::Char('/') | KeyCode::Char('i') => {
+                app.begin_search_edit();
+                return;
+            }
+            KeyCode::Enter => {
+                app.open_search_session(app.selected);
+                return;
+            }
+            _ => {}
+        }
     }
 
     if app.page == Page::Devices && app.device_picker {
@@ -531,6 +632,11 @@ fn on_key(app: &mut App, k: KeyEvent) {
         KeyCode::Esc => app.set_drill(Drill::None),
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Char('r') => app.request_rescan(Rescan::Manual),
+        // `/` means search everywhere it is not already typing.
+        KeyCode::Char('/') => {
+            app.set_page(Page::Search);
+            app.begin_search_edit();
+        }
         KeyCode::Char('w') => app.toggle_watch(),
         KeyCode::Char('t') => app.set_range(Range::Today),
         KeyCode::Tab | KeyCode::Right => app.next_page(1),
@@ -551,7 +657,7 @@ fn on_key(app: &mut App, k: KeyEvent) {
         KeyCode::Char('?') => {
             app.status = Some(
                 "click the sidebar, chips, and rows · wheel scrolls · enter drills in · \
-                 w keeps the numbers live"
+                 / searches your history · w keeps the numbers live"
                     .into(),
             )
         }
@@ -614,6 +720,10 @@ fn apply(app: &mut App, action: Action) {
         }
         Action::ProjectRow(i) => app.open_project(i),
         Action::SessionRow(i) => app.open_session(i),
+        Action::InsightSessionRow(i) => app.open_insight_session(i),
+        Action::SearchRow(i) => app.open_search_session(i),
+        Action::SearchSample(i) => app.open_search_sample(i),
+        Action::SearchEdit => app.begin_search_edit(),
         Action::BackToSessions => app.back_to_sessions(),
         Action::ReplayToggle => app.toggle_replay(),
         Action::ReplaySpeed(speed) => app.set_replay_speed(speed),
@@ -897,6 +1007,57 @@ mod tests {
     }
 
     #[test]
+    fn an_insight_row_opens_the_session_it_names_not_the_one_at_that_offset() {
+        // Insights ranks by cost and Sessions by recency, so the two lists
+        // disagree about what row 0 is. Resolving an insight row against
+        // `by_session` would quietly replay a different session than the one
+        // the user clicked.
+        let mut a = app_with_data();
+        a.set_page(Page::Insights);
+        let ranked = a.insights.costly_sessions[0].session.clone();
+        assert_ne!(
+            ranked, a.summary.by_session[0].label,
+            "the two orderings must differ for this test to mean anything"
+        );
+
+        apply(&mut a, Action::InsightSessionRow(0));
+        assert_eq!(a.page, Page::Replay);
+        assert_eq!(
+            a.replay_requested.as_ref().map(|request| request.session.as_str()),
+            Some(ranked.as_str())
+        );
+        // Esc goes back to the ranking it was opened from, not to a list the
+        // user was never on.
+        assert_eq!(a.replay.return_page, Page::Insights);
+        a.back_to_sessions();
+        assert_eq!(a.page, Page::Insights);
+    }
+
+    #[test]
+    fn insights_are_recomputed_with_the_summary_rather_than_alongside_it() {
+        // Two views of one window that are accumulated separately can drift
+        // apart. These are both derived from the same recompute, so a drill
+        // that narrows one must narrow the other by construction.
+        let mut a = app_with_data();
+        assert_eq!(a.insights.tokens, a.summary.total.tokens);
+        a.set_drill(Drill::Model("model-1".into()));
+        assert_eq!(a.insights.tokens, a.summary.total.tokens);
+        assert_eq!(a.insights.session_total, a.summary.by_session.len());
+        assert_eq!(a.row_count(), a.insights.costly_sessions.len().min(a.row_count()));
+    }
+
+    #[test]
+    fn an_all_time_window_shows_no_period_comparison() {
+        // There is no window before all of them, and inventing one to fill the
+        // card would be a fabricated baseline.
+        let mut a = app_with_data();
+        a.set_range(Range::All);
+        assert!(a.insights.previous.is_none());
+        a.set_range(Range::D7);
+        assert!(a.insights.previous.is_some());
+    }
+
+    #[test]
     fn hover_only_redraws_when_the_target_changes() {
         let mut a = app_with_data();
         a.hits.add_hoverable(
@@ -998,6 +1159,181 @@ mod tests {
                 assert!(text.contains("1x"));
             }
         }
+    }
+
+    fn search_results(matches: usize) -> crate::search::Results {
+        crate::search::Results {
+            query: "deadlock".into(),
+            sessions: vec![
+                crate::search::SessionHits {
+                    source: Source::Claude,
+                    session: "sess-recent".into(),
+                    project: "/w/alpha".into(),
+                    last_ts_ms: 1_787_000_002_000,
+                    matches,
+                    samples: vec![
+                        crate::search::Hit {
+                            ts_ms: 1_787_000_001_000,
+                            kind: ReplayKind::User,
+                            title: "user".into(),
+                            snippet: "why does the pool deadlock".into(),
+                        },
+                        crate::search::Hit {
+                            ts_ms: 1_787_000_002_000,
+                            kind: ReplayKind::ToolCall,
+                            title: "Bash".into(),
+                            snippet: "grep -rn deadlock src".into(),
+                        },
+                    ],
+                },
+                crate::search::SessionHits {
+                    source: Source::Codex,
+                    session: "sess-older".into(),
+                    project: "/w/beta".into(),
+                    last_ts_ms: 1_786_000_000_000,
+                    matches: 1,
+                    samples: vec![crate::search::Hit {
+                        ts_ms: 1_786_000_000_000,
+                        kind: ReplayKind::Assistant,
+                        title: "assistant".into(),
+                        snippet: "the deadlock was in the waiter".into(),
+                    }],
+                },
+            ],
+            sessions_matched: 9,
+            total_matches: matches + 1,
+            files_searched: 400,
+            files_failed: 0,
+            files_total: 400,
+            bytes_read: 1_000,
+            truncated: false,
+            elapsed_ms: 1_500,
+        }
+    }
+
+    #[test]
+    fn search_results_name_their_sessions_and_quote_the_lines_that_matched() {
+        let mut a = app_with_many_rows();
+        a.set_page(Page::Search);
+        a.search.query = "deadlock".into();
+        a.apply_search(search_results(7));
+
+        let text = buffer_text(&render(&mut a, 130, 30));
+        assert!(text.contains("/w/alpha"), "a result is named by its project: {text}");
+        assert!(text.contains("grep -rn deadlock src"), "the matching line is quoted");
+        assert!(text.contains("Bash"), "a tool hit names its tool");
+        // Nine sessions matched and two are shown; silence would read as two.
+        assert!(text.contains("showing the 2 most recent of 9"), "{text}");
+        // The samples say they are a sample.
+        assert!(text.contains("2 of 7"), "{text}");
+    }
+
+    #[test]
+    fn a_narrow_search_page_drops_the_sample_pane_rather_than_the_results() {
+        let mut a = app_with_many_rows();
+        a.set_page(Page::Search);
+        a.apply_search(search_results(2));
+        for (width, height) in [(160, 48), (130, 30), (100, 24), (60, 18), (20, 8), (1, 1)] {
+            let text = buffer_text(&render(&mut a, width, height));
+            if width >= 60 && height >= 18 {
+                assert!(text.contains("/w/alpha"), "{width}x{height}: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn opening_a_hit_seeks_the_replay_to_the_moment_it_matched() {
+        let mut a = app_with_many_rows();
+        a.set_page(Page::Search);
+        a.apply_search(search_results(2));
+        // The second sample, not the first: a hit names a moment.
+        a.open_search_sample(1);
+        assert_eq!(a.page, Page::Replay);
+        assert_eq!(a.replay.pending_seek_ts_ms, Some(1_787_000_002_000));
+        assert_eq!(
+            a.replay_requested.as_ref().map(|r| r.session.as_str()),
+            Some("sess-recent"),
+            "the request goes straight to the matched session"
+        );
+
+        a.apply_replay(SessionReplay {
+            events: vec![
+                ReplayEvent {
+                    ts_ms: 1_787_000_000_000,
+                    offset_ms: 0,
+                    kind: ReplayKind::User,
+                    title: "user".into(),
+                    detail: "start".into(),
+                },
+                ReplayEvent {
+                    ts_ms: 1_787_000_002_000,
+                    offset_ms: 2_000,
+                    kind: ReplayKind::ToolCall,
+                    title: "Bash".into(),
+                    detail: "grep".into(),
+                },
+            ],
+            first_ts_ms: 1_787_000_000_000,
+            last_ts_ms: 1_787_000_002_000,
+            truncated: false,
+        });
+        assert_eq!(a.selected, 1, "the replay lands on the matching event, not on the start");
+        assert_eq!(a.replay.position_ms, 2_000.0);
+        assert_eq!(a.replay.pending_seek_ts_ms, None, "the seek is consumed once");
+
+        // Esc returns to the search results rather than to a list the reader
+        // was never on.
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.page, Page::Search);
+    }
+
+    #[test]
+    fn a_hit_in_a_session_with_no_billed_usage_still_opens_its_replay() {
+        // `sess-recent` has no usage event, so resolving the source through
+        // the filtered event stream would find nothing. Search already knows
+        // it: it matched the file on this machine.
+        let mut a = App::new(Source::ALL.to_vec(), Filter::default(), Pricing::builtin());
+        a.set_page(Page::Search);
+        a.apply_search(search_results(1));
+        a.open_search_session(0);
+        assert_eq!(a.page, Page::Replay);
+        assert!(a.replay.error.is_none(), "{:?}", a.replay.error);
+        assert!(a.replay_requested.is_some());
+    }
+
+    #[test]
+    fn the_query_editor_owns_the_keyboard_while_it_has_focus() {
+        let mut a = app_with_many_rows();
+        a.set_page(Page::Search);
+        assert!(a.search.editing, "an unsearched page opens in the editor");
+        // `q` quits the dashboard everywhere else; here it is a letter.
+        for ch in "deadlock".chars() {
+            press(&mut a, KeyCode::Char(ch));
+        }
+        assert_eq!(a.search.query, "deadlock");
+        assert!(!a.should_quit);
+
+        press(&mut a, KeyCode::Enter);
+        assert!(a.search_requested.is_some(), "Enter runs the search");
+        assert!(!a.search.editing, "and gives the keyboard back to the list");
+
+        // Too short to be a search: say so rather than reading the corpus.
+        a.search_requested = None;
+        a.search.running = false;
+        a.begin_search_edit();
+        a.search.query = "d".into();
+        press(&mut a, KeyCode::Enter);
+        assert!(a.search_requested.is_none());
+        assert!(a.search.error.is_some());
+    }
+
+    #[test]
+    fn slash_opens_search_from_any_page() {
+        let mut a = app_with_many_rows();
+        a.set_page(Page::Models);
+        press(&mut a, KeyCode::Char('/'));
+        assert_eq!(a.page, Page::Search);
+        assert!(a.search.editing);
     }
 
     /// Plain text of a rendered buffer, one line per row.

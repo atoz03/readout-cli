@@ -73,6 +73,48 @@ pub fn share(fraction: f64) -> String {
     }
 }
 
+/// A relative change as a signed percentage: `+12%`, `-3%`, `±0%`.
+///
+/// `None` is the "there was nothing to compare against" case, which reads as
+/// `new`. Rendering that as `+100%` would be inventing a baseline, and as `0%`
+/// would hide a window that went from empty to busy.
+pub fn delta(ratio: Option<f64>) -> String {
+    let Some(ratio) = ratio else { return "new".to_string() };
+    let pct = ratio * 100.0;
+    // A change too small to show as a whole percent is not a flat line, and
+    // `+0%` next to a number that demonstrably moved reads as a bug.
+    if !pct.is_finite() {
+        "—".to_string()
+    } else if pct.abs() < 0.5 {
+        "±0%".to_string()
+    } else {
+        format!("{pct:+.0}%")
+    }
+}
+
+/// A ratio expressed as a multiplier: `4.2x`, `0.08x`, `0.004x`.
+///
+/// The precision follows the magnitude rather than being fixed. Output is a
+/// few thousandths of the context a cached agent turn carries, and rounding
+/// that to `0.00x` deletes the measurement instead of abbreviating it.
+pub fn multiplier(v: f64) -> String {
+    if !v.is_finite() {
+        "—".to_string()
+    } else if v >= 10.0 {
+        format!("{v:.0}x")
+    } else if v >= 1.0 {
+        format!("{v:.1}x")
+    } else if v >= 0.01 {
+        format!("{v:.2}x")
+    } else if v >= 0.0005 {
+        format!("{v:.3}x")
+    } else if v > 0.0 {
+        "<0.001x".to_string()
+    } else {
+        "0x".to_string()
+    }
+}
+
 /// `20h ago`, `yesterday`, `Jul 27`.
 pub fn relative(ts: i64) -> String {
     if ts == 0 {
@@ -216,6 +258,28 @@ mod tests {
         assert_eq!(money_partial(0.0, 0.0), "—");
         assert_eq!(money_partial(12.0, 1.0), "$12.00");
         assert_eq!(money_partial(12.0, 0.5), "$12.00+", "a partial total must say so");
+    }
+
+    #[test]
+    fn a_change_from_nothing_is_named_rather_than_given_a_percentage() {
+        assert_eq!(delta(None), "new");
+        assert_eq!(delta(Some(0.12)), "+12%");
+        assert_eq!(delta(Some(-0.034)), "-3%");
+        assert_eq!(delta(Some(0.0)), "±0%");
+        assert_eq!(delta(Some(0.001)), "±0%", "a change too small to show is not a rise");
+        assert_eq!(delta(Some(f64::INFINITY)), "—");
+    }
+
+    #[test]
+    fn multipliers_keep_a_significant_digit_at_every_magnitude() {
+        assert_eq!(multiplier(4.23), "4.2x");
+        assert_eq!(multiplier(0.081), "0.08x");
+        assert_eq!(multiplier(42.0), "42x");
+        // A cached agent turn produces a few thousandths of its context in
+        // output. `0.00x` would delete that measurement rather than shorten it.
+        assert_eq!(multiplier(0.0042), "0.004x");
+        assert_eq!(multiplier(0.00001), "<0.001x");
+        assert_eq!(multiplier(0.0), "0x");
     }
 
     #[test]
