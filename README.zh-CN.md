@@ -144,7 +144,7 @@ readout search — "frame budget"
     22:03 tool res… …budget test measures the profile rather than the code…
 ```
 
-在 dashboard 中对结果按 `Enter`，会直接从命中的那一刻打开 Session Replay，而不是从会话开头。其他筛选参数同样生效，只有 `-m/--model` 例外：模型属于一次计费请求，而不属于一句话，因此 search 会明确提示该参数被忽略，而不是悄悄地什么也不筛。
+在 dashboard 中对结果按 `Enter`，会直接从命中的那一刻打开 Session Replay，而不是从会话开头。其他筛选参数同样生效，只有 `-m/--model` 例外：模型属于一次计费请求，而不属于一句话，因此 search 会明确说明该参数被忽略，而不是让它悄悄失效。
 
 搜索每次都重新读取 transcript，而不是查索引，因为消息正文从不进入缓存——参见[数据与隐私](#数据与隐私)。GB 级历史需要几秒钟。
 
@@ -180,7 +180,7 @@ readout insights — last 7 days
 
 ## 健康检查
 
-`readout doctor` 回答这些数字是否可信：两棵 transcript 目录是否都存在、是否有记录解析失败、是否存在重复响应或缺失时间戳、是否有模型缺价，以及缓存和远端快照是否是最新的。
+`readout doctor` 回答这些数字是否可信：两个 transcript 目录是否都存在、是否有记录解析失败、是否存在重复响应或缺失时间戳、是否有模型缺价，以及缓存和远端快照是否是最新的。
 
 ```sh
 readout doctor
