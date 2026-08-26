@@ -15,7 +15,7 @@ every test is a `#[cfg(test)] mod tests` next to the code it covers.
 ```sh
 cargo build
 cargo run -- summary --json               # scriptable output
-cargo test --all-targets                  # ~210 tests, about a second
+cargo test --all-targets                  # ~270 tests, about a second
 cargo test dedup                          # one test / substring
 cargo test --release                      # see below — not redundant
 cargo fmt --all --check
@@ -61,6 +61,36 @@ writes a real `~/.config/readout/settings.json` on the machine running the test.
 | `READOUT_STATE_DIR` | the cache, remote snapshots and `pricing.json` (default `~/.cache/readout/`) |
 | `READOUT_CONFIG_DIR` | `settings.json` (default `~/.config/readout/`) |
 | `READOUT_SSH_CONFIG` | SSH config used for Host discovery and passed to OpenSSH with `-F` |
+
+## Releasing
+
+**`main` must stay linear.** A GitHub ruleset rejects any push containing a
+merge commit — `remote: error: GH013 … This branch must not contain merge
+commits`. Branch, commit, then fast-forward or rebase back onto `main`; never
+`git merge --no-ff`. A `--no-ff` merge of a fast-forwardable branch contributes
+no content of its own anyway, so flattening one costs nothing: check
+`git rev-parse <merge>^{tree}` against the branch tip before resetting.
+
+A release is one commit plus one tag:
+
+1. Bump `version` in `Cargo.toml`, then refresh `Cargo.lock`
+   (`cargo update -p readout --offline`).
+2. Update both READMEs. `README.zh-CN.md` is a mirror, not a subset — a new
+   command or page belongs in its Features list, its page/key tables, and its
+   CLI block too.
+3. Run the full gate, including `cargo test --release`.
+4. Commit (subject in the imperative, ending `… and release vX.Y.Z`), then
+   `git tag -a vX.Y.Z`.
+
+**Pushing the tag is the publish action.** `.github/workflows/release.yml` fires
+on `v*` and builds and uploads artifacts, so push `main` *first* and the tag
+second — its validate job rejects a tag that is not already an ancestor of
+`origin/main`, and separately rejects one whose name does not match
+`^v[0-9]+\.[0-9]+\.[0-9]+$` or whose version disagrees with `Cargo.toml`.
+
+```sh
+git push origin main && git push origin vX.Y.Z
+```
 
 ## Architecture
 
