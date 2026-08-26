@@ -134,6 +134,115 @@ and `[`/`]` to move one event at a time. Remote bundles contain no message
 content, so remote sessions are usage-only; full Replay is available only where
 the transcript itself exists.
 
+## Search
+
+`/` in the dashboard, or `readout search` from a shell, looks for a phrase
+across every Claude Code and Codex transcript on the machine. Matching ignores
+ASCII case, and results group by session, most recent first.
+
+```sh
+readout search "frame budget" -n 2
+readout search deadlock -d 30 -s codex
+readout search "cache hit" --json
+```
+
+```text
+readout search — "frame budget"
+  34 matches in 7 sessions · 477 of 477 transcripts read in 2.04s
+  showing the 2 most recent; pass --limit for more
+
+  1f4c8a02-91be… claude  /work/api-gateway                         4 hits just now
+    09:12 assistant the release-mode frame budget test asserts only when optimized
+    09:20 Bash      …cargo test --release -- frame_budget…
+
+  01a008f3-aec7… codex   /work/ingest                              2 hits Aug 15
+    22:03 tool res… …budget test measures the profile rather than the code…
+```
+
+In the dashboard, `Enter` on a result opens Session Replay positioned at the
+moment it matched rather than at the start of the session. The same filters
+apply as everywhere else, except `-m/--model`: a model is a property of a billed
+request, not of a sentence, so search says it is ignoring the flag instead of
+quietly narrowing nothing.
+
+Search re-reads the transcripts on every run instead of consulting an index,
+because message text is never cached — see [Data and privacy](#data-and-privacy).
+A gigabyte-scale history takes a few seconds.
+
+## Insights
+
+Derived ratios and rankings rather than totals: what the cache is saving, what
+the window costs per day, which sessions are expensive or context-heavy, and how
+the period compares with the one before it.
+
+```sh
+readout insights -d 7
+readout insights --json
+```
+
+```text
+readout insights — last 7 days
+
+  Efficiency
+    cache hit ratio               99%   454M of 459M tokens of context served from cache
+    output ratio               0.004x   output per token of context sent
+    context per request          196k   context carried by the average request
+
+  Burn rate
+    per day                    $45.39   over 7 calendar days
+    per active day             $79.43   over 4 days with activity
+
+  Against the previous 7 days
+    tokens                       461M     -54%   was 1.0B
+    cost                      $317.71     -62%   was $829.89
+```
+
+The comparison window is the current one shifted back by its own length, so
+`-d 7` is measured against the 7 days before it. All-time has no period before
+it and shows no comparison.
+
+Every figure comes from the same rollup the other pages read, so Insights cannot
+disagree with Overview. A ratio with nothing behind it prints `—` rather than
+`0`, and costs carry the same coverage marks as everywhere else.
+
+## Health checks
+
+`readout doctor` answers whether the numbers can be trusted: whether both
+transcript trees were found, whether any records failed to parse, whether
+responses were duplicated or timestamps are missing, whether anything is
+unpriced, and whether the cache and remote snapshots are current.
+
+```sh
+readout doctor
+readout doctor --json
+```
+
+```text
+readout doctor — corpus health, all time
+
+  ✓ ok    Transcript coverage    97,418 requests across 477 transcripts
+          transcripts discovered       477
+          read this run                477 reused · 0 appended · 0 full
+          transcripts with no usage    94
+
+  ✓ ok    Malformed records      every record parsed
+
+  ⓘ note  Model pricing          1 model has no rate — <1% of tokens are excluded from cost
+                 codex-auto-review
+          → readout pricing --init  # write a starter override file
+
+  6 ok · 2 note · 0 warn · 0 fail
+```
+
+It diagnoses and never repairs: each finding names the command that would fix
+it. The exit code is meant to be scripted on:
+
+| Code | Meaning |
+|---|---|
+| `0` | Ran cleanly, or found only notes and warnings |
+| `1` | readout itself could not run |
+| `2` | A figure readout reports is wrong or missing |
+
 ## Multiple devices
 
 readout uses OpenSSH to run `readout export` on remote machines. Exported

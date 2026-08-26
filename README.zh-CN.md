@@ -121,6 +121,97 @@ readout -w              # 每几秒增量刷新
 
 Replay 默认暂停。`Space` 播放或暂停，`1/2/4` 调整倍速，`[`/`]` 逐事件移动。远端 bundle 不包含消息正文，因此远程 session 只显示用量；完整 Replay 仅在当前设备持有会话记录时可用。
 
+## 搜索
+
+在 dashboard 中按 `/`，或在终端执行 `readout search`，可以在本机所有 Claude Code 与 Codex transcript 中查找一段文字。匹配忽略 ASCII 大小写，结果按 session 分组，最近的在前。
+
+```sh
+readout search "frame budget" -n 2
+readout search deadlock -d 30 -s codex
+readout search "cache hit" --json
+```
+
+```text
+readout search — "frame budget"
+  34 matches in 7 sessions · 477 of 477 transcripts read in 2.04s
+  showing the 2 most recent; pass --limit for more
+
+  1f4c8a02-91be… claude  /work/api-gateway                         4 hits just now
+    09:12 assistant the release-mode frame budget test asserts only when optimized
+    09:20 Bash      …cargo test --release -- frame_budget…
+
+  01a008f3-aec7… codex   /work/ingest                              2 hits Aug 15
+    22:03 tool res… …budget test measures the profile rather than the code…
+```
+
+在 dashboard 中对结果按 `Enter`，会直接从命中的那一刻打开 Session Replay，而不是从会话开头。其他筛选参数同样生效，只有 `-m/--model` 例外：模型属于一次计费请求，而不属于一句话，因此 search 会明确提示该参数被忽略，而不是悄悄地什么也不筛。
+
+搜索每次都重新读取 transcript，而不是查索引，因为消息正文从不进入缓存——参见[数据与隐私](#数据与隐私)。GB 级历史需要几秒钟。
+
+## Insights
+
+给出的是比率和排名，而不是总量：缓存省下了多少、当前窗口每天花多少、哪些会话最贵或上下文最重，以及与上一个周期相比的变化。
+
+```sh
+readout insights -d 7
+readout insights --json
+```
+
+```text
+readout insights — last 7 days
+
+  Efficiency
+    cache hit ratio               99%   454M of 459M tokens of context served from cache
+    output ratio               0.004x   output per token of context sent
+    context per request          196k   context carried by the average request
+
+  Burn rate
+    per day                    $45.39   over 7 calendar days
+    per active day             $79.43   over 4 days with activity
+
+  Against the previous 7 days
+    tokens                       461M     -54%   was 1.0B
+    cost                      $317.71     -62%   was $829.89
+```
+
+对比窗口是当前窗口整体前移自身长度，因此 `-d 7` 与它之前的 7 天相比。全部历史没有更早的周期，因此不显示对比。
+
+所有数字都来自其他页面读取的同一份汇总，因此 Insights 不会与 Overview 冲突。没有依据的比率显示 `—` 而不是 `0`，费用同样带有覆盖率标记。
+
+## 健康检查
+
+`readout doctor` 回答这些数字是否可信：两棵 transcript 目录是否都存在、是否有记录解析失败、是否存在重复响应或缺失时间戳、是否有模型缺价，以及缓存和远端快照是否是最新的。
+
+```sh
+readout doctor
+readout doctor --json
+```
+
+```text
+readout doctor — corpus health, all time
+
+  ✓ ok    Transcript coverage    97,418 requests across 477 transcripts
+          transcripts discovered       477
+          read this run                477 reused · 0 appended · 0 full
+          transcripts with no usage    94
+
+  ✓ ok    Malformed records      every record parsed
+
+  ⓘ note  Model pricing          1 model has no rate — <1% of tokens are excluded from cost
+                 codex-auto-review
+          → readout pricing --init  # write a starter override file
+
+  6 ok · 2 note · 0 warn · 0 fail
+```
+
+它只诊断，不修复：每条结论都会给出可以修复它的命令。退出码可以直接用于脚本判断：
+
+| 退出码 | 含义 |
+|---|---|
+| `0` | 运行正常，或只有 note 和 warn |
+| `1` | readout 自身无法运行 |
+| `2` | readout 报出的某个数字是错的或缺失的 |
+
 ## 多设备
 
 readout 通过 OpenSSH 从远端执行 `readout export`。远端 bundle 只包含用量元数据，不包含 prompt、回复正文、工具参数、工具结果或认证信息。
