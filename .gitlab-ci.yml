@@ -1,0 +1,79 @@
+# GitLab mirror of .github/workflows/ci.yml.
+#
+# Its existence is half the point: with no pipeline definition GitLab falls back
+# to Auto DevOps, which tries to build a container image with Cloud Native
+# Buildpacks. That needs a privileged docker-in-docker service, and it is the
+# wrong shape for a single Rust binary regardless. Nothing below needs Docker —
+# these are plain image jobs that run on an unprivileged runner.
+
+stages: [lint, test]
+
+variables:
+  CARGO_TERM_COLOR: always
+  # Cargo's downloads live outside the project by default, where `cache:` cannot
+  # see them.
+  CARGO_HOME: $CI_PROJECT_DIR/.cargo
+
+# One image for both jobs, pinned to the toolchain the lint job requires, so a
+# pipeline pulls ~600 MB once instead of twice. Coverage on a floating `stable`
+# — and on macOS and Windows — comes from the GitHub matrix; if this instance
+# ever becomes the only CI, give the test job `image: rust:latest` back.
+default:
+  image: rust:1.97.1
+  cache:
+    # Per job: the two jobs write different target dirs, and a shared key means
+    # whichever finishes last silently overwrites the other's.
+    key: cargo-$CI_JOB_NAME
+    paths:
+      - .cargo/registry/
+      - .cargo/git/
+      - target/
+
+lint:
+  stage: lint
+  # Pinned, not `stable`: every Rust release adds lints, and a floating
+  # toolchain turns `-D warnings` into a build that breaks on an untouched
+  # repository. .github/workflows/ci.yml holds the same pin — bump both in the
+  # commit that fixes the new lints.
+  before_script:
+    # The official rust image is built with rustup's minimal profile, which
+    # ships neither component.
+    - rustup component add rustfmt clippy
+  script:
+    - cargo fmt --all --check
+    - cargo clippy --all-targets -- -D warnings
+
+test:
+  stage: test
+  variables:
+    # All five redirects, not a subset: every subcommand loads settings, so
+    # leaving READOUT_CONFIG_DIR unset writes a real settings.json onto the
+    # runner. The transcript dirs are deliberately never created — the empty
+    # corpus is the smoke test, and it is the path a fresh install hits first.
+    READOUT_CLAUDE_DIR: $CI_PROJECT_DIR/.readout-ci/claude
+    READOUT_CODEX_DIR: $CI_PROJECT_DIR/.readout-ci/codex
+    READOUT_STATE_DIR: $CI_PROJECT_DIR/.readout-ci/state
+    READOUT_CONFIG_DIR: $CI_PROJECT_DIR/.readout-ci/config
+    READOUT_SSH_CONFIG: $CI_PROJECT_DIR/.readout-ci/ssh_config
+  script:
+    - cargo test --all-targets
+    # Not a repeat of the line above: the frame-budget test only asserts when
+    # optimized, because a debug timing measured against a runtime budget
+    # measures the profile rather than the code.
+    - cargo test --release
+    # The dashboard is the part tests reach least, so render one frame here too.
+    - cargo run --quiet -- snapshot --width 100 --height 30
+    # Every page the keyboard can reach, because a page that only renders on one
+    # developer's machine is a page nobody tested.
+    - |
+      for page in overview daily insights models projects sessions search devices pricing settings; do
+        cargo run --quiet -- snapshot --width 100 --height 30 --page "$page" > /dev/null
+      done
+      cargo run --quiet -- snapshot --width 100 --height 30 --page search --query readout > /dev/null
+    - cargo run --quiet -- summary --json > /dev/null
+    # All three exit 0 on an empty corpus; doctor's 2 means "a reported figure is
+    # wrong", which a fresh checkout has no way to be.
+    - |
+      cargo run --quiet -- insights --json > /dev/null
+      cargo run --quiet -- search readout --json > /dev/null
+      cargo run --quiet -- doctor --json > /dev/null

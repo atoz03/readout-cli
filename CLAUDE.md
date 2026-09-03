@@ -30,8 +30,11 @@ debug-only run passes it silently.
 
 CI pins clippy to a **fixed toolchain (1.97.1)** on purpose — a floating
 `stable` turns `-D warnings` into a build that breaks on an untouched
-repository. Bump the pin in `.github/workflows/ci.yml` and fix the new lints in
-that same commit.
+repository. The pin lives in two files — `.github/workflows/ci.yml` and
+`.gitlab-ci.yml` — so bump both, and fix the new lints in that same commit.
+`.gitlab-ci.yml` exists mainly to stop GitLab falling back to Auto DevOps, which
+builds a container nobody here wants; it mirrors the Linux half of the GitHub
+workflow and needs no Docker service.
 
 ### Seeing the TUI without a terminal
 
