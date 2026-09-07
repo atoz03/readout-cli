@@ -675,7 +675,7 @@ pub fn pricing_table(p: &Pricing, observed: &[String]) -> String {
     let _ = writeln!(
         o,
         "Cache read defaults to {}x input; cache write to {}x (5m TTL) or {}x (1h TTL).\n\
-         A model may pin its own — OpenAI does not bill cache writes.\n",
+         A model may pin its own — most OpenAI models bill no cache write.\n",
         crate::pricing::CACHE_READ_MULTIPLIER,
         crate::pricing::CACHE_WRITE_5M_MULTIPLIER,
         crate::pricing::CACHE_WRITE_1H_MULTIPLIER,

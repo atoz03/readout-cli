@@ -51,7 +51,7 @@ impl Rate {
         Rate { input, output, cache_read: None, cache_write_5m: None, cache_write_1h: None }
     }
 
-    /// A rate for a provider that does not bill cache writes at all.
+    /// A rate for a model that does not bill cache writes at all.
     ///
     /// Without this the 1.25x derivation applies and the rate table advertises
     /// a fee that cannot be charged.
@@ -62,6 +62,18 @@ impl Rate {
             cache_read: None,
             cache_write_5m: Some(0.0),
             cache_write_1h: Some(0.0),
+        }
+    }
+
+    /// A rate for a model that publishes its own cache-hit price rather than
+    /// charging the usual multiple of base input.
+    const fn with_cache_read(input: f64, output: f64, cache_read: f64) -> Self {
+        Rate {
+            input,
+            output,
+            cache_read: Some(cache_read),
+            cache_write_5m: None,
+            cache_write_1h: None,
         }
     }
 
@@ -133,21 +145,29 @@ impl Rate {
     }
 }
 
-/// Anthropic first-party list prices (source: bundled `claude-api` skill
-/// model table, cached 2026-06-24).
+/// Anthropic first-party list prices (source: the published rate table at
+/// `platform.claude.com/docs/en/about-claude/pricing`, read 2026-09-07 — every
+/// row below was checked against it on that date).
 ///
-/// Claude Sonnet 5 carries a promotional $2/$10 introductory rate through
-/// 2026-08-31. We deliberately bill history at the standard $3/$15: applying a
-/// promo retroactively across months of transcripts would silently understate
-/// spend. Override in `pricing.json` if you want the intro rate.
+/// Claude Sonnet 5's $2/$10 was announced as an introductory rate expiring
+/// 2026-08-31, and this table once billed history at $3/$15 rather than apply a
+/// promo retroactively. The increase was then cancelled and $2/$10 became the
+/// standard price, which makes $3/$15 a rate nobody was ever charged — exactly
+/// the invented figure the module refuses to print. Bill the real one.
 const CLAUDE_RATES: &[(&str, Rate)] = &[
+    // Cache hits on the 5.1 pair are 0.025x base input, not the 0.10x every
+    // other Claude model charges — an exception Anthropic documents on the
+    // pricing page itself, so it is stored rather than derived. Their writes
+    // are ordinary and still derive, giving $12.50 and $20.
+    ("claude-fable-5-1", Rate::with_cache_read(10.00, 50.00, 0.25)),
+    ("claude-mythos-5-1", Rate::with_cache_read(10.00, 50.00, 0.25)),
     ("claude-fable-5", Rate::new(10.00, 50.00)),
     ("claude-mythos-5", Rate::new(10.00, 50.00)),
     ("claude-opus-5", Rate::new(5.00, 25.00)),
     ("claude-opus-4-8", Rate::new(5.00, 25.00)),
     ("claude-opus-4-7", Rate::new(5.00, 25.00)),
     ("claude-opus-4-6", Rate::new(5.00, 25.00)),
-    ("claude-sonnet-5", Rate::new(3.00, 15.00)),
+    ("claude-sonnet-5", Rate::new(2.00, 10.00)),
     ("claude-sonnet-4-6", Rate::new(3.00, 15.00)),
     ("claude-haiku-4-5", Rate::new(1.00, 5.00)),
 ];
@@ -172,7 +192,18 @@ const CLAUDE_RATES: &[(&str, Rate)] = &[
 /// would only ever surface in the rate table as a charge that does not exist.
 /// The source table lists a derived write fee for the gpt-5.6 family and zero
 /// for everything older; the zeros are the ones that match how OpenAI bills.
+/// `gpt-6-astra` is the one row that keeps the derivation, because OpenAI
+/// prices a cache write for it explicitly — see its comment below.
 const OPENAI_RATES: &[(&str, Rate)] = &[
+    // First-party, unlike every row under it: OpenAI's own price list
+    // (developers.openai.com/api/docs/pricing, read 2026-09-07) gives $10 base
+    // input, $1 cached input, $12.50 cache write and $50 output, which the
+    // 0.10x and 1.25x derivations reproduce exactly — so this row is `new`
+    // rather than `no_cache_write`, and zeroing its write would understate the
+    // published card. Those are the <=272K rates; OpenAI bills a separate 2x
+    // long-context tier past that threshold, which readout has no way to
+    // express, so a long-context Astra request is billed at the rate below.
+    ("gpt-6-astra", Rate::new(10.00, 50.00)),
     ("gpt-5.6", Rate::no_cache_write(5.00, 30.00)),
     ("gpt-5.6-sol", Rate::no_cache_write(5.00, 30.00)),
     ("gpt-5.6-terra", Rate::no_cache_write(2.50, 15.00)),
@@ -385,6 +416,54 @@ mod tests {
         // through to unpriced.
         assert_eq!(p.rate("gpt-5.4-xhigh").map(|r| r.input), Some(2.50));
         assert!(p.is_priced("gpt-5.2-codex-high"));
+    }
+
+    #[test]
+    fn the_5_1_models_charge_the_cache_hit_rate_anthropic_publishes_for_them() {
+        let p = Pricing::builtin();
+        for id in ["claude-fable-5-1", "claude-mythos-5-1"] {
+            let r = p.rate(id).unwrap_or_else(|| panic!("a built-in rate for {id}"));
+            assert_eq!((r.input, r.output), (10.00, 50.00));
+            // 0.025x base input, the documented exception — not the 0.10x
+            // derivation, which would charge four times as much for every hit.
+            assert_eq!(r.cache_read_rate(), 0.25);
+            assert_ne!(r.cache_read_rate(), r.input * CACHE_READ_MULTIPLIER);
+            // Writes are not exceptional and still derive.
+            assert_eq!(r.cache_write_5m_rate(), 12.50);
+            assert_eq!(r.cache_write_1h_rate(), 20.00);
+        }
+        // The trailing `-1` is a version, not a date, so it must not fold into
+        // the 5 generation — which bills cache hits at the ordinary 0.10x.
+        assert_eq!(pricing_key("claude-fable-5-1"), "claude-fable-5-1");
+        assert_eq!(p.rate("claude-fable-5").unwrap().cache_read_rate(), 1.00);
+        assert_eq!(p.rate("claude-mythos-5").unwrap().cache_read_rate(), 1.00);
+    }
+
+    #[test]
+    fn sonnet_5_bills_the_price_that_was_actually_charged() {
+        let p = Pricing::builtin();
+        let r = p.rate("claude-sonnet-5").expect("a built-in rate for Claude Sonnet 5");
+        // The scheduled rise to $3/$15 was cancelled and never took effect, so
+        // billing history at it would invent a charge nobody ever received.
+        assert_eq!((r.input, r.output), (2.00, 10.00));
+        assert_eq!(r.cache_read_rate(), 0.20);
+        // Sonnet 4.6 did not move, and must not be dragged along.
+        assert_eq!(p.rate("claude-sonnet-4-6").map(|r| (r.input, r.output)), Some((3.00, 15.00)));
+    }
+
+    #[test]
+    fn gpt_6_astra_keeps_the_cache_write_openai_bills_for_it() {
+        let p = Pricing::builtin();
+        let r = p.rate("gpt-6-astra").expect("a built-in rate for GPT-6 Astra");
+        assert_eq!((r.input, r.output), (10.00, 50.00));
+        assert_eq!(r.cache_read_rate(), 1.00);
+        // The one OpenAI row that is not `no_cache_write`: Astra's published
+        // card prices a cache write, so pinning it to zero would understate it.
+        assert_eq!(r.cache_write_5m_rate(), 12.50);
+        // `-astra` names a model, not an effort level, so only the effort
+        // suffix is trimmed and the tier survives the pricing lookup.
+        assert_eq!(pricing_key("gpt-6-astra"), "gpt-6-astra");
+        assert_eq!(p.rate("gpt-6-astra-xhigh").map(|r| r.input), Some(10.00));
     }
 
     #[test]
