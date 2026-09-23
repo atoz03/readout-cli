@@ -147,7 +147,8 @@ impl Rate {
 
 /// Anthropic first-party list prices (source: the published rate table at
 /// `platform.claude.com/docs/en/about-claude/pricing`, read 2026-09-07 — every
-/// row below was checked against it on that date).
+/// row below was checked against it on that date; Claude Opus 5.5 was added
+/// from the same table on 2026-09-22).
 ///
 /// Claude Sonnet 5's $2/$10 was announced as an introductory rate expiring
 /// 2026-08-31, and this table once billed history at $3/$15 rather than apply a
@@ -161,6 +162,10 @@ const CLAUDE_RATES: &[(&str, Rate)] = &[
     // are ordinary and still derive, giving $12.50 and $20.
     ("claude-fable-5-1", Rate::with_cache_read(10.00, 50.00, 0.25)),
     ("claude-mythos-5-1", Rate::with_cache_read(10.00, 50.00, 0.25)),
+    // Opus 5.5 is the second documented exception: cache hits at 0.05x base
+    // input, $0.20 rather than the $0.40 the derivation would give. Writes
+    // derive as usual, to the published $5 and $8.
+    ("claude-opus-5-5", Rate::with_cache_read(4.00, 20.00, 0.20)),
     ("claude-fable-5", Rate::new(10.00, 50.00)),
     ("claude-mythos-5", Rate::new(10.00, 50.00)),
     ("claude-opus-5", Rate::new(5.00, 25.00)),
@@ -192,10 +197,10 @@ const CLAUDE_RATES: &[(&str, Rate)] = &[
 /// would only ever surface in the rate table as a charge that does not exist.
 /// The source table lists a derived write fee for the gpt-5.6 family and zero
 /// for everything older; the zeros are the ones that match how OpenAI bills.
-/// `gpt-6-astra` is the one row that keeps the derivation, because OpenAI
-/// prices a cache write for it explicitly — see its comment below.
+/// The GPT-6 rows are the exception: they keep the derivation, because OpenAI
+/// prices a cache write for them explicitly — see the comment below.
 const OPENAI_RATES: &[(&str, Rate)] = &[
-    // First-party, unlike every row under it: OpenAI's own price list
+    // First-party, unlike the gpt-5 rows below: OpenAI's own price list
     // (developers.openai.com/api/docs/pricing, read 2026-09-07) gives $10 base
     // input, $1 cached input, $12.50 cache write and $50 output, which the
     // 0.10x and 1.25x derivations reproduce exactly — so this row is `new`
@@ -203,7 +208,11 @@ const OPENAI_RATES: &[(&str, Rate)] = &[
     // published card. Those are the <=272K rates; OpenAI bills a separate 2x
     // long-context tier past that threshold, which readout has no way to
     // express, so a long-context Astra request is billed at the rate below.
+    // Sol ($2/$0.20/$2.50/$10) and Luna ($0.10/$0.01/$0.125/$0.50) come from
+    // the same list, read 2026-09-22, and match the derivations the same way.
     ("gpt-6-astra", Rate::new(10.00, 50.00)),
+    ("gpt-6-sol", Rate::new(2.00, 10.00)),
+    ("gpt-6-luna", Rate::new(0.10, 0.50)),
     ("gpt-5.6", Rate::no_cache_write(5.00, 30.00)),
     ("gpt-5.6-sol", Rate::no_cache_write(5.00, 30.00)),
     ("gpt-5.6-terra", Rate::no_cache_write(2.50, 15.00)),
@@ -464,6 +473,36 @@ mod tests {
         // suffix is trimmed and the tier survives the pricing lookup.
         assert_eq!(pricing_key("gpt-6-astra"), "gpt-6-astra");
         assert_eq!(p.rate("gpt-6-astra-xhigh").map(|r| r.input), Some(10.00));
+    }
+
+    #[test]
+    fn opus_5_5_charges_the_cache_hit_rate_anthropic_publishes_for_it() {
+        let p = Pricing::builtin();
+        let r = p.rate("claude-opus-5-5").expect("a built-in rate for Claude Opus 5.5");
+        assert_eq!((r.input, r.output), (4.00, 20.00));
+        // 0.05x base input, not the 0.10x derivation, which would double it.
+        assert_eq!(r.cache_read_rate(), 0.20);
+        assert_eq!(r.cache_write_5m_rate(), 5.00);
+        assert_eq!(r.cache_write_1h_rate(), 8.00);
+        // The trailing `-5` is a version, so it must not fall back to Opus 5.
+        assert_eq!(pricing_key("claude-opus-5-5"), "claude-opus-5-5");
+        assert_eq!(p.rate("claude-opus-5").map(|r| r.input), Some(5.00));
+    }
+
+    #[test]
+    fn gpt_6_sol_and_luna_bill_their_published_cards() {
+        let p = Pricing::builtin();
+        let sol = p.rate("gpt-6-sol").expect("a built-in rate for GPT-6 Sol");
+        assert_eq!((sol.input, sol.output), (2.00, 10.00));
+        assert!((sol.cache_read_rate() - 0.20).abs() < 1e-12);
+        assert_eq!(sol.cache_write_5m_rate(), 2.50);
+        let luna = p.rate("gpt-6-luna").expect("a built-in rate for GPT-6 Luna");
+        assert_eq!((luna.input, luna.output), (0.10, 0.50));
+        assert!((luna.cache_read_rate() - 0.01).abs() < 1e-12);
+        assert_eq!(luna.cache_write_5m_rate(), 0.125);
+        // Tier names survive the effort-suffix trim, like `-astra`.
+        assert_eq!(p.rate("gpt-6-sol-high").map(|r| r.input), Some(2.00));
+        assert_eq!(p.rate("gpt-6-luna-xhigh").map(|r| r.input), Some(0.10));
     }
 
     #[test]
