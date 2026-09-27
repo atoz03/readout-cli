@@ -24,6 +24,8 @@ readout summary --json   # 输出 JSON
 - 回放本机 session 的消息与工具调用时间线
 - 全文搜索本机 Claude Code 与 Codex 历史，并直接跳进 Replay
 - 计算缓存命中率、消耗速率、高成本会话和相邻周期的变化
+- 在 Daily 图表上点击任意一天，直接查看当天的 Insights
+- 可选把同一系列的模型版本合并显示（Opus 5 + Opus 5.5 → Opus）
 - 诊断覆盖范围、损坏记录、缺价模型、缓存状态和设备同步
 - 通过 SSH 聚合多台设备，同时对重复会话记录去重
 - 增量扫描会话记录，支持低开销 watch 模式
@@ -81,7 +83,8 @@ readout -w              # 每几秒增量刷新
 | `-d, --days N` | 最近 N 天 |
 | `-s, --source claude\|codex` | 只统计一种工具 |
 | `-p, --project PATH` | 只统计一个完整项目路径 |
-| `-m, --model MODEL` | 只统计一个模型 |
+| `-m, --model MODEL` | 只统计一个模型（模型 id；合并系列时也可以是系列名） |
+| `--group-models[=BOOL]` | 本次运行按模型系列合并 |
 | `--no-cache` | 忽略增量缓存并完整重扫 |
 
 ## Dashboard
@@ -91,7 +94,7 @@ readout -w              # 每几秒增量刷新
 | 页面 | 内容 |
 |---|---|
 | Overview | token、费用、请求、会话和近期趋势 |
-| Daily | 每日用量 |
+| Daily | 每日用量；点击柱子或在行上按 `Enter` 查看当天的 Insights |
 | Models | 模型分布与费用覆盖率 |
 | Projects | 项目列表；进入后查看 Sessions |
 | Sessions / Replay | 会话用量，以及本机 transcript 的消息和工具时间线 |
@@ -99,7 +102,7 @@ readout -w              # 每几秒增量刷新
 | Search | 全文搜索本机历史，回车在命中处打开 Replay |
 | Devices | 本机、已添加的 SSH 设备和同步状态 |
 | Pricing | 当前模型价格 |
-| Settings | 聚合开关、本机名称、SSH 设备、项目别名和配置路径 |
+| Settings | 聚合开关、模型系列合并、本机名称、SSH 设备、项目别名和配置路径 |
 
 鼠标可点击侧栏、筛选项、列表行、卡片标题和 Replay 时间线。常用键盘操作：
 
@@ -107,7 +110,7 @@ readout -w              # 每几秒增量刷新
 |---|---|
 | `↑/↓`、`j/k` | 移动选择 |
 | `Enter` | 打开或确认当前行 |
-| `Esc` | 返回、清除筛选或取消确认 |
+| `Esc` | 返回、取消选中的日期、清除筛选或取消确认 |
 | `Tab` / `Shift-Tab`、`←/→` | 切换页面 |
 | `t`、`1/2/3/4` | 今日、7 天、30 天、90 天、全部 |
 | `c/x` | 切换 Claude Code / Codex |
@@ -176,7 +179,17 @@ readout insights — last 7 days
 
 对比窗口是当前窗口整体前移自身长度，因此 `-d 7` 与它之前的 7 天相比。全部历史没有更早的周期，因此不显示对比。
 
-所有数字都来自其他页面读取的同一份汇总，因此 Insights 不会与 Overview 冲突。没有依据的比率显示 `—` 而不是 `0`，费用同样带有覆盖率标记。
+所有数字都来自其他页面读取的同一份汇总，因此 Insights 不会与 Overview 冲突。没有依据的比率显示 `—` 而不是 `0`，费用同样带有覆盖率标记。本月累计与本月预测只在窗口覆盖本月至今时出现；窗口更短时显示 `—`（JSON 中为 `null`），而不是把一周的花费冠以“本月累计”之名。
+
+### 按天查看
+
+在 Daily 页点击某一天的柱子——或选中它所在的行并按 `Enter`——即可打开只包含这一天的 Insights：当天的缓存命中率与费用、按费用排序的会话、按小时的分布，以及与前一天的对比。鼠标指向柱子时，图表下方会预览这一天。按 `Esc` 回到 Daily 页并保持选中同一天；点击任意时间范围则回到该范围。选中的日期会保留选择它时已有的模型、项目或设备筛选。
+
+## 模型系列
+
+Settings → **Group model families** 会把同一命名系列的不同版本合成一行：`claude-opus-5` 与 `claude-opus-5-5` 合并为 **Opus**，Fable 各版本合并为 **Fable**，GPT 的 Sol 与 Luna 各档分别合并为 **Sol** 和 **Luna**。没有系列名的版本（如 `gpt-5.4`、`gpt-5.4-mini`）保持原 id。合并只改变行，不改变金额：每个请求仍按自己的模型 id 计价，因此系列的费用等于各版本费用之和。
+
+该设置同时作用于 dashboard 和所有报表。`--group-models` 或 `--group-models=false` 只覆盖本次运行，不会写入设置；开启合并时 `-m Opus` 选中整个系列，`-m claude-opus-5` 仍只选中这一个版本。`readout pricing` 始终列出模型 id，因为价格按 id 登记；`summary --json` 会输出 `model_families`，方便脚本判断读到的是哪一种行。
 
 ## 健康检查
 
@@ -263,7 +276,7 @@ readout search QUERY [-n LIMIT] [--json]
 readout doctor [--json]
 readout pricing [--init]
 readout refresh [--clear]
-readout snapshot [--width N] [--height N] [--page PAGE] [--query TEXT]
+readout snapshot [--width N] [--height N] [--page PAGE] [--query TEXT] [--day DATE]
 
 readout sync
 readout update
@@ -283,6 +296,7 @@ readout project-alias list
 
 ```sh
 readout snapshot --width 120 --height 40 --page devices
+readout snapshot --page insights --day 2026-09-25   # 相当于点击了那一天的柱子
 ```
 
 ## 费用说明

@@ -161,6 +161,43 @@ pub fn normalize_model(raw: &str, source: Source) -> String {
 /// `-mini`, because the match is on the whole suffix.
 const EFFORT_SUFFIXES: [&str; 5] = ["-minimal", "-low", "-medium", "-high", "-xhigh"];
 
+/// Named Claude lines, as the segment of the id that names them.
+const CLAUDE_FAMILIES: [(&str, &str); 5] = [
+    ("opus", "Opus"),
+    ("sonnet", "Sonnet"),
+    ("haiku", "Haiku"),
+    ("fable", "Fable"),
+    ("mythos", "Mythos"),
+];
+
+/// Named OpenAI tiers. A version with no name (`gpt-5.4`, `gpt-5.4-mini`) has
+/// no family to fold into and keeps its id.
+const OPENAI_FAMILIES: [(&str, &str); 4] =
+    [("sol", "Sol"), ("luna", "Luna"), ("terra", "Terra"), ("astra", "Astra")];
+
+/// The named line a model id belongs to — `Opus` for both `claude-opus-5` and
+/// `claude-opus-5-5`, `Sol` for both `gpt-5.6-sol` and `gpt-6-sol-high`.
+///
+/// Only whole `-`-separated segments count, so a tier that merely contains a
+/// family's letters is not claimed by it. `None` means the id names a version
+/// rather than a line, and grouping leaves it exactly as written.
+pub fn model_family(model: &str) -> Option<&'static str> {
+    let (rest, families): (&str, &[(&str, &str)]) = match model.strip_prefix("claude-") {
+        Some(rest) => (rest, &CLAUDE_FAMILIES),
+        None => (model.strip_prefix("gpt-")?, &OPENAI_FAMILIES),
+    };
+    rest.split('-').find_map(|segment| {
+        families.iter().find(|(key, _)| segment.eq_ignore_ascii_case(key)).map(|(_, name)| *name)
+    })
+}
+
+/// How a model is labelled in the rollups: its family when `families` is on
+/// and it has one, its id otherwise. Pricing never goes through this — rates
+/// differ between versions of one line, so cost is always looked up by id.
+pub fn model_label(model: &str, families: bool) -> &str {
+    if families { model_family(model).unwrap_or(model) } else { model }
+}
+
 /// Trim a Claude `-YYYYMMDD` date suffix or a Codex reasoning-effort suffix, so
 /// every id of the same model shares one price row. Charts still bucket by the
 /// raw model id — this is a pricing lookup, not a display grouping.
@@ -224,6 +261,35 @@ mod tests {
         // Codex model ids are passed through untouched.
         assert_eq!(normalize_model("gpt-5.2-codex", Source::Codex), "gpt-5.2-codex");
         assert_eq!(normalize_model("  ", Source::Codex), "unknown");
+    }
+
+    #[test]
+    fn versions_of_a_named_line_share_a_family() {
+        assert_eq!(model_family("claude-opus-5"), Some("Opus"));
+        assert_eq!(model_family("claude-opus-5-5"), Some("Opus"));
+        assert_eq!(model_family("claude-opus-4-6-20260206"), Some("Opus"));
+        assert_eq!(model_family("claude-fable-5"), Some("Fable"));
+        assert_eq!(model_family("claude-fable-5-1"), Some("Fable"));
+        assert_eq!(model_family("claude-3-5-sonnet-20241022"), Some("Sonnet"));
+        assert_eq!(model_family("gpt-6-sol"), Some("Sol"));
+        assert_eq!(model_family("gpt-5.6-sol"), Some("Sol"));
+        assert_eq!(model_family("gpt-6-luna-xhigh"), Some("Luna"));
+        assert_eq!(model_family("gpt-5.6-luna"), Some("Luna"));
+    }
+
+    #[test]
+    fn a_version_with_no_name_keeps_its_id_when_grouped() {
+        // GPT-5.4 is a version, not a line: there is nothing to fold it into,
+        // and inventing a "GPT" bucket would merge models priced 12x apart.
+        for id in ["gpt-5.4", "gpt-5.4-mini", "gpt-5.2-codex", "codex-mini", "unknown"] {
+            assert_eq!(model_family(id), None, "{id}");
+            assert_eq!(model_label(id, true), id);
+        }
+        // A segment has to be the family, not merely contain it.
+        assert_eq!(model_family("gpt-5-solar"), None);
+        // Grouping off is the identity, family or not.
+        assert_eq!(model_label("claude-opus-5-5", false), "claude-opus-5-5");
+        assert_eq!(model_label("claude-opus-5-5", true), "Opus");
     }
 
     #[test]

@@ -39,6 +39,10 @@ pub struct Settings {
     /// 默认页面是否合并已导入的其他设备；关闭后只显示本机观察到的事件。
     #[serde(default = "yes")]
     pub aggregate_devices: bool,
+    /// 把同一命名系列的不同版本合成一行（Opus 5 与 Opus 5.5 → Opus）。只影响分组与
+    /// 显示；费用仍按各自的 model id 计价。
+    #[serde(default)]
+    pub model_families: bool,
     /// 用户明确添加的 SSH config 别名或可直接解析的主机名。
     #[serde(default)]
     pub ssh_hosts: Vec<String>,
@@ -57,6 +61,7 @@ impl Default for Settings {
             version: SCHEMA_VERSION,
             device: DeviceSettings { id: new_device_id(&name), name },
             aggregate_devices: true,
+            model_families: false,
             ssh_hosts: Vec::new(),
             project_aliases: Vec::new(),
         }
@@ -307,6 +312,18 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_settings_file_from_before_model_families_still_loads_with_it_off() {
+        // Older files have no such key. Refusing them would strand every
+        // existing install on "move or delete settings.json".
+        let path = temp_path("pre-families");
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("model_families");
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(!Settings::load_from(&path).unwrap().model_families);
         let _ = std::fs::remove_file(path);
     }
 

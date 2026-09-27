@@ -106,11 +106,13 @@ pub struct SnapshotRequest {
     /// something has been searched, so without it a snapshot of that page
     /// could never show the layout it exists to show.
     pub query: Option<String>,
+    /// Draw with this day picked, as a click on its Daily bar would.
+    pub day: Option<chrono::NaiveDate>,
     pub settings: Settings,
 }
 
 pub fn snapshot(request: SnapshotRequest) -> Result<String> {
-    let SnapshotRequest { sources, filter, use_cache, width, height, page, query, settings } =
+    let SnapshotRequest { sources, filter, use_cache, width, height, page, query, day, settings } =
         request;
     let pricing = Pricing::load(crate::paths::pricing_override_file().ok().as_deref())?;
     let mut app = App::with_settings(sources.clone(), filter, pricing, settings.clone());
@@ -123,6 +125,7 @@ pub fn snapshot(request: SnapshotRequest) -> Result<String> {
     }
     app.loading = Loading::Done;
     app.set_page(page);
+    app.day = day;
     // Snapshots show the settled state; animating into a still image would
     // only ever capture a half-drawn frame.
     app.recompute(false);
@@ -624,6 +627,9 @@ fn on_key(app: &mut App, k: KeyEvent) {
     }
 
     match k.code {
+        // A picked day is the innermost narrowing, so Esc lets go of it first —
+        // from Insights, straight back to the Daily page it was picked on.
+        KeyCode::Esc if app.day.is_some() => app.clear_day(),
         KeyCode::Char('q') | KeyCode::Esc if app.drill == Drill::None => {
             if k.code == KeyCode::Char('q') {
                 app.should_quit = true;
@@ -718,6 +724,7 @@ fn apply(app: &mut App, action: Action) {
                 app.disarm_update();
             }
         }
+        Action::Day(date) => app.open_day(date),
         Action::ProjectRow(i) => app.open_project(i),
         Action::SessionRow(i) => app.open_session(i),
         Action::InsightSessionRow(i) => app.open_insight_session(i),
@@ -733,7 +740,7 @@ fn apply(app: &mut App, action: Action) {
             app.activate_setting(i);
         }
         Action::SyncDevices => app.request_sync(),
-        Action::ClearFilter => app.set_drill(Drill::None),
+        Action::ClearFilter => app.clear_filters(),
         Action::Refresh => app.request_rescan(Rescan::Manual),
         Action::ToggleWatch => app.toggle_watch(),
         Action::Quit => app.should_quit = true,
@@ -1585,6 +1592,116 @@ mod tests {
             a.set_page(page);
             pages::draw(&mut a, &mut buf, area);
         }
+    }
+
+    /// Where on screen a click performs `action`, if anywhere.
+    fn find_hit(app: &App, width: u16, height: u16, action: &Action) -> Option<(u16, u16)> {
+        (0..height)
+            .flat_map(|y| (0..width).map(move |x| (x, y)))
+            .find(|(x, y)| app.hits.hit(*x, *y) == Some(action))
+    }
+
+    #[test]
+    fn clicking_a_daily_bar_opens_that_days_insights_and_esc_comes_back() {
+        let mut a = app_with_many_rows();
+        a.set_range(Range::D30);
+        a.set_page(Page::Daily);
+        render(&mut a, 120, 40);
+        let yesterday = chrono::Local::now().date_naive() - chrono::Duration::days(1);
+        let (x, y) = find_hit(&a, 120, 40, &Action::Day(yesterday)).expect("a bar for yesterday");
+
+        let action = a.hits.hit(x, y).cloned().unwrap();
+        apply(&mut a, action);
+        assert_eq!(a.page, Page::Insights);
+        assert_eq!(a.day, Some(yesterday));
+        // Every figure on the page is that day's and only that day's.
+        assert_eq!(a.summary.total.events, 1);
+        assert_eq!(a.summary.daily.len(), 1);
+        assert_eq!(a.insights.span_days, 1);
+        assert_eq!(a.insights.previous.map(|p| p.span_days), Some(1));
+        assert!(a.insights.month_to_date.is_none(), "one past day is not the month");
+        let frame = buffer_text(&render(&mut a, 120, 40));
+        assert!(frame.contains(&yesterday.format("%a %b %-d").to_string()), "the day is named");
+
+        // Esc is a step back to where the day was picked, with it still picked
+        // out in the table, rather than a jump to some other page.
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.page, Page::Daily);
+        assert_eq!(a.day, None);
+        assert_eq!(a.range, Range::D30, "the window it came from is untouched");
+        assert_eq!(a.daily_row_date(a.selected), Some(yesterday));
+    }
+
+    #[test]
+    fn enter_on_a_daily_row_opens_the_insights_for_that_row() {
+        let mut a = app_with_many_rows();
+        a.set_page(Page::Daily);
+        render(&mut a, 120, 40);
+        press(&mut a, KeyCode::Down);
+        press(&mut a, KeyCode::Down);
+        let date = a.daily_row_date(2).expect("a third day");
+        press(&mut a, KeyCode::Enter);
+        assert_eq!((a.page, a.day), (Page::Insights, Some(date)));
+    }
+
+    #[test]
+    fn a_day_with_nothing_billed_is_not_opened() {
+        let mut a = app_with_data();
+        a.set_page(Page::Daily);
+        let idle = chrono::Local::now().date_naive() - chrono::Duration::days(3);
+        apply(&mut a, Action::Day(idle));
+        assert_eq!((a.page, a.day), (Page::Daily, None));
+        assert!(a.status.as_deref().is_some_and(|s| s.starts_with("no usage")));
+    }
+
+    #[test]
+    fn a_range_chip_lets_go_of_a_picked_day_even_the_chip_already_lit() {
+        let mut a = app_with_many_rows();
+        a.set_range(Range::D7);
+        let today = chrono::Local::now().date_naive();
+        a.open_day(today);
+        assert_eq!(a.window_days(), Some(1));
+        apply(&mut a, Action::Range(Range::D7));
+        assert_eq!(a.day, None);
+        assert_eq!(a.summary.daily.len(), 7);
+    }
+
+    #[test]
+    fn a_picked_day_keeps_the_drill_it_was_picked_under() {
+        // A day picked off one model's chart is that model's day. Replacing
+        // the drill would show a page the reader never clicked on.
+        let mut a = app_with_many_rows();
+        a.set_drill(Drill::Model("model-01".into()));
+        let yesterday = chrono::Local::now().date_naive() - chrono::Duration::days(1);
+        a.set_page(Page::Daily);
+        a.open_day(yesterday);
+        assert_eq!(a.drill, Drill::Model("model-01".into()));
+        assert_eq!(a.summary.total.events, 1);
+
+        // Esc peels one layer at a time, innermost first.
+        press(&mut a, KeyCode::Esc);
+        assert_eq!((a.day, a.drill.clone()), (None, Drill::Model("model-01".into())));
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.drill, Drill::None);
+        // The empty-state button clears both at once.
+        a.set_drill(Drill::Model("model-01".into()));
+        a.open_day(yesterday);
+        apply(&mut a, Action::ClearFilter);
+        assert_eq!((a.day, a.drill.clone()), (None, Drill::None));
+    }
+
+    #[test]
+    fn a_daily_row_does_not_light_up_when_a_bar_is_pointed_at() {
+        // The chart hovers by column number. When the table did too, pointing
+        // at the third bar also highlighted the third row — a different day.
+        let mut a = app_with_many_rows();
+        a.set_range(Range::D30);
+        a.set_page(Page::Daily);
+        render(&mut a, 120, 40);
+        let (x, y) = find_hit(&a, 120, 40, &Action::Row(0)).expect("a first table row");
+        let row_hover = a.hits.hover_at(x, y).expect("table rows highlight on hover");
+        // Bars take column numbers, and there are never more columns than width.
+        assert!(row_hover >= 120, "a row id must not be a column number");
     }
 
     #[test]

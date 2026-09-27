@@ -278,9 +278,19 @@ pub struct SearchUi {
 /// dashboard that redraws faster than the thing it measures is just motion.
 pub const WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Rows on the Settings page. The ones code outside the list refers to by
+/// position are named, so inserting a row cannot silently retarget them.
+pub const SETTINGS_ROWS: usize = 6;
+pub const SETTING_MODEL_FAMILIES: usize = 1;
+pub const SETTING_DEVICE_NAME: usize = 2;
+
 pub struct App {
     pub page: Page,
     pub range: Range,
+    /// One calendar day picked from the Daily page. While set it replaces the
+    /// range chip's window everywhere, and it composes with `drill` rather than
+    /// replacing it: a day picked off a model's chart stays that model's day.
+    pub day: Option<chrono::NaiveDate>,
     pub drill: Drill,
     pub sources: Vec<Source>,
     /// Sources the user has switched off in the UI. Kept separate from
@@ -289,6 +299,10 @@ pub struct App {
 
     pub events: Vec<UsageEvent>,
     pub devices: Vec<DeviceRecord>,
+    /// `--group-models[=BOOL]` from the command line, where it disagrees with
+    /// Settings. It holds for this run only: persisting it would let saving an
+    /// unrelated setting quietly write down a one-off flag.
+    group_models_override: Option<bool>,
     /// Devices 页始终基于全设备事件，避免关闭默认聚合后远端状态一起消失。
     pub device_summary: Summary,
     pub settings: Settings,
@@ -395,6 +409,7 @@ impl App {
         App {
             page: Page::Overview,
             range,
+            day: None,
             drill: match (&base.model, &base.project) {
                 (Some(m), _) => Drill::Model(m.clone()),
                 (_, Some(p)) => Drill::Project(p.clone()),
@@ -403,6 +418,8 @@ impl App {
             sources,
             disabled: Vec::new(),
             events: Vec::new(),
+            group_models_override: (base.model_families != settings.model_families)
+                .then_some(base.model_families),
             devices: vec![DeviceRecord {
                 id: settings.device.id.clone(),
                 name: settings.device.name.clone(),
@@ -469,9 +486,21 @@ impl App {
 
     pub fn filter(&self) -> Filter {
         let today = chrono::Local::now().date_naive();
-        let mut f = Filter { sources: self.active_sources(), ..Default::default() };
-        f.since = self.range.days().map(|d| today - chrono::Duration::days(d - 1));
-        f.until = Some(today);
+        let mut f = Filter {
+            sources: self.active_sources(),
+            model_families: self.model_families(),
+            ..Default::default()
+        };
+        match self.day {
+            Some(day) => {
+                f.since = Some(day);
+                f.until = Some(day);
+            }
+            None => {
+                f.since = self.range.days().map(|d| today - chrono::Duration::days(d - 1));
+                f.until = Some(today);
+            }
+        }
         match &self.drill {
             Drill::None => {}
             Drill::Model(m) => f.model = Some(m.clone()),
@@ -495,7 +524,8 @@ impl App {
         // there is one — an all-time range has no period before it.
         let previous =
             previous_window(&filter).map(|window| summarize(&self.events, &window, &self.pricing));
-        self.insights = insights(&self.summary, previous.as_ref(), self.range.days());
+        let through = filter.until.unwrap_or_else(|| chrono::Local::now().date_naive());
+        self.insights = insights(&self.summary, previous.as_ref(), self.window_days(), through);
         self.summary_date = chrono::Local::now().date_naive();
         let targets = [
             self.summary.total.tokens.total() as f64,
@@ -649,7 +679,7 @@ impl App {
             Page::Replay => self.replay.data.as_ref().map_or(0, |replay| replay.events.len()),
             Page::Devices => self.device_row_count(),
             Page::Pricing => self.pricing.known_models().len(),
-            Page::Settings => usize::from(!self.device_name_editor) * 5,
+            Page::Settings => usize::from(!self.device_name_editor) * SETTINGS_ROWS,
         }
     }
 
@@ -677,6 +707,9 @@ impl App {
             self.page = page;
             self.selected = 0;
             self.scroll = 0;
+            // Hover ids are per page — a Models row and a Daily bar can share
+            // a number — so the old page's must not light something on the new.
+            self.hover = None;
             self.disarm_update();
             self.grow = Eased::from_zero(1.0).with_rate(crate::tui::anim::RATE_FAST);
             self.needs_redraw = true;
@@ -697,9 +730,75 @@ impl App {
         self.set_page(Page::ORDER[i]);
     }
 
+    /// Picking a chip is asking for that window, so it also lets go of a
+    /// picked day — including the chip that was already lit underneath it.
     pub fn set_range(&mut self, range: Range) {
-        if self.range != range {
+        if self.range != range || self.day.is_some() {
             self.range = range;
+            self.day = None;
+            self.recompute(true);
+        }
+    }
+
+    /// Whether model rows are families right now: the command line's say for
+    /// this run if it had one, Settings' otherwise.
+    pub fn model_families(&self) -> bool {
+        self.group_models_override.unwrap_or(self.settings.model_families)
+    }
+
+    /// Length of the window on screen, in days; `None` for all time.
+    pub fn window_days(&self) -> Option<i64> {
+        if self.day.is_some() { Some(1) } else { self.range.days() }
+    }
+
+    /// The window is a single calendar day, whether picked or the Today chip.
+    /// A trend across one day is one bar, so the charts show its hours instead.
+    pub fn single_day(&self) -> Option<chrono::NaiveDate> {
+        self.day.or_else(|| (self.range == Range::Today).then_some(self.summary_date))
+    }
+
+    /// The date behind row `index` of the Daily table, which lists newest first.
+    pub fn daily_row_date(&self, index: usize) -> Option<chrono::NaiveDate> {
+        self.summary.daily.iter().rev().nth(index).map(|d| d.date)
+    }
+
+    /// Show one day's Insights: the Daily page's answer to "what happened here".
+    ///
+    /// A day with nothing billed is refused with a note rather than opened —
+    /// an Insights page of dashes says less than the empty bar already did.
+    pub fn open_day(&mut self, date: chrono::NaiveDate) {
+        if self.summary.day(date).is_none_or(|bucket| bucket.events == 0) {
+            self.status = Some(format!("no usage on {}", date.format("%a %b %-d")));
+            self.needs_redraw = true;
+            return;
+        }
+        if self.day != Some(date) {
+            self.day = Some(date);
+            self.recompute(true);
+        }
+        self.set_page(Page::Insights);
+        self.status = Some(format!("{} · Esc returns to Daily", date.format("%a %b %-d")));
+    }
+
+    /// Let go of a picked day. From Insights that is a step back to the Daily
+    /// page it was picked on, with the same day still under the cursor.
+    pub fn clear_day(&mut self) {
+        let Some(date) = self.day.take() else { return };
+        self.recompute(true);
+        if self.page == Page::Insights {
+            self.set_page(Page::Daily);
+            if let Some(index) = self.summary.daily.iter().rev().position(|d| d.date == date) {
+                self.selected = index;
+                self.ensure_visible(self.list_rows.get());
+            }
+        }
+    }
+
+    /// Clear every narrowing at once: the picked day and the drill.
+    pub fn clear_filters(&mut self) {
+        let changed = self.day.take().is_some() || self.drill != Drill::None;
+        self.drill = Drill::None;
+        if changed {
             self.recompute(true);
         }
     }
@@ -780,6 +879,11 @@ impl App {
                     .map(|bucket| Drill::Model(bucket.label.clone()));
                 if let Some(next) = next {
                     self.set_drill(if self.drill == next { Drill::None } else { next });
+                }
+            }
+            Page::Daily => {
+                if let Some(date) = self.daily_row_date(self.selected) {
+                    self.open_day(date);
                 }
             }
             Page::Projects => self.open_project(self.selected),
@@ -1222,21 +1326,24 @@ impl App {
         let before = self.settings.clone();
         match index {
             0 => self.settings.aggregate_devices = !self.settings.aggregate_devices,
-            1 => {
+            // Flips what is on screen, whichever of Settings or the command
+            // line put it there.
+            SETTING_MODEL_FAMILIES => self.settings.model_families = !self.model_families(),
+            SETTING_DEVICE_NAME => {
                 self.begin_device_name_editor();
                 return;
             }
-            2 => {
+            3 => {
                 self.set_page(Page::Devices);
                 self.status = Some("select Add SSH device… or an existing host".into());
                 return;
             }
-            3 => {
+            4 => {
                 self.status =
                     Some("manage aliases with `readout project-alias set|remove|list`".into());
                 return;
             }
-            4 => {
+            5 => {
                 self.status = Some(format!("settings file: {}", self.settings_path));
                 return;
             }
@@ -1246,6 +1353,16 @@ impl App {
             self.settings = before;
             self.status = Some(format!("could not save settings: {error}"));
             return;
+        }
+        if index == SETTING_MODEL_FAMILIES {
+            // Settings decides from here on.
+            self.group_models_override = None;
+            // A model drill names a row of the old labelling. Kept, `Opus`
+            // would match no id once grouping is off, and the dashboard would
+            // go blank for a reason nothing on screen explains.
+            if matches!(self.drill, Drill::Model(_)) {
+                self.drill = Drill::None;
+            }
         }
         self.status = Some("settings saved".into());
         self.recompute(true);
@@ -1264,7 +1381,7 @@ impl App {
         if self.device_name_editor {
             self.device_name_editor = false;
             self.device_name_input.clear();
-            self.selected = 1;
+            self.selected = SETTING_DEVICE_NAME;
             self.scroll = 0;
             self.needs_redraw = true;
         }
@@ -1310,7 +1427,7 @@ impl App {
         }
         self.device_name_editor = false;
         self.device_name_input.clear();
-        self.selected = 1;
+        self.selected = SETTING_DEVICE_NAME;
         self.scroll = 0;
         self.status = Some(format!("local device renamed to {name}"));
         self.needs_redraw = true;
@@ -1843,7 +1960,7 @@ mod tests {
             .join(format!("readout-tui-device-name-{}.json", std::process::id()));
         a.settings_file = Some(path.clone());
         a.page = Page::Settings;
-        a.selected = 1;
+        a.selected = SETTING_DEVICE_NAME;
         a.activate_selected();
         assert!(a.device_name_editor);
         assert_eq!(a.device_name_input, a.settings.device.name);
@@ -1871,10 +1988,89 @@ mod tests {
     fn the_ssh_settings_row_opens_the_shared_device_management_flow() {
         let mut a = App::new(Source::ALL.to_vec(), Filter::default(), Pricing::builtin());
         a.page = Page::Settings;
-        a.selected = 2;
+        a.selected = SETTING_DEVICE_NAME + 1;
         a.activate_selected();
         assert_eq!(a.page, Page::Devices);
         assert_eq!(a.status.as_deref(), Some("select Add SSH device… or an existing host"));
+    }
+
+    fn family_events() -> Vec<UsageEvent> {
+        ["claude-opus-5", "claude-opus-5-5", "gpt-5.4"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, model)| UsageEvent {
+                source: if model.starts_with("gpt") { Source::Codex } else { Source::Claude },
+                ts: chrono::Local::now().timestamp(),
+                model: model.into(),
+                session: format!("s{i}"),
+                project: "alpha".into(),
+                tokens: Tokens { input: 100, output: 100, ..Default::default() },
+                observed_on: Vec::new(),
+                dedup_key: None,
+                dedup_rank: 0,
+            })
+            .collect()
+    }
+
+    fn labels(a: &App) -> Vec<&str> {
+        let mut labels: Vec<&str> = a.summary.by_model.iter().map(|b| b.label.as_str()).collect();
+        labels.sort_unstable();
+        labels
+    }
+
+    #[test]
+    fn the_families_setting_regroups_every_rollup_and_is_saved() {
+        let mut a = App::new(Source::ALL.to_vec(), Filter::default(), Pricing::builtin());
+        let path = std::env::temp_dir()
+            .join(format!("readout-tui-model-families-{}.json", std::process::id()));
+        a.settings_file = Some(path.clone());
+        a.events = family_events();
+        a.recompute(false);
+        assert_eq!(labels(&a), ["claude-opus-5", "claude-opus-5-5", "gpt-5.4"]);
+        let cost = a.summary.total.priced.cost;
+
+        // A drill on an id would still match after grouping, but one on a
+        // family would match nothing once it is turned off again — so a flip
+        // always lets go of the model drill rather than keeping half of them.
+        a.set_drill(Drill::Model("claude-opus-5".into()));
+        a.page = Page::Settings;
+        a.selected = SETTING_MODEL_FAMILIES;
+        a.activate_selected();
+        assert_eq!(a.drill, Drill::None);
+        assert_eq!(labels(&a), ["Opus", "gpt-5.4"]);
+        assert_eq!(a.summary.total.priced.cost, cost, "grouping moves rows, not money");
+        assert!(Settings::load_from(&path).unwrap().model_families);
+
+        a.activate_selected();
+        assert_eq!(labels(&a), ["claude-opus-5", "claude-opus-5-5", "gpt-5.4"]);
+        assert!(!Settings::load_from(&path).unwrap().model_families);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_command_line_grouping_flag_lasts_the_run_and_is_never_saved() {
+        let base = Filter { model_families: true, ..Filter::default() };
+        let mut a =
+            App::with_settings(Source::ALL.to_vec(), base, Pricing::builtin(), Settings::default());
+        let path = std::env::temp_dir()
+            .join(format!("readout-tui-group-flag-{}.json", std::process::id()));
+        a.settings_file = Some(path.clone());
+        a.events = family_events();
+        a.recompute(false);
+        assert!(a.model_families());
+        assert_eq!(labels(&a), ["Opus", "gpt-5.4"]);
+
+        // Saving something unrelated must not write the flag down with it.
+        a.activate_setting(0);
+        assert!(!Settings::load_from(&path).unwrap().model_families);
+        a.activate_setting(0);
+        assert!(a.model_families(), "the run keeps what the command line asked for");
+
+        // The toggle flips what is on screen, and Settings decides from then on.
+        a.activate_setting(SETTING_MODEL_FAMILIES);
+        assert!(!a.model_families());
+        assert_eq!(labels(&a).len(), 3);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -28,6 +28,8 @@ readout summary --json   # emit JSON
 - Replay messages and tool calls from local sessions on a timeline
 - Search every Claude Code and Codex transcript and jump straight into Replay
 - Derive cache hit ratio, burn rate, costly sessions, and period-over-period change
+- Click any day on the Daily chart to open that day's Insights
+- Optionally fold model versions into families (Opus 5 + Opus 5.5 → Opus)
 - Diagnose coverage, damaged records, pricing gaps, cache health, and device sync
 - Aggregate multiple machines over SSH without double-counting copied transcripts
 - Incrementally scan transcripts and keep the dashboard live at low overhead
@@ -89,7 +91,8 @@ The same filters apply to the dashboard and all reporting commands:
 | `-d, --days N` | Limit the view to the last N days |
 | `-s, --source claude\|codex` | Include only one tool |
 | `-p, --project PATH` | Include one full project path |
-| `-m, --model MODEL` | Include one model |
+| `-m, --model MODEL` | Include one model (an id, or a family name when grouped) |
+| `--group-models[=BOOL]` | Group model versions into families for this run |
 | `--no-cache` | Ignore the incremental cache and parse everything |
 
 ## Dashboard
@@ -100,7 +103,7 @@ configuration:
 | Page | What it shows |
 |---|---|
 | Overview | Tokens, estimated cost, requests, sessions, and recent trends |
-| Daily | Usage by day |
+| Daily | Usage by day; click a bar or press `Enter` on a row for that day's Insights |
 | Models | Model distribution and pricing coverage |
 | Projects | Projects, with navigation into their sessions |
 | Sessions / Replay | Session usage and local message/tool timelines |
@@ -108,7 +111,7 @@ configuration:
 | Search | Full-text search over local history, opening Replay at the match |
 | Devices | The local machine, configured SSH devices, and sync state |
 | Pricing | Effective model prices |
-| Settings | Aggregation, local identity, devices, aliases, and config paths |
+| Settings | Aggregation, model families, local identity, devices, aliases, and config paths |
 
 Sidebar entries, filters, rows, card headers, and Replay events are clickable.
 The essential keyboard controls are:
@@ -117,7 +120,7 @@ The essential keyboard controls are:
 |---|---|
 | `↑/↓`, `j/k` | Move the selection |
 | `Enter` | Open or confirm the selected row |
-| `Esc` | Go back, clear a filter, or cancel confirmation |
+| `Esc` | Go back, let go of a picked day, clear a filter, or cancel confirmation |
 | `Tab` / `Shift-Tab`, `←/→` | Change page |
 | `t`, `1/2/3/4` | Today, 7 days, 30 days, 90 days, all time |
 | `c/x` | Toggle Claude Code / Codex |
@@ -203,7 +206,35 @@ it and shows no comparison.
 
 Every figure comes from the same rollup the other pages read, so Insights cannot
 disagree with Overview. A ratio with nothing behind it prints `—` rather than
-`0`, and costs carry the same coverage marks as everywhere else.
+`0`, and costs carry the same coverage marks as everywhere else. Month to date
+and the month projection appear only when the window covers the month so far;
+over a shorter window they print `—` (`null` in JSON) rather than a week's spend
+under the month's name.
+
+### One day at a time
+
+On the Daily page, click a day's bar — or select its row and press `Enter` — to
+open Insights for that day alone: its cache hit ratio and cost, its sessions
+ranked by cost, its hours, and how it compares with the day before. Pointing at
+a bar previews the day underneath the chart. `Esc` returns to the Daily page
+with the same day selected, and any range chip returns to that range. A picked
+day keeps any model, project, or device filter it was picked under.
+
+## Model families
+
+Settings → **Group model families** folds versions of one named line into a
+single row: `claude-opus-5` and `claude-opus-5-5` become **Opus**, the Fable
+releases become **Fable**, and GPT Sol and Luna tiers become **Sol** and
+**Luna**. A version with no line name, such as `gpt-5.4` or `gpt-5.4-mini`, keeps
+its id. Grouping changes rows, never money: each request is still priced by its
+own model id, so a family's cost is the sum of its versions' costs.
+
+The setting applies to the dashboard and every report. `--group-models` or
+`--group-models=false` overrides it for one run without saving anything, and
+with grouping on `-m Opus` selects the whole family while `-m claude-opus-5`
+still selects one version. `readout pricing` always lists ids, since that is what
+rates are keyed by, and `summary --json` reports `model_families` so scripts can
+tell which kind of row they are reading.
 
 ## Health checks
 
@@ -305,7 +336,7 @@ readout search QUERY [-n LIMIT] [--json]
 readout doctor [--json]
 readout pricing [--init]
 readout refresh [--clear]
-readout snapshot [--width N] [--height N] [--page PAGE] [--query TEXT]
+readout snapshot [--width N] [--height N] [--page PAGE] [--query TEXT] [--day DATE]
 
 readout sync
 readout update
@@ -328,6 +359,7 @@ interactive terminal mode:
 
 ```sh
 readout snapshot --width 120 --height 40 --page devices
+readout snapshot --page insights --day 2026-09-25   # as if that day's bar was clicked
 ```
 
 ## Cost estimates

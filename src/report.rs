@@ -73,7 +73,8 @@ pub fn text(s: &Summary, stats: &ScanStats, days: Option<i64>) -> String {
     );
 
     if !s.by_model.is_empty() {
-        let _ = writeln!(o, "\n  By model");
+        let heading = if s.model_families { "By model family" } else { "By model" };
+        let _ = writeln!(o, "\n  {heading}");
         let width = s
             .by_model
             .iter()
@@ -217,11 +218,12 @@ pub fn insights_text(i: &Insights, days: Option<i64>) -> String {
         o,
         "    {:<22} {:>10}   {}",
         "month to date",
-        fmt::money_partial(i.month_to_date.cost, i.month_to_date.coverage()),
+        i.month_to_date
+            .map_or_else(|| "—".to_string(), |mtd| fmt::money_partial(mtd.cost, mtd.coverage())),
         match i.projected_month {
             Some(projected) =>
                 format!("on track for {}", fmt::money_partial(projected, i.cost_coverage)),
-            None => "widen the window to project the month".to_string(),
+            None => "widen the window to the whole month to see it".to_string(),
         },
     );
 
@@ -509,8 +511,10 @@ pub fn insights_json(i: &Insights, days: Option<i64>) -> String {
             "cost_per_session": i.cost_per_session,
             "cost_per_request": i.cost_per_request,
             "cost_coverage": i.cost_coverage,
-            "month_to_date_usd": i.month_to_date.cost,
-            "month_to_date_coverage": i.month_to_date.coverage(),
+            // Null when the window does not cover the month so far: summed over
+            // a shorter window it would be a different figure under this name.
+            "month_to_date_usd": i.month_to_date.map(|mtd| mtd.cost),
+            "month_to_date_coverage": i.month_to_date.map(|mtd| mtd.coverage()),
             "projected_month_usd": i.projected_month,
         },
         "previous_window": i.previous.map(|p| json!({
@@ -603,6 +607,9 @@ pub fn json(
             o["source"] = json!(src.short());
             o
         }).collect::<Vec<_>>(),
+        // Whether `by_model` rows are families (`Opus`) or ids. Rates, and so
+        // `unpriced_models`, are always per id either way.
+        "model_families": s.model_families,
         "by_model": s.by_model.iter().map(bucket).collect::<Vec<_>>(),
         "by_project": s.by_project.iter().map(bucket).collect::<Vec<_>>(),
         // 一个事件若被多台设备观察到，它只落在 `@shared` 这一桶里，不会重复计入
@@ -899,7 +906,7 @@ mod tests {
         // "nothing was sent", and `0.0` says the first about both.
         let p = Pricing::builtin();
         let empty = summarize(&[], &Filter::default(), &p);
-        let i = crate::agg::insights(&empty, None, Some(7));
+        let i = crate::agg::insights(&empty, None, Some(7), chrono::Local::now().date_naive());
         let v: serde_json::Value = serde_json::from_str(&insights_json(&i, Some(7))).unwrap();
         assert!(v["efficiency"]["cache_hit_ratio"].is_null());
         assert!(v["previous_window"].is_null(), "no comparison was supplied");
@@ -907,10 +914,28 @@ mod tests {
     }
 
     #[test]
+    fn month_to_date_is_null_when_the_window_does_not_cover_the_month() {
+        // A week's spend under the name "month to date" is a wrong figure, not
+        // a partial one. Asserted on the rule, so it holds on any calendar day.
+        use chrono::Datelike;
+        let p = Pricing::builtin();
+        let s = summarize(&sample(), &Filter::last_days(7), &p);
+        let today = chrono::Local::now().date_naive();
+        let i = crate::agg::insights(&s, None, Some(7), today);
+        let v: serde_json::Value = serde_json::from_str(&insights_json(&i, Some(7))).unwrap();
+        let covered = today.day() <= 7;
+        assert_eq!(!v["burn"]["month_to_date_usd"].is_null(), covered);
+        assert_eq!(!v["burn"]["projected_month_usd"].is_null(), covered);
+        let all =
+            crate::agg::insights(&summarize(&sample(), &Filter::default(), &p), None, None, today);
+        assert!(all.month_to_date.is_some(), "all time always covers the month");
+    }
+
+    #[test]
     fn insight_text_marks_partly_priced_figures_and_names_its_cap() {
         let p = Pricing::builtin();
         let s = summarize(&sample(), &Filter::default(), &p);
-        let i = crate::agg::insights(&s, None, None);
+        let i = crate::agg::insights(&s, None, None, chrono::Local::now().date_naive());
         let out = insights_text(&i, None);
         assert!(out.contains("readout insights — all time"));
         assert!(out.contains("cache hit ratio"));

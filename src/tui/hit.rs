@@ -22,6 +22,8 @@ pub enum Action {
     ToggleSource(crate::model::Source),
     /// Select row `usize` of the focused list.
     Row(usize),
+    /// Open one calendar day's Insights, from a bar on the Daily chart.
+    Day(chrono::NaiveDate),
     /// 打开项目并显示它的 sessions。
     ProjectRow(usize),
     /// 打开 session replay。

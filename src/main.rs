@@ -62,9 +62,21 @@ struct Common {
     #[arg(long, short = 'p', global = true)]
     project: Option<String>,
 
-    /// Only this model
+    /// Only this model: an id, or a family name when models are grouped
     #[arg(long, short = 'm', global = true)]
     model: Option<String>,
+
+    /// Group versions of one model line into a row (Opus 5 + Opus 5.5 → Opus);
+    /// `--group-models=false` lists ids even when Settings groups them
+    #[arg(
+        long,
+        global = true,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true"
+    )]
+    group_models: Option<bool>,
 
     /// Ignore the incremental cache and reparse everything
     #[arg(long, global = true)]
@@ -173,6 +185,9 @@ enum Command {
         /// Run this search first, so `--page search` has results to draw
         #[arg(long)]
         query: Option<String>,
+        /// Draw with one day picked (YYYY-MM-DD), as clicking its Daily bar does
+        #[arg(long)]
+        day: Option<chrono::NaiveDate>,
     },
     /// SSH 设备协议：导出只含 usage 的 bundle
     #[command(hide = true)]
@@ -282,7 +297,8 @@ fn run() -> Result<Outcome> {
             if json {
                 println!("{}", report::json(&s, &stats, &devices, cli.common.days));
             } else {
-                print_buckets(&s.by_model, "model", s.total.tokens.total());
+                let kind = if s.model_families { "family" } else { "model" };
+                print_buckets(&s.by_model, kind, s.total.tokens.total());
             }
             Ok(Outcome::Ok)
         }
@@ -322,7 +338,8 @@ fn run() -> Result<Outcome> {
             // length, so everything but the dates is held constant.
             let previous =
                 agg::previous_window(&filter).map(|window| summarize(&events, &window, &pricing));
-            let insights = agg::insights(&summary, previous.as_ref(), cli.common.days);
+            let today = chrono::Local::now().date_naive();
+            let insights = agg::insights(&summary, previous.as_ref(), cli.common.days, today);
             if json {
                 println!("{}", report::insights_json(&insights, cli.common.days));
             } else {
@@ -383,8 +400,12 @@ fn run() -> Result<Outcome> {
             Ok(if report.failed() { Outcome::Findings } else { Outcome::Ok })
         }
         Some(Command::Pricing { init }) => {
-            let pricing = Pricing::load(paths::pricing_override_file().ok().as_deref())?;
-            let s = load(&cli.common, &sources, &settings)?.summary;
+            let Loaded { events, pricing, .. } = load(&cli.common, &sources, &settings)?;
+            // A rate belongs to an id, never to a family: listing "Opus" here
+            // would write a starter row nothing is ever billed under.
+            let filter =
+                Filter { model_families: false, ..build_filter(&cli.common, &sources, &settings) };
+            let s = summarize(&events, &filter, &pricing);
             let observed: Vec<String> = s.by_model.iter().map(|b| b.label.clone()).collect();
             if init {
                 let path = paths::pricing_override_file()?;
@@ -426,7 +447,7 @@ fn run() -> Result<Outcome> {
             print!("{}", report::timing(&result.stats));
             Ok(Outcome::Ok)
         }
-        Some(Command::Snapshot { width, height, page, query }) => {
+        Some(Command::Snapshot { width, height, page, query, day }) => {
             let page = match page.to_ascii_lowercase().as_str() {
                 "overview" => tui::app::Page::Overview,
                 "daily" => tui::app::Page::Daily,
@@ -451,6 +472,7 @@ fn run() -> Result<Outcome> {
                     height,
                     page,
                     query,
+                    day,
                     settings,
                 })?
             );
@@ -597,6 +619,7 @@ fn build_filter(common: &Common, sources: &[Source], settings: &settings::Settin
         model: common.model.clone(),
         session: None,
         device: (!settings.aggregate_devices).then(|| settings.device.id.clone()),
+        model_families: common.group_models.unwrap_or(settings.model_families),
     }
 }
 
@@ -646,6 +669,33 @@ mod tests {
         assert!(parse_days("-7").is_err());
         assert!(parse_days("36501").is_err());
         assert!(parse_days("nope").is_err());
+    }
+
+    #[test]
+    fn the_group_models_flag_overrides_the_setting_in_both_directions() {
+        let common = |args: &[&str]| {
+            Cli::try_parse_from(std::iter::once("readout").chain(args.iter().copied()))
+                .unwrap()
+                .common
+        };
+        let mut settings = settings::Settings::default();
+        let sources = Source::ALL.to_vec();
+        assert!(!build_filter(&common(&["summary"]), &sources, &settings).model_families);
+        assert!(
+            build_filter(&common(&["summary", "--group-models"]), &sources, &settings)
+                .model_families
+        );
+        settings.model_families = true;
+        assert!(build_filter(&common(&["summary"]), &sources, &settings).model_families);
+        assert!(
+            !build_filter(&common(&["--group-models=false", "summary"]), &sources, &settings)
+                .model_families
+        );
+        // `require_equals` keeps a bare flag from swallowing the subcommand.
+        assert!(matches!(
+            Cli::try_parse_from(["readout", "--group-models", "models"]).unwrap().command,
+            Some(Command::Models { .. })
+        ));
     }
 
     #[test]

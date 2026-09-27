@@ -4,7 +4,7 @@
 //! is reflected everywhere consistently. Dates and hours are bucketed in
 //! **local time** — "when you work" is a question about your day, not UTC's.
 
-use crate::model::{Source, Tokens, UsageEvent};
+use crate::model::{Source, Tokens, UsageEvent, model_label};
 use crate::pricing::{Priced, Pricing, price};
 use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Timelike};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -35,7 +35,9 @@ impl Bucket {
         Bucket { label: label.into(), ..Default::default() }
     }
 
-    fn absorb(&mut self, e: &UsageEvent, pricing: &Pricing) {
+    /// `model` is the event's label under the current grouping; the price is
+    /// still looked up by the event's own id.
+    fn absorb(&mut self, e: &UsageEvent, model: &str, pricing: &Pricing) {
         self.tokens += &e.tokens;
         self.priced.add(&price(pricing, &e.model, &e.tokens));
         self.events = self.events.saturating_add(1);
@@ -45,7 +47,7 @@ impl Bucket {
         self.devices.extend(e.observed_on.iter().cloned());
         self.sources.insert(e.source);
         self.last_ts = self.last_ts.max(e.ts);
-        let model_tokens = self.models.entry(e.model.clone()).or_default();
+        let model_tokens = self.models.entry(model.to_string()).or_default();
         *model_tokens = model_tokens.saturating_add(e.tokens.total());
         let project_tokens = self.projects.entry(e.project.clone()).or_default();
         *project_tokens = project_tokens.saturating_add(e.tokens.total());
@@ -88,8 +90,11 @@ pub struct Summary {
     pub by_hour: [Bucket; 24],
     pub first_ts: i64,
     pub last_ts: i64,
-    /// Models observed that we have no price for.
+    /// Models observed that we have no price for. Always ids, never families:
+    /// a rate is per id, so a family is not something a rate can be added for.
     pub unpriced_models: Vec<String>,
+    /// Whether `by_model` and every `models` map are keyed by family.
+    pub model_families: bool,
 }
 
 /// Which events to include.
@@ -103,10 +108,18 @@ pub struct Filter {
     /// current window while remaining absent from its chart.
     pub until: Option<NaiveDate>,
     pub project: Option<String>,
+    /// A model id, or a family name when `model_families` is on.
     pub model: Option<String>,
     pub session: Option<String>,
     /// 只显示该设备观察到的事件；共享事件仍会出现，但只计一次。
     pub device: Option<String>,
+    /// Label models by family (`Opus`) rather than by id (`claude-opus-5-5`).
+    ///
+    /// Not a filter in the sense the fields above are — it admits nothing and
+    /// excludes nothing. It lives here because the model filter has to match
+    /// under the same labelling the rollups use, and a comparison window made
+    /// from this one must carry both.
+    pub model_families: bool,
 }
 
 impl Default for Filter {
@@ -119,6 +132,7 @@ impl Default for Filter {
             model: None,
             session: None,
             device: None,
+            model_families: false,
         }
     }
 }
@@ -133,6 +147,11 @@ impl Filter {
             until: Some(today),
             ..Default::default()
         }
+    }
+
+    /// The label an event's model takes in this filter's rollups.
+    pub fn model_label<'a>(&self, model: &'a str) -> &'a str {
+        model_label(model, self.model_families)
     }
 
     pub(crate) fn admits(&self, e: &UsageEvent) -> bool {
@@ -162,8 +181,11 @@ impl Filter {
         {
             return false;
         }
+        // An id still selects its own model when grouping is on, so `--model
+        // claude-opus-5` means the same thing whichever way the rows are cut.
         if let Some(m) = &self.model
             && &e.model != m
+            && self.model_label(&e.model) != m
         {
             return false;
         }
@@ -204,22 +226,26 @@ pub fn summarize(events: &[UsageEvent], filter: &Filter, pricing: &Pricing) -> S
     let mut first_ts = i64::MAX;
 
     for e in events.iter().filter(|e| filter.admits(e)) {
-        s.total.absorb(e, pricing);
+        let model = filter.model_label(&e.model);
+        s.total.absorb(e, model, pricing);
         observed.insert(e.model.as_str());
 
         by_source
             .entry(e.source)
             .or_insert_with(|| Bucket::new(e.source.label()))
-            .absorb(e, pricing);
-        by_model.entry(e.model.clone()).or_insert_with(|| Bucket::new(&e.model)).absorb(e, pricing);
+            .absorb(e, model, pricing);
+        by_model
+            .entry(model.to_string())
+            .or_insert_with(|| Bucket::new(model))
+            .absorb(e, model, pricing);
         by_project
             .entry(e.project.clone())
             .or_insert_with(|| Bucket::new(&e.project))
-            .absorb(e, pricing);
+            .absorb(e, model, pricing);
         by_session
             .entry((e.source, e.session.clone()))
             .or_insert_with(|| Bucket::new(&e.session))
-            .absorb(e, pricing);
+            .absorb(e, model, pricing);
         if let Some(device) = match e.observed_on.as_slice() {
             [] => None,
             [device] => Some(device.as_str()),
@@ -228,7 +254,7 @@ pub fn summarize(events: &[UsageEvent], filter: &Filter, pricing: &Pricing) -> S
             by_device
                 .entry(device.to_string())
                 .or_insert_with(|| Bucket::new(device))
-                .absorb(e, pricing);
+                .absorb(e, model, pricing);
         }
 
         if e.ts > 0 {
@@ -238,8 +264,8 @@ pub fn summarize(events: &[UsageEvent], filter: &Filter, pricing: &Pricing) -> S
                 daily
                     .entry(dt.date_naive())
                     .or_insert_with(|| Bucket::new(dt.date_naive().to_string()))
-                    .absorb(e, pricing);
-                hours[dt.hour() as usize].absorb(e, pricing);
+                    .absorb(e, model, pricing);
+                hours[dt.hour() as usize].absorb(e, model, pricing);
             }
         }
     }
@@ -258,6 +284,7 @@ pub fn summarize(events: &[UsageEvent], filter: &Filter, pricing: &Pricing) -> S
     s.daily = daily.into_iter().map(|(date, bucket)| DayBucket { date, bucket }).collect();
     s.by_hour = hours.try_into().expect("24 hour buckets");
     s.unpriced_models = pricing.unpriced_among(observed);
+    s.model_families = filter.model_families;
     s
 }
 
@@ -269,8 +296,12 @@ impl Summary {
     /// request has landed today — which is not the same as zero, and the
     /// callers that care render it differently.
     pub fn today(&self) -> Option<&Bucket> {
-        let today = Local::now().date_naive();
-        self.daily.iter().find(|d| d.date == today).map(|d| &d.bucket)
+        self.day(Local::now().date_naive())
+    }
+
+    /// One calendar day's totals, from the same rows the daily chart draws.
+    pub fn day(&self, date: NaiveDate) -> Option<&Bucket> {
+        self.daily.iter().find(|d| d.date == date).map(|d| &d.bucket)
     }
 }
 
@@ -452,10 +483,13 @@ pub struct Insights {
     /// How much of the cost figures above is backed by a known rate.
     pub cost_coverage: f64,
 
-    pub month_to_date: Priced,
-    /// The current calendar month at its month-to-date run rate. `None` when
-    /// the window does not reach back to the first of the month, because a
-    /// projection from a 7-day slice of a 20-day month is not a projection.
+    /// Spend since the first of the current month. `None` when the window does
+    /// not cover that stretch: summed over a 7-day slice of a 20-day month, or
+    /// over one day picked from last week, it would be some other figure
+    /// wearing this one's name.
+    pub month_to_date: Option<Priced>,
+    /// The current calendar month at its month-to-date run rate. Present
+    /// exactly when `month_to_date` is, for the same reason.
     pub projected_month: Option<f64>,
 
     pub previous: Option<Comparison>,
@@ -497,13 +531,15 @@ pub fn previous_window(filter: &Filter) -> Option<Filter> {
 
 /// Derive the insight metrics for a window.
 ///
-/// `previous` is the summary of [`previous_window`] under the same filter, and
-/// `window_days` the length of the range chip that produced `summary` —
-/// `None` for all-time, where the corpus itself sets the span.
+/// `previous` is the summary of [`previous_window`] under the same filter,
+/// `window_days` the length of the window that produced `summary` — `None` for
+/// all-time, where the corpus itself sets the span — and `through` its last
+/// calendar day: today for a range chip, the day itself for a picked day.
 pub fn insights(
     summary: &Summary,
     previous: Option<&Summary>,
     window_days: Option<i64>,
+    through: NaiveDate,
 ) -> Insights {
     let total = &summary.total;
     let today = Local::now().date_naive();
@@ -513,7 +549,7 @@ pub fn insights(
         None => local_datetime(summary.first_ts)
             .map(|dt| dt.date_naive())
             .map_or(summary.daily.len().max(1) as u32, |first| {
-                ((today - first).num_days() + 1).clamp(1, i64::from(u32::MAX)) as u32
+                ((through - first).num_days() + 1).clamp(1, i64::from(u32::MAX)) as u32
             }),
     };
     let active_days = summary.daily.len() as u32;
@@ -525,13 +561,15 @@ pub fn insights(
     let per =
         |numerator: f64, denominator: f64| (denominator > 0.0).then_some(numerator / denominator);
 
-    // A month projected from a fraction of itself is a guess dressed as a
-    // figure, so it only appears once the window covers the month so far.
+    // Both month figures are read off this window's days, so they exist only
+    // when those days are the month so far: ending today, and reaching back to
+    // the first. A month projected from a fraction of itself is a guess
+    // dressed as a figure.
     let day_of_month = i64::from(today.day());
-    let month_to_date = month_to_date(&summary.daily);
-    let projected_month = window_days
-        .is_none_or(|days| days >= day_of_month)
-        .then(|| month_to_date.cost / day_of_month as f64 * f64::from(days_in_month(today)));
+    let covers_month = through == today && window_days.is_none_or(|days| days >= day_of_month);
+    let month_to_date = covers_month.then(|| month_to_date(&summary.daily));
+    let projected_month =
+        month_to_date.map(|mtd| mtd.cost / day_of_month as f64 * f64::from(days_in_month(today)));
 
     Insights {
         span_days,
@@ -928,7 +966,7 @@ mod tests {
         };
         let summary = summarize(events, &filter, &p);
         let previous = previous_window(&filter).map(|f| summarize(events, &f, &p));
-        insights(&summary, previous.as_ref(), days)
+        insights(&summary, previous.as_ref(), days, Local::now().date_naive())
     }
 
     #[test]
@@ -1040,8 +1078,85 @@ mod tests {
         // A one-day window only does on the first, so the assertion is on the
         // rule rather than on today's date.
         let today = Local::now().date_naive();
-        let covered = derive(&events, Some(1)).projected_month.is_some();
-        assert_eq!(covered, today.day() == 1);
+        let one_day = derive(&events, Some(1));
+        assert_eq!(one_day.projected_month.is_some(), today.day() == 1);
+        // Month to date is read off the same days, so it follows the same
+        // rule: a week's spend is not the month's.
+        assert_eq!(one_day.month_to_date.is_some(), today.day() == 1);
+    }
+
+    #[test]
+    fn a_picked_day_in_the_past_reports_no_month_figures() {
+        // One day from last week, summed as "month to date", would be that
+        // day's spend under the month's name.
+        let p = Pricing::builtin();
+        let events = vec![ev(Source::Claude, "claude-opus-5", "alpha", "s1", at(3, 9), 100)];
+        let day = Local::now().date_naive() - Duration::days(3);
+        let filter = Filter { since: Some(day), until: Some(day), ..Default::default() };
+        let summary = summarize(&events, &filter, &p);
+        let previous = previous_window(&filter).map(|f| summarize(&events, &f, &p));
+        let i = insights(&summary, previous.as_ref(), Some(1), day);
+        assert_eq!(i.span_days, 1);
+        assert_eq!(i.active_days, 1);
+        assert!(i.month_to_date.is_none());
+        assert!(i.projected_month.is_none());
+        let prev = i.previous.expect("a day compares against the one before it");
+        assert_eq!(prev.span_days, 1);
+        assert_eq!(prev.requests.current, 1.0);
+    }
+
+    #[test]
+    fn grouping_folds_versions_into_one_row_but_prices_each_by_its_own_rate() {
+        let p = Pricing::builtin();
+        let events = vec![
+            ev(Source::Claude, "claude-opus-5", "alpha", "s1", at(0, 9), 1_000_000),
+            ev(Source::Claude, "claude-opus-5-5", "alpha", "s1", at(0, 10), 1_000_000),
+            ev(Source::Codex, "gpt-5.4", "beta", "s2", at(0, 11), 1_000_000),
+        ];
+        let raw = summarize(&events, &Filter::default(), &p);
+        let grouped =
+            summarize(&events, &Filter { model_families: true, ..Default::default() }, &p);
+        assert_eq!(raw.by_model.len(), 3);
+        assert_eq!(grouped.by_model.len(), 2);
+        let opus = grouped.by_model.iter().find(|b| b.label == "Opus").expect("an Opus row");
+        assert_eq!(opus.events, 2);
+        // $25/M for Opus 5 and $20/M for Opus 5.5 output, not one rate for both.
+        let raw_opus: f64 = raw
+            .by_model
+            .iter()
+            .filter(|b| b.label.starts_with("claude-opus"))
+            .map(|b| b.priced.cost)
+            .sum();
+        assert!((opus.priced.cost - raw_opus).abs() < 1e-9);
+        assert!(grouped.by_model.iter().any(|b| b.label == "gpt-5.4"), "a version stays as is");
+        assert_eq!(grouped.total.priced.cost, raw.total.priced.cost);
+        // A session's model is named the way the model rows are.
+        let s1 = grouped.by_session.iter().find(|b| b.label == "s1").expect("session s1");
+        assert_eq!(s1.top_model(), Some("Opus"));
+        assert!(grouped.model_families && !raw.model_families);
+    }
+
+    #[test]
+    fn a_family_filter_selects_every_version_and_an_id_still_selects_its_own() {
+        let p = Pricing::builtin();
+        let events = vec![
+            ev(Source::Claude, "claude-opus-5", "alpha", "s1", at(0, 9), 10),
+            ev(Source::Claude, "claude-opus-5-5", "alpha", "s1", at(0, 10), 10),
+            ev(Source::Claude, "claude-sonnet-5", "alpha", "s1", at(0, 11), 10),
+        ];
+        let grouped = |model: &str| Filter {
+            model: Some(model.into()),
+            model_families: true,
+            ..Default::default()
+        };
+        assert_eq!(summarize(&events, &grouped("Opus"), &p).total.events, 2);
+        assert_eq!(summarize(&events, &grouped("claude-opus-5-5"), &p).total.events, 1);
+        // Ungrouped, a family name is not an id and selects nothing.
+        let raw = Filter { model: Some("Opus".into()), ..Default::default() };
+        assert_eq!(summarize(&events, &raw, &p).total.events, 0);
+        // The comparison window keeps the grouping it was made from.
+        let window = Filter { since: Some(Local::now().date_naive()), ..grouped("Opus") };
+        assert!(previous_window(&window).is_some_and(|prev| prev.model_families));
     }
 
     #[test]

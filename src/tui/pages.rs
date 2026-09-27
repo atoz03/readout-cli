@@ -5,7 +5,7 @@
 //! headline figure with no distribution behind it is a stat tile rather than
 //! a chart. Nothing here uses two y-scales, a pie, or a rainbow ramp.
 
-use crate::agg::{Summary, current_streak, dense_daily, month_to_date};
+use crate::agg::{Summary, current_streak, dense_daily};
 use crate::fmt;
 use crate::model::Source;
 use crate::replay::{ReplayEvent, ReplayKind};
@@ -22,7 +22,14 @@ pub const SIDEBAR_W: u16 = 18;
 /// Titles for the hour histogram. Across a long window the bars are a working
 /// habit; across one day they are that day as far as it has got.
 const HOURS_HABIT: &str = "When You Work";
-const HOURS_TODAY: &str = "Today, by Hour";
+
+fn hours_of(app: &App, day: chrono::NaiveDate) -> String {
+    if day == app.summary_date {
+        "Today, by Hour".to_string()
+    } else {
+        format!("{}, by Hour", day.format("%a %b %-d"))
+    }
+}
 
 /// A list that can own the keyboard selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,7 +136,7 @@ fn draw_empty(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
     let y = area.y + area.height / 2;
     let band = Rect { x: area.x, y: y.saturating_sub(1), width: area.width, height: 3 };
     w::fill(buf, band, theme::SURFACE);
-    let action = (app.drill != Drill::None).then_some(Action::ClearFilter);
+    let action = (app.drill != Drill::None || app.day.is_some()).then_some(Action::ClearFilter);
     w::callout(buf, hits, band, theme::ICON_INFO, theme::TEXT_MUTED, &msg, action);
 }
 
@@ -241,7 +248,9 @@ fn draw_header(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
     let mut cx = area.right().saturating_sub(total + quit_w + 1);
     for (r, label) in Range::ORDER.iter().zip(&chips) {
         let width = label.chars().count() as u16;
-        let active = app.range == *r;
+        // A picked day is the window, so no chip is lit while one is: the
+        // sub-line names the day instead.
+        let active = app.day.is_none() && app.range == *r;
         let style = if active {
             Style::default()
                 .fg(theme::TEXT_PRIMARY)
@@ -291,6 +300,25 @@ fn headline(app: &App, width: u16) -> String {
         );
     }
     let s = &app.summary;
+    // A picked day leads, because it is the window now — the lit chip is gone
+    // and nothing else on screen says which day this is.
+    if let Some(day) = app.day {
+        let drill = match &app.drill {
+            Drill::Device(id) => Some(format!("device: {}", app.device_name(id))),
+            other => other.label(),
+        };
+        let figures = format!(
+            "{} · {} tokens",
+            fmt::money_partial(s.total.priced.cost, s.total.priced.coverage()),
+            fmt::tokens(s.total.tokens.total()),
+        );
+        let date = day.format("%a %b %-d");
+        let text = match drill {
+            Some(drill) => format!("{date} · {drill} · {figures} — Esc steps back"),
+            None => format!("{date} · {figures} — Esc returns to {}", app.range.label()),
+        };
+        return fmt::ellipsize(&text, width as usize);
+    }
     if let Drill::Device(id) = &app.drill {
         return format!("Filtered to device: {} — press Esc to clear", app.device_name(id));
     }
@@ -479,8 +507,8 @@ fn overview(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
         // A one-day window has nothing to trend: the chart would be a single
         // bar next to its own axis. The hours of that day are the shape there
         // is, so they take the whole row.
-        if app.range == Range::Today {
-            hour_card(app, buf, hits, activity, HOURS_TODAY);
+        if let Some(day) = app.single_day() {
+            hour_card(app, buf, hits, activity, &hours_of(app, day));
         } else if activity.width >= 64 {
             // Below ~64 columns the two charts would each be too narrow to
             // read; give the width to the trend, which is the one that
@@ -620,6 +648,7 @@ fn trend_card(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
         .collect();
 
     let plot = Rect { x: inner.x, y: inner.y, width: inner.width, height: inner.height - 1 };
+    let (values, labels, _) = fit_days(&values, &labels, plot.width);
     w::vbars(buf, hits, plot, &values, &labels, |_| theme::SERIES[0], app.grow.value(), None, None);
 
     // The annotation must describe the window that was drawn. Reporting the
@@ -645,7 +674,7 @@ fn trend_card(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
 /// The title is the caller's because the same bars mean two different things:
 /// across a long window they are a habit, and across one day they are that
 /// day's shape so far.
-fn hour_card(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect, title: &'static str) {
+fn hour_card(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect, title: &str) {
     let inner = w::card(
         buf,
         hits,
@@ -726,6 +755,28 @@ fn fit_day(hourly: &[u64], width: u16) -> (Vec<u64>, Vec<String>, impl Fn(usize)
     (values, labels, move |c: usize| (c / per_hour) * per_col)
 }
 
+/// Lay a run of days out across `width` columns.
+///
+/// One column per day when that is all there is room for. With room to spare
+/// each day widens to a bar plus a one-column gap, so seven days in a
+/// hundred-column card read as a chart rather than as seven hairlines against
+/// the left edge. Widening never changes a height — only how many columns
+/// carry it.
+///
+/// Returns `(values, axis labels, columns per day)`; column `c` is day
+/// `c / per`.
+fn fit_days(values: &[u64], labels: &[String], width: u16) -> (Vec<u64>, Vec<String>, usize) {
+    let per = (width as usize / values.len().max(1)).clamp(1, 8);
+    let mut columns = Vec::with_capacity(values.len() * per);
+    let mut axis = vec![String::new(); values.len() * per];
+    for (day, value) in values.iter().enumerate() {
+        // The last column of a widened day is the gap before the next one.
+        columns.extend((0..per).map(|c| if per > 1 && c == per - 1 { 0 } else { *value }));
+        axis[day * per] = labels.get(day).cloned().unwrap_or_default();
+    }
+    (columns, axis, per)
+}
+
 fn model_card(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
     let inner = w::card(
         buf,
@@ -737,7 +788,7 @@ fn model_card(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
             title: "Usage by Model",
             glyph: "◱",
             glyph_color: theme::SERIES[3],
-            meta: Some(format!("{} models", app.summary.by_model.len())),
+            meta: Some(plural(app.summary.by_model.len(), "model", "models")),
             action: Some(Action::Page(Page::Models)),
         },
     );
@@ -772,8 +823,8 @@ fn daily(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
     // A one-day window plots one bar, which is a number wearing a chart's
     // clothes. Show that day's hours instead; the table below still lists the
     // day, so nothing is lost.
-    if app.range == Range::Today {
-        hour_card(app, buf, hits, chart_area, HOURS_TODAY);
+    if let Some(day) = app.single_day() {
+        hour_card(app, buf, hits, chart_area, &hours_of(app, day));
         day_table(app, buf, hits, table_area);
         return;
     }
@@ -792,33 +843,90 @@ fn daily(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
             title: "Daily Tokens",
             glyph: "▤",
             glyph_color: theme::SERIES[0],
-            meta: Some(format!("{days}d")),
+            meta: Some(format!("{days}d · click a day")),
             action: None,
         },
     );
+    if inner.height < 3 {
+        day_table(app, buf, hits, table_area);
+        return;
+    }
     let dense = dense_daily(&app.summary.daily, days);
     let values: Vec<u64> = dense.iter().map(|(_, t, _)| *t).collect();
+    let dates: Vec<chrono::NaiveDate> = dense.iter().map(|(d, _, _)| *d).collect();
     let step = (days / 8).max(1);
     let labels: Vec<String> = dense
         .iter()
         .enumerate()
         .map(|(i, (d, _, _))| if i % step == 0 { fmt::short_date(*d) } else { String::new() })
         .collect();
-    let hovered = app.hover.map(|h| h as usize);
-    let action = |i: usize| Action::Row(i);
+    let plot = Rect { height: inner.height - 1, ..inner };
+    let (values, labels, per) = fit_days(&values, &labels, plot.width);
+    // The bar under the pointer, else the day the table has selected. The chart
+    // and the table are two views of one set of days, so they point at the
+    // same one — and ↑↓ in the table visibly walks along the chart.
+    let pointed = app.hover.map(|h| h as usize).filter(|col| *col < values.len()).map(|c| c / per);
+    let selected =
+        app.daily_row_date(app.selected).and_then(|date| dates.iter().position(|d| *d == date));
+    let focus = pointed.or(selected);
+    // A bar opens that day's Insights on one click. Unlike a list row there is
+    // no selection step to protect: hovering already shows the day below, and
+    // Esc brings the reader straight back here.
+    let action = |col: usize| Action::Day(dates[col / per]);
     w::vbars(
         buf,
         hits,
-        inner,
+        plot,
         &values,
         &labels,
-        |_| theme::SERIES[0],
+        // A widened day is several columns, so the highlight goes by day
+        // rather than through the single hovered column `vbars` knows about.
+        |col| if focus == Some(col / per) { theme::TEXT_PRIMARY } else { theme::SERIES[0] },
         app.grow.value(),
-        hovered,
+        None,
         Some(&action),
     );
+    if let Some(date) = focus.map(|i| dates[i]) {
+        w::text(
+            buf,
+            inner.x,
+            inner.bottom().saturating_sub(1),
+            inner.width,
+            &day_note(app, date, inner.width as usize),
+            Style::default().fg(theme::TEXT_MUTED),
+        );
+    }
 
     day_table(app, buf, hits, table_area);
+}
+
+/// One line on the day under the pointer or cursor: what it cost, how busy it
+/// was, which model carried it, and how to see more.
+///
+/// Built from whole parts in priority order, and a part that does not fit is
+/// left off rather than cut — "$12.4" is a different number from "$12.40".
+fn day_note(app: &App, date: chrono::NaiveDate, width: usize) -> String {
+    let label = date.format("%a %b %-d").to_string();
+    let Some(b) = app.summary.day(date).filter(|b| b.events > 0) else {
+        return format!("{label} · no usage");
+    };
+    let parts = [
+        fmt::money_partial(b.priced.cost, b.priced.coverage()),
+        format!("{} tokens", fmt::tokens(b.tokens.total())),
+        format!("{} req", fmt::count(b.events)),
+        plural(b.session_count(), "session", "sessions"),
+        b.top_model().unwrap_or("—").to_string(),
+        "⏎ insights".to_string(),
+    ];
+    let mut line = label;
+    for part in parts {
+        if line.chars().count() + part.chars().count() + 3 > width {
+            break;
+        }
+        line.push_str(" · ");
+        line.push_str(&part);
+    }
+    line
 }
 
 fn day_table(app: &App, buf: &mut Buffer, hits: &mut Registry, table_area: Rect) {
@@ -830,7 +938,10 @@ fn day_table(app: &App, buf: &mut Buffer, hits: &mut Registry, table_area: Rect)
             title: "By Day",
             glyph: "▤",
             glyph_color: theme::SERIES[0],
-            meta: Some(format!("{} active days", app.summary.daily.len())),
+            meta: Some(format!(
+                "{} · ⏎ insights",
+                plural(app.summary.daily.len(), "active day", "active days")
+            )),
             action: None,
         },
     );
@@ -844,15 +955,36 @@ fn day_table(app: &App, buf: &mut Buffer, hits: &mut Registry, table_area: Rect)
     }
     // Most recent first: the day you care about is today, not the oldest.
     let ordered: Vec<_> = app.summary.daily.iter().rev().collect();
+    // Which model carried each day, where there is room to say so. It is the
+    // column a narrow terminal loses first: the bar is what the table is for.
+    let model_w = if inner.width >= 90 {
+        ordered
+            .iter()
+            .skip(app.scroll)
+            .take(rows)
+            .map(|d| d.bucket.top_model().map_or(1, |m| m.chars().count()))
+            .max()
+            .unwrap_or(0)
+            .clamp(4, 18)
+    } else {
+        0
+    };
     for (i, d) in ordered.iter().enumerate().skip(app.scroll).take(rows) {
         let y = inner.y + (i - app.scroll) as u16;
-        let value = format!(
+        let mut value = format!(
             "{:>10}  {:>9}  {:>6} req",
             fmt::count(d.bucket.tokens.total()),
             fmt::money_partial(d.bucket.priced.cost, d.bucket.priced.coverage()),
             fmt::count(d.bucket.events),
         );
+        if model_w > 0 {
+            let model = fmt::ellipsize(d.bucket.top_model().unwrap_or("—"), model_w);
+            value.push_str(&format!("  {model:<model_w$}"));
+        }
         let row = Rect { x: inner.x, y, width: inner.width, height: 1 };
+        // Its own hover namespace: the chart above hovers by column number,
+        // and sharing plain indices lit a table row whenever a bar was pointed at.
+        let hover_id = w::hover_id(&format!("day:{i}"));
         w::bar_row(
             buf,
             row,
@@ -864,10 +996,10 @@ fn day_table(app: &App, buf: &mut Buffer, hits: &mut Registry, table_area: Rect)
                 fraction: d.bucket.tokens.total() as f64 / max as f64 * app.grow.value(),
                 color: theme::SERIES[0],
                 selected: i == app.selected,
-                hovered: app.hover == Some(i as u64),
+                hovered: app.hover == Some(hover_id),
             },
         );
-        hits.add_hoverable(row, Action::Row(i), i as u64);
+        hits.add_hoverable(row, Action::Row(i), hover_id);
     }
 }
 
@@ -977,6 +1109,18 @@ fn insights(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
         comparison_line(app, buf, compare);
     }
 
+    // One day has a shape the window averages away: when the work happened.
+    // It goes above the rankings when there is room for both, since a single
+    // day rarely has enough sessions to fill the page on its own.
+    let lists = match app.single_day() {
+        Some(day) if lists.height >= 20 => {
+            let [hours, rest] =
+                Layout::vertical([Constraint::Length(9), Constraint::Min(0)]).areas(lists);
+            hour_card(app, buf, hits, hours, &hours_of(app, day));
+            rest
+        }
+        _ => lists,
+    };
     if lists.height > 0 {
         if lists.width >= 96 {
             let [sessions, projects] =
@@ -1002,7 +1146,7 @@ fn comparison_line(app: &App, buf: &mut Buffer, area: Rect) {
         format!("reqs {}", fmt::delta(p.requests.ratio())),
         format!("sessions {}", fmt::delta(p.sessions.ratio())),
     ];
-    let mut line = format!("vs previous {}d", p.span_days);
+    let mut line = format!("vs {}", previous_span(p.span_days));
     for part in parts {
         if line.chars().count() + part.chars().count() + 3 > area.width as usize {
             break;
@@ -1011,6 +1155,12 @@ fn comparison_line(app: &App, buf: &mut Buffer, area: Rect) {
         line.push_str(&part);
     }
     w::text(buf, area.x, area.y, area.width, &line, Style::default().fg(theme::TEXT_MUTED));
+}
+
+/// What the comparison window is called. A picked day is compared with the
+/// day before it, and "previous 1d" is a clumsy way to say so.
+fn previous_span(days: u32) -> String {
+    if days == 1 { "the day before".to_string() } else { format!("previous {days}d") }
 }
 
 fn insight_tiles(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
@@ -1129,16 +1279,18 @@ fn burn_card(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
             fraction: None,
             color: theme::SERIES[3],
         },
-        Metric {
+    ];
+    // Neither month figure can be read off a window that is not the month so
+    // far, so both rows are absent there rather than showing a dash the reader
+    // would have to interpret — or, worse, a week's spend under the month's name.
+    if let Some(mtd) = i.month_to_date {
+        rows.push(Metric {
             label: "month to date",
-            value: fmt::money_partial(i.month_to_date.cost, i.month_to_date.coverage()),
+            value: fmt::money_partial(mtd.cost, mtd.coverage()),
             fraction: None,
             color: theme::SERIES[3],
-        },
-    ];
-    // A month cannot be projected from a window that does not reach the first
-    // of it, so the row is absent there rather than showing a dash the reader
-    // would have to interpret.
+        });
+    }
     if let Some(projected) = i.projected_month {
         rows.push(Metric {
             label: "month on track for",
@@ -1157,10 +1309,10 @@ fn comparison_card(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect)
         hits,
         area,
         Card {
-            title: "vs Previous",
+            title: if p.span_days == 1 { "vs Day Before" } else { "vs Previous" },
             glyph: "⇄",
             glyph_color: theme::SERIES[6],
-            meta: Some(format!("{}d", p.span_days)),
+            meta: (p.span_days > 1).then(|| format!("{}d", p.span_days)),
             action: None,
         },
     );
@@ -1366,6 +1518,9 @@ enum RankKind {
 
 fn ranked(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect, kind: RankKind) {
     let (title, glyph, color) = match kind {
+        // Says so when rows are families, or "Opus" reads as a model id that
+        // appeared from nowhere.
+        RankKind::Model if app.summary.model_families => ("Model Families", "◱", theme::SERIES[0]),
         RankKind::Model => ("Model Usage", "◱", theme::SERIES[0]),
         RankKind::Project => ("By Project", "▣", theme::SERIES[2]),
     };
@@ -2125,6 +2280,11 @@ fn settings(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
             if app.settings.aggregate_devices { "On".to_string() } else { "Off".to_string() },
             "Include remote usage in the default totals".to_string(),
         ),
+        (
+            "Group model families",
+            if app.model_families() { "On".to_string() } else { "Off".to_string() },
+            "Opus 5 + Opus 5.5 → Opus; gpt-5.4 stays".to_string(),
+        ),
         ("Local device", app.settings.device.name.clone(), "Enter to rename".to_string()),
         ("SSH devices", app.settings.ssh_hosts.len().to_string(), "Enter to manage".to_string()),
         (
@@ -2782,7 +2942,12 @@ fn pricing(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
         }
     }
 
-    let mtd = month_to_date(&app.summary.daily);
+    // Month to date only where the window covers it; otherwise the window's own
+    // spend, named as that, rather than a slice of the month under its name.
+    let (period, mtd) = match app.insights.month_to_date {
+        Some(mtd) => ("Month to date", mtd),
+        None => ("This window", app.summary.total.priced),
+    };
     w::callout(
         buf,
         hits,
@@ -2790,7 +2955,7 @@ fn pricing(app: &App, buf: &mut Buffer, hits: &mut Registry, area: Rect) {
         if mtd.is_complete() { theme::ICON_GOOD } else { theme::ICON_INFO },
         if mtd.is_complete() { theme::GOOD } else { theme::SERIES[0] },
         &format!(
-            "Month to date: {} across {} tokens{}",
+            "{period}: {} across {} tokens{}",
             fmt::money_partial(mtd.cost, mtd.coverage()),
             fmt::tokens(mtd.total_tokens()),
             if mtd.is_complete() { "" } else { " (priced models only)" },
@@ -2808,8 +2973,9 @@ fn empty_message(app: &App, summary: &Summary) -> String {
     if !missing.is_empty() {
         return format!("No transcripts found for {}.", missing.join(" and "));
     }
-    match app.drill {
-        Drill::None => "No usage in this window. Try a wider range.".into(),
+    match (app.day, &app.drill) {
+        (None, Drill::None) => "No usage in this window. Try a wider range.".into(),
+        (Some(_), Drill::None) => "No usage on this day. Press Esc to go back.".into(),
         _ => "Nothing matches this filter. Press Esc to clear it.".into(),
     }
 }
@@ -2879,6 +3045,25 @@ mod tests {
         // it again in the sub-line is just the same number twice.
         a.set_range(Range::Today);
         assert!(!headline(&a, 200).starts_with("Today "));
+    }
+
+    #[test]
+    fn widened_days_keep_their_heights_order_and_fit() {
+        let values: Vec<u64> = (1..=7).collect();
+        let labels: Vec<String> = (1..=7).map(|d| format!("d{d}")).collect();
+        for width in [7u16, 13, 14, 60, 100, 200] {
+            let (columns, axis, per) = fit_days(&values, &labels, width);
+            assert!(columns.len() <= width as usize, "width {width} overflowed");
+            assert_eq!(columns.len(), values.len() * per);
+            assert_eq!(axis.len(), columns.len());
+            for (c, v) in columns.iter().enumerate() {
+                let gap = per > 1 && c % per == per - 1;
+                assert_eq!(*v, if gap { 0 } else { values[c / per] }, "width {width} col {c}");
+            }
+            assert_eq!(axis[per * 3], "d4", "a day's label sits on its first column");
+        }
+        assert_eq!(fit_days(&values, &labels, 100).2, 8, "widening is capped");
+        assert_eq!(fit_days(&values, &labels, 7).2, 1, "no room means one column each");
     }
 
     #[test]
