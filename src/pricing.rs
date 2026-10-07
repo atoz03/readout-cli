@@ -220,10 +220,14 @@ const OPENAI_RATES: &[(&str, Rate)] = &[
     // published hit price (0.20x base input rather than 0.10x): an owner-chosen
     // markup layered on the official card. Input, output and writes stay official.
     ("gpt-6-astra", Rate::with_cache_read(10.00, 50.00, 2.00)),
+    // GPT-6.1 Sol (released 2026-09-29, read 2026-10-06) keeps Sol's $2/$10 but
+    // lists a $0.10 cache hit (0.05x), so its doubled hit price is $0.20.
+    ("gpt-6.1-sol", Rate::with_cache_read(2.00, 10.00, 0.20)),
     ("gpt-6-sol", Rate::with_cache_read(2.00, 10.00, 0.40)),
     ("gpt-6-luna", Rate::with_cache_read(0.10, 0.50, 0.02)),
     ("gpt-5.6", Rate::no_cache_write(5.00, 30.00)),
-    ("gpt-5.6-sol", Rate::no_cache_write(5.00, 30.00)),
+    // Promotional $4/$20, officially valid until at least 2026-11-21.
+    ("gpt-5.6-sol", Rate::no_cache_write(4.00, 20.00)),
     ("gpt-5.6-terra", Rate::no_cache_write(2.50, 15.00)),
     ("gpt-5.6-luna", Rate::no_cache_write(1.00, 6.00)),
     ("gpt-5.5", Rate::no_cache_write(5.00, 30.00)),
@@ -493,6 +497,18 @@ mod tests {
         // suffix is trimmed and the tier survives the pricing lookup.
         assert_eq!(pricing_key("gpt-6-astra"), "gpt-6-astra");
         assert_eq!(p.rate("gpt-6-astra-xhigh").map(|r| r.input), Some(10.00));
+    }
+
+    #[test]
+    fn gpt_6_1_sol_doubles_its_own_published_cache_hit() {
+        let p = Pricing::builtin();
+        let r = p.rate("gpt-6.1-sol").expect("a built-in rate for GPT-6.1 Sol");
+        assert_eq!((r.input, r.output), (2.00, 10.00));
+        // Published hit is $0.10 (0.05x), not the 0.10x derivation; 2x on top.
+        assert!((r.cache_read_rate() - 0.20).abs() < 1e-12);
+        assert_eq!(r.cache_write_5m_rate(), 2.50);
+        assert_eq!(p.rate("gpt-6.1-sol-high").map(|r| r.input), Some(2.00));
+        assert_eq!(p.rate("gpt-5.6-sol").map(|r| (r.input, r.output)), Some((4.00, 20.00)));
     }
 
     #[test]
