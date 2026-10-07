@@ -148,7 +148,8 @@ impl Rate {
 /// Anthropic first-party list prices (source: the published rate table at
 /// `platform.claude.com/docs/en/about-claude/pricing`, read 2026-09-07 — every
 /// row below was checked against it on that date; Claude Opus 5.5 was added
-/// from the same table on 2026-09-22).
+/// from the same table on 2026-09-22; Sonnet 5.5, Opus 4.5 and Sonnet 4.5 were
+/// added from it on 2026-10-07).
 ///
 /// Claude Sonnet 5's $2/$10 was announced as an introductory rate expiring
 /// 2026-08-31, and this table once billed history at $3/$15 rather than apply a
@@ -172,8 +173,12 @@ const CLAUDE_RATES: &[(&str, Rate)] = &[
     ("claude-opus-4-8", Rate::new(5.00, 25.00)),
     ("claude-opus-4-7", Rate::new(5.00, 25.00)),
     ("claude-opus-4-6", Rate::new(5.00, 25.00)),
+    ("claude-opus-4-5", Rate::new(5.00, 25.00)),
+    // Sonnet 5.5 shares Sonnet 5's $2/$10 card and the ordinary 0.10x cache hit.
+    ("claude-sonnet-5-5", Rate::new(2.00, 10.00)),
     ("claude-sonnet-5", Rate::new(2.00, 10.00)),
     ("claude-sonnet-4-6", Rate::new(3.00, 15.00)),
+    ("claude-sonnet-4-5", Rate::new(3.00, 15.00)),
     ("claude-haiku-4-5", Rate::new(1.00, 5.00)),
 ];
 
@@ -210,9 +215,13 @@ const OPENAI_RATES: &[(&str, Rate)] = &[
     // express, so a long-context Astra request is billed at the rate below.
     // Sol ($2/$0.20/$2.50/$10) and Luna ($0.10/$0.01/$0.125/$0.50) come from
     // the same list, read 2026-09-22, and match the derivations the same way.
-    ("gpt-6-astra", Rate::new(10.00, 50.00)),
-    ("gpt-6-sol", Rate::new(2.00, 10.00)),
-    ("gpt-6-luna", Rate::new(0.10, 0.50)),
+    //
+    // Cache reads on the whole GPT-6 series are deliberately billed at 2x the
+    // published hit price (0.20x base input rather than 0.10x): an owner-chosen
+    // markup layered on the official card. Input, output and writes stay official.
+    ("gpt-6-astra", Rate::with_cache_read(10.00, 50.00, 2.00)),
+    ("gpt-6-sol", Rate::with_cache_read(2.00, 10.00, 0.40)),
+    ("gpt-6-luna", Rate::with_cache_read(0.10, 0.50, 0.02)),
     ("gpt-5.6", Rate::no_cache_write(5.00, 30.00)),
     ("gpt-5.6-sol", Rate::no_cache_write(5.00, 30.00)),
     ("gpt-5.6-terra", Rate::no_cache_write(2.50, 15.00)),
@@ -461,11 +470,22 @@ mod tests {
     }
 
     #[test]
+    fn sonnet_5_5_is_priced_rather_than_falling_back_to_sonnet_5() {
+        let p = Pricing::builtin();
+        let r = p.rate("claude-sonnet-5-5").expect("a built-in rate for Claude Sonnet 5.5");
+        assert_eq!((r.input, r.output), (2.00, 10.00));
+        assert_eq!(r.cache_read_rate(), 0.20);
+        assert_eq!(r.cache_write_5m_rate(), 2.50);
+        assert_eq!(r.cache_write_1h_rate(), 4.00);
+    }
+
+    #[test]
     fn gpt_6_astra_keeps_the_cache_write_openai_bills_for_it() {
         let p = Pricing::builtin();
         let r = p.rate("gpt-6-astra").expect("a built-in rate for GPT-6 Astra");
         assert_eq!((r.input, r.output), (10.00, 50.00));
-        assert_eq!(r.cache_read_rate(), 1.00);
+        // Official $1.00 doubled by the deliberate GPT-6 cache-read markup.
+        assert_eq!(r.cache_read_rate(), 2.00);
         // The one OpenAI row that is not `no_cache_write`: Astra's published
         // card prices a cache write, so pinning it to zero would understate it.
         assert_eq!(r.cache_write_5m_rate(), 12.50);
@@ -494,11 +514,11 @@ mod tests {
         let p = Pricing::builtin();
         let sol = p.rate("gpt-6-sol").expect("a built-in rate for GPT-6 Sol");
         assert_eq!((sol.input, sol.output), (2.00, 10.00));
-        assert!((sol.cache_read_rate() - 0.20).abs() < 1e-12);
+        assert!((sol.cache_read_rate() - 0.40).abs() < 1e-12);
         assert_eq!(sol.cache_write_5m_rate(), 2.50);
         let luna = p.rate("gpt-6-luna").expect("a built-in rate for GPT-6 Luna");
         assert_eq!((luna.input, luna.output), (0.10, 0.50));
-        assert!((luna.cache_read_rate() - 0.01).abs() < 1e-12);
+        assert!((luna.cache_read_rate() - 0.02).abs() < 1e-12);
         assert_eq!(luna.cache_write_5m_rate(), 0.125);
         // Tier names survive the effort-suffix trim, like `-astra`.
         assert_eq!(p.rate("gpt-6-sol-high").map(|r| r.input), Some(2.00));
