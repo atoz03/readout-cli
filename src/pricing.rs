@@ -227,6 +227,12 @@ const OPENAI_RATES: &[(&str, Rate)] = &[
     // GPT-6.1 Sol (released 2026-09-29, read 2026-10-06) keeps Sol's $2/$10 but
     // lists a $0.10 cache hit (0.05x), so its doubled hit price is $0.20.
     ("gpt-6.1-sol", Rate::with_cache_read(2.00, 10.00, 0.20)),
+    // GPT-6.1 Terra (released 2026-10-26) is $1/$5 with a $0.05 cache hit (0.05x),
+    // doubled to $0.10 like the rest of the series. **Secondhand:** these figures
+    // come from press coverage of the launch, not OpenAI's own price list, which
+    // was unreachable when this row was added — check them against it. Writes
+    // derive as 1.25x, matching the other GPT-6 rows.
+    ("gpt-6.1-terra", Rate::with_cache_read(1.00, 5.00, 0.10)),
     ("gpt-6-sol", Rate::with_cache_read(2.00, 10.00, 0.40)),
     ("gpt-6-luna", Rate::with_cache_read(0.10, 0.50, 0.02)),
     ("gpt-5.6", Rate::no_cache_write(5.00, 30.00)),
@@ -497,6 +503,18 @@ mod tests {
         assert_eq!(r.cache_write_1h_rate(), 0.20);
         // Haiku 4.5 did not move.
         assert_eq!(p.rate("claude-haiku-4-5").map(|r| (r.input, r.output)), Some((1.00, 5.00)));
+    }
+
+    #[test]
+    fn gpt_6_1_terra_is_priced_rather_than_left_unpriced() {
+        let p = Pricing::builtin();
+        let r = p.rate("gpt-6.1-terra").expect("a built-in rate for GPT-6.1 Terra");
+        assert_eq!((r.input, r.output), (1.00, 5.00));
+        assert!((r.cache_read_rate() - 0.10).abs() < 1e-12);
+        assert_eq!(r.cache_write_5m_rate(), 1.25);
+        assert_eq!(p.rate("gpt-6.1-terra-high").map(|r| r.input), Some(1.00));
+        // GPT-5.6 Terra did not move.
+        assert_eq!(p.rate("gpt-5.6-terra").map(|r| (r.input, r.output)), Some((2.50, 15.00)));
     }
 
     #[test]
