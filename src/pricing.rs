@@ -149,7 +149,7 @@ impl Rate {
 /// `platform.claude.com/docs/en/about-claude/pricing`, read 2026-09-07 — every
 /// row below was checked against it on that date; Claude Opus 5.5 was added
 /// from the same table on 2026-09-22; Sonnet 5.5, Opus 4.5 and Sonnet 4.5 were
-/// added from it on 2026-10-07).
+/// added from it on 2026-10-07; Haiku 5.5 on 2026-10-27).
 ///
 /// Claude Sonnet 5's $2/$10 was announced as an introductory rate expiring
 /// 2026-08-31, and this table once billed history at $3/$15 rather than apply a
@@ -179,6 +179,10 @@ const CLAUDE_RATES: &[(&str, Rate)] = &[
     ("claude-sonnet-5", Rate::new(2.00, 10.00)),
     ("claude-sonnet-4-6", Rate::new(3.00, 15.00)),
     ("claude-sonnet-4-5", Rate::new(3.00, 15.00)),
+    // Haiku 5.5 bills $0.10/$0.50 for prompts up to 100K tokens and 5x that past
+    // it. readout cannot see a request's prompt tier, so a long-prompt request
+    // is billed at the short-prompt rate below and its cost is understated.
+    ("claude-haiku-5-5", Rate::new(0.10, 0.50)),
     ("claude-haiku-4-5", Rate::new(1.00, 5.00)),
 ];
 
@@ -481,6 +485,18 @@ mod tests {
         assert_eq!(r.cache_read_rate(), 0.20);
         assert_eq!(r.cache_write_5m_rate(), 2.50);
         assert_eq!(r.cache_write_1h_rate(), 4.00);
+    }
+
+    #[test]
+    fn haiku_5_5_is_priced_at_its_short_prompt_card() {
+        let p = Pricing::builtin();
+        let r = p.rate("claude-haiku-5-5").expect("a built-in rate for Claude Haiku 5.5");
+        assert_eq!((r.input, r.output), (0.10, 0.50));
+        assert!((r.cache_read_rate() - 0.01).abs() < 1e-12);
+        assert_eq!(r.cache_write_5m_rate(), 0.125);
+        assert_eq!(r.cache_write_1h_rate(), 0.20);
+        // Haiku 4.5 did not move.
+        assert_eq!(p.rate("claude-haiku-4-5").map(|r| (r.input, r.output)), Some((1.00, 5.00)));
     }
 
     #[test]
